@@ -51,6 +51,8 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- The DLL names its PDB by file name only, not by the full path of the build folder it was linked in. -->
+      <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
       <ModuleDefinitionFile>$(MSBuildProjectDirectory)\dxgi.def</ModuleDefinitionFile>
       <!-- The menu: D3D12 and DXGI for the overlay, comctl32 for the window subclass, d3dcompiler for the overlay's
            own shaders (the ImGui DX12 backend compiles its shaders the same way). -->
