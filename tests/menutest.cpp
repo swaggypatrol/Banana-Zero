@@ -1,0 +1,555 @@
+// menutest: the menu without a GPU or a game. The key names, the ini write-back, the menu's model
+// and the panel itself are run here: ImGui without a renderer, the panel drawn every frame, the mouse fed to it.
+// Nothing is written outside a directory of its own under %TEMP%. The exit code is the number of failed checks.
+//
+//   build\Release\menutest.exe
+//
+// Checks:
+//   - keys.cpp: names and codes both ways, the hex fallback, unknown names
+//   - settings_write.cpp: a file with comments, unknown keys and StatsLog keeps every line it should; a model
+//     parameter set back to the model's default loses its line; a new file gets its header; what was written reads
+//     back the same
+//   - menu_model.cpp: the draft, A/B, when the file is due, a reload behind the menu
+//   - the panel: a slider dragged with the mouse publishes nothing until the mouse is released, then once, with the
+//     value; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
+//     box unfreezes it, unticking the card undoes the freeze it made; a refused model parameter set goes back to the
+//     last that worked; "all defaults"; closing the menu writes the file, and so does a second after a commit while it
+//     is open
+
+#include <windows.h>
+
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "freeze.h"
+#include "imgui.h"
+#include "keys.h"
+#include "log.h"
+#include "menu.h"
+#include "menu_model.h"
+#include "nr_dx12.h"
+#include "overlay_dx12.h"
+#include "settings.h"
+#include "settings_write.h"
+
+// What the DLL has and this test stands in for: the overlay (overlay_dx12.cpp) and the NR pass (nr_dx12.cpp).
+NrStatusState g_fakeStatus = {};
+bool OverlayOpen(ID3D12GraphicsCommandList*) { return true; }
+void OverlayClose() {}
+void OverlayRelease() {}
+ImTextureID OverlayPreviewTexture(ID3D12Resource*, unsigned, DXGI_FORMAT) { return ImTextureID(0); }
+bool OverlayFrameSize(unsigned* width, unsigned* height)
+{
+    *width = *height = 0;
+    return false;
+}
+const char* OverlayState() { return "menutest"; }
+bool NrStatus(NrStatusState* out)
+{
+    *out = g_fakeStatus;
+    return g_fakeStatus.attempted;
+}
+bool NrPreview(NrPreviewState* out)
+{
+    *out = {};
+    return false;
+}
+
+namespace
+{
+int g_checks = 0;
+int g_failed = 0;
+wchar_t g_directory[MAX_PATH];
+wchar_t g_ini[MAX_PATH];
+
+void Check(bool ok, const char* format, ...)
+{
+    ++g_checks;
+    if (!ok)
+        ++g_failed;
+    std::fputs(ok ? "ok    " : "FAIL  ", stdout);
+    va_list args;
+    va_start(args, format);
+    std::vprintf(format, args);
+    va_end(args);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+bool ReadAll(const wchar_t* path, char* out, size_t size)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") != 0 || f == nullptr)
+        return false;
+    const size_t n = fread(out, 1, size - 1, f);
+    out[n] = '\0';
+    fclose(f);
+    return true;
+}
+
+bool WriteAll(const wchar_t* path, const char* text)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || f == nullptr)
+        return false;
+    fwrite(text, 1, strlen(text), f);
+    fclose(f);
+    return true;
+}
+
+// Waits for the writer thread: the file holds `needle` within `seconds`.
+bool FileHas(const char* needle, double seconds)
+{
+    const double until = LogClock() + seconds;
+    do
+    {
+        char text[8192];
+        if (ReadAll(g_ini, text, sizeof text) && strstr(text, needle) != nullptr)
+            return true;
+        Sleep(20);
+    } while (LogClock() < until);
+    return false;
+}
+
+bool Near(float a, float b, float tolerance) { return std::fabs(a - b) <= tolerance; }
+
+// ---------------------------------------------------------------------------------------------------------------
+
+void TestKeys()
+{
+    char name[16];
+    Check(strcmp(KeyName(0x23, name, sizeof name), "End") == 0, "keys: 0x23 is End");
+    Check(strcmp(KeyName(0x7B, name, sizeof name), "F12") == 0, "keys: 0x7B is F12");
+    Check(strcmp(KeyName(0x65, name, sizeof name), "Numpad5") == 0, "keys: 0x65 is Numpad5");
+    Check(strcmp(KeyName(0x41, name, sizeof name), "A") == 0, "keys: 0x41 is A");
+    Check(strcmp(KeyName(0, name, sizeof name), "None") == 0, "keys: 0 is None");
+    Check(strcmp(KeyName(0xE7, name, sizeof name), "0xE7") == 0, "keys: 0xE7 has no name (%s)", name);
+    unsigned vk = 99;
+    Check(KeyFromName("end", &vk) && vk == 0x23, "keys: end -> 0x23");
+    Check(KeyFromName("F12", &vk) && vk == 0x7B, "keys: F12 -> 0x7B");
+    Check(KeyFromName("numpad5", &vk) && vk == 0x65, "keys: numpad5 -> 0x65");
+    Check(KeyFromName("a", &vk) && vk == 0x41, "keys: a -> 0x41");
+    Check(KeyFromName("0x2e", &vk) && vk == 0x2E, "keys: 0x2e -> 0x2E");
+    Check(KeyFromName("none", &vk) && vk == 0, "keys: none -> 0");
+    vk = 99;
+    Check(!KeyFromName("banana", &vk) && vk == 99, "keys: banana is no key");
+    Check(!KeyFromName("0x1FF", &vk), "keys: 0x1FF is out of range");
+    // Every named key comes back to the same code.
+    bool all = true;
+    for (unsigned k = 1; k < 255; ++k)
+    {
+        KeyName(k, name, sizeof name);
+        unsigned back = 0;
+        if (!KeyFromName(name, &back) || back != k)
+            all = false;
+    }
+    Check(all, "keys: every code names itself and comes back");
+}
+
+void TestWrite()
+{
+    const char* text = "; my notes\r\n"
+                       "Enabled = 1 ; keep this comment\r\n"
+                       "Preset=3\r\n"
+                       "Foo = bar\r\n"
+                       "StatsLog = 2\r\n"
+                       "ColorStrength = 0.5\r\n";
+    Settings s;
+    s.enabled = false;
+    s.model.preset.set = false;
+    s.model.intensity.set = true;
+    s.model.intensity.value = 0.8f;
+    s.statsSeconds = 0.0f;
+    s.colourStrength = 1.25f;
+    s.menuKey = 0x7B; // F12
+    size_t length = 0;
+    char* merged = SettingsMergeIni(text, s, &length);
+    Check(merged != nullptr, "write: merge gives text");
+    if (merged == nullptr)
+        return;
+    Check(strstr(merged, "; my notes\r\n") != nullptr, "write: the comment line stays");
+    Check(strstr(merged, "Enabled = 0  ; keep this comment\r\n") != nullptr, "write: Enabled updated, comment kept");
+    Check(strstr(merged, "Preset") == nullptr, "write: a model parameter back to the model's default loses its line");
+    Check(strstr(merged, "Foo = bar\r\n") != nullptr, "write: an unknown key stays");
+    Check(strstr(merged, "StatsLog = 2\r\n") != nullptr, "write: StatsLog is never touched");
+    Check(strstr(merged, "ColourStrength = 1.25\r\n") != nullptr && strstr(merged, "ColorStrength") == nullptr,
+          "write: a line under the other spelling of a key becomes the key's own line");
+    Check(strstr(merged, "Intensity = 0.8\r\n") != nullptr, "write: a set model parameter is added");
+    Check(strstr(merged, "MenuKey = F12\r\n") != nullptr, "write: a key away from its default is added");
+    Check(strstr(merged, "Shoulder") == nullptr, "write: a value at its default is not added");
+    Check(strstr(merged, "\n\n") == nullptr && strchr(merged, '\n') != nullptr && strstr(merged, "\r\n") != nullptr,
+          "write: CRLF kept, no blank lines made");
+    Check(WriteAll(g_ini, merged), "write: the merged text goes to the test's ini");
+    delete[] merged;
+
+    const Settings* loaded = SettingsLoad(g_ini);
+    Check(loaded->generation == 1, "write: the file read (generation %u)", loaded->generation);
+    Check(!loaded->enabled, "write: Enabled 0 read back");
+    Check(!loaded->model.preset.set, "write: Preset not set");
+    Check(loaded->model.intensity.set && Near(loaded->model.intensity.value, 0.8f, 1e-6f),
+          "write: Intensity read back");
+    Check(Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog 2 read back");
+    Check(Near(loaded->colourStrength, 1.25f, 1e-6f), "write: ColourStrength read back");
+    Check(loaded->menuKey == 0x7B, "write: MenuKey F12 read back");
+
+    // A new file: the header and only the keys away from their defaults.
+    Settings fresh;
+    fresh.whiteEV = -1.5f;
+    merged = SettingsMergeIni(nullptr, fresh, &length);
+    Check(merged != nullptr && merged[0] == ';' && strstr(merged, "WhiteEV = -1.5\r\n") != nullptr &&
+              strstr(merged, "Enabled") == nullptr,
+          "write: a new file gets a header and WhiteEV only");
+    delete[] merged;
+
+    // Written with SettingsWriteIni, read back identical through SettingsLoad.
+    Settings full;
+    full.model.preset = { true, 4 };
+    full.model.style = { true, 2 };
+    full.model.skinStructure = { true, -1.0f };
+    full.model.autoMask = { true, 0 };
+    full.inputType = InputType::LinearHdr;
+    full.whiteSource = WhiteSource::Manual;
+    full.shoulder = 0.85f;
+    full.preview = Preview::Output;
+    full.zebra = false;
+    full.cardCorner = Corner::TopRight;
+    full.compare = true;
+    full.compareSplit = 33.0f;
+    full.toggleKey = 0x70; // F1
+    full.freezeKey = 0x71; // F2
+    full.menuColour = MenuColour::Hdr;
+    full.menuNits = 250.0f;
+    unsigned long error = 0;
+    Check(SettingsWriteIni(g_ini, full, &error), "write: SettingsWriteIni (error %lu)", error);
+    loaded = SettingsLoad(g_ini);
+    Check(loaded->model == full.model, "write: the model parameters read back the same");
+    Check(loaded->inputType == full.inputType && loaded->whiteSource == full.whiteSource &&
+              Near(loaded->shoulder, full.shoulder, 1e-6f) && loaded->preview == full.preview &&
+              loaded->zebra == full.zebra && loaded->cardCorner == full.cardCorner,
+          "write: the encode, composite and aid keys read back the same");
+    Check(loaded->compare == full.compare && Near(loaded->compareSplit, full.compareSplit, 1e-6f) &&
+              loaded->toggleKey == full.toggleKey && loaded->freezeKey == full.freezeKey &&
+              loaded->menuColour == full.menuColour && Near(loaded->menuNits, full.menuNits, 1e-6f),
+          "write: the menu's keys read back the same");
+    Check(loaded->enabled && Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog still 2, Enabled back to 1");
+}
+
+// A stand-in for SettingsPublish that counts.
+unsigned g_published = 0;
+Settings g_lastPublished;
+const Settings* FakePublish(const Settings& s)
+{
+    ++g_published;
+    g_lastPublished = s;
+    g_lastPublished.generation = 1000 + g_published;
+    return &g_lastPublished;
+}
+
+void TestModel()
+{
+    Settings current;
+    current.generation = 7;
+    current.model.intensity = { true, 0.9f };
+    MenuModel m;
+    MenuModelInit(&m, current);
+    Check(m.generation == 7 && !m.dirty && !m.abOff, "model: init takes the snapshot");
+    Check(!MenuModelWriteDue(m, 100.0), "model: nothing due after init");
+    Check(!MenuModelSync(&m, current), "model: the same generation is no reload");
+
+    m.draft.whiteEV = 1.0f;
+    const Settings* p = MenuModelCommit(&m, 10.0, &FakePublish);
+    Check(g_published == 1 && Near(p->whiteEV, 1.0f, 1e-6f) && p->enabled, "model: a commit publishes the draft");
+    Check(m.dirty && m.generation == p->generation, "model: dirty, generation follows the publish");
+    m.open = true;
+    Check(!MenuModelWriteDue(m, 10.5), "model: open, not due at 0.5 s");
+    Check(MenuModelWriteDue(m, 11.0), "model: open, due at 1 s");
+    m.open = false;
+    Check(MenuModelWriteDue(m, 10.5), "model: closed, due at once");
+    MenuModelWritten(&m);
+    Check(!m.dirty && !MenuModelWriteDue(m, 20.0), "model: written clears dirty");
+
+    m.abOff = true;
+    p = MenuModelCommit(&m, 12.0, &FakePublish);
+    Check(g_published == 2 && !p->enabled && m.draft.enabled, "model: A/B publishes Enabled 0, the draft keeps 1");
+    Check(!m.dirty, "model: A/B alone makes nothing due for the file");
+
+    Settings reloaded = current;
+    reloaded.generation = 8;
+    reloaded.whiteEV = -2.0f;
+    Check(MenuModelSync(&m, reloaded), "model: a foreign generation is a reload");
+    Check(Near(m.draft.whiteEV, -2.0f, 1e-6f) && !m.abOff && !m.dirty && m.generation == 8,
+          "model: the draft follows the file, A/B cleared");
+
+    KeyEdge edge;
+    Check(!KeyEdgeUpdate(&edge, false) && KeyEdgeUpdate(&edge, true) && !KeyEdgeUpdate(&edge, true) &&
+              !KeyEdgeUpdate(&edge, false) && KeyEdgeUpdate(&edge, true),
+          "model: a key edge fires once per press");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The panel, headless.
+
+void Frame()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.DeltaTime = 1.0f / 60.0f;
+    ImGui::NewFrame();
+    MenuLock();
+    MenuDraw();
+    MenuUnlock();
+    ImGui::Render();
+}
+
+bool Centre(const char* key, float* x, float* y, float atX = 0.5f)
+{
+    Frame(); // the layout of a frame follows what the frame before changed: read a rectangle after that
+    float x0, y0, x1, y1;
+    if (!MenuItemRect(key, &x0, &y0, &x1, &y1))
+        return false;
+    *x = x0 + (x1 - x0) * atX;
+    *y = (y0 + y1) * 0.5f;
+    return true;
+}
+
+void MoveTo(float x, float y)
+{
+    ImGui::GetIO().AddMousePosEvent(x, y);
+    Frame();
+}
+
+void Button(int button, bool down)
+{
+    ImGui::GetIO().AddMouseButtonEvent(button, down);
+    Frame();
+}
+
+// Click a control's centre (or a point along its width) with the left button: move, press, release.
+bool Click(const char* key, float atX = 0.5f, int button = 0)
+{
+    float x, y;
+    if (!Centre(key, &x, &y, atX))
+        return false;
+    MoveTo(x, y);
+    Button(button, true);
+    Button(button, false);
+    return true;
+}
+
+unsigned Generation() { return SettingsCurrent()->generation; }
+
+void TestPanel()
+{
+    // The file the menu starts from.
+    WriteAll(g_ini, "Enabled = 1\r\nIntensity = 0.7\r\nStatsLog = 0\r\nDumpEvery = 0\r\n");
+    const Settings* start = SettingsLoad(g_ini);
+    const unsigned g0 = start->generation;
+
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1920.0f, 1200.0f);
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures; // no renderer here: the atlas stays unbuilt, allowed
+    io.IniFilename = nullptr;
+    io.Fonts->AddFontDefault();
+
+    g_fakeStatus = {};
+    g_fakeStatus.attempted = true;
+    g_fakeStatus.haveFeature = true;
+    g_fakeStatus.ready = true;
+    g_fakeStatus.width = 3840;
+    g_fakeStatus.height = 2160;
+    g_fakeStatus.feature = 13;
+    g_fakeStatus.hdr = true;
+    g_fakeStatus.linear = true;
+    g_fakeStatus.havePreExposure = true;
+    memcpy(g_fakeStatus.createdModel, &start->model, sizeof(ModelSettings));
+
+    MenuOnEvaluate(nullptr); // takes the snapshot as the draft
+    MenuSetOpen(true);
+    Check(MenuIsOpen(), "panel: the menu opens");
+    Frame();
+    Frame();
+    float x, y;
+    Check(Centre("DetailStrength", &x, &y), "panel: the strength slider was drawn");
+    Check(!Centre("Intensity", &x, &y), "panel: the model's parameters wait under the advanced header");
+    Check(Click("Advanced"), "panel: open the advanced header");
+    Check(Centre("Intensity", &x, &y), "panel: the Intensity slider was drawn");
+    Check(Centre("Close", &x, &y), "panel: the close button was drawn");
+    Check(Generation() == g0, "panel: drawing publishes nothing");
+
+    // A slider: press a tenth of the way along (the grab sits at 1 of 1.5, away from there), drag to six tenths,
+    // release.
+    Check(Centre("Intensity", &x, &y, 0.1f), "panel: Intensity rect");
+    MoveTo(x, y);
+    Button(0, true);
+    Frame();
+    Check(Generation() == g0, "panel: pressing publishes nothing");
+    {
+        MenuLock();
+        const float shown = MenuModelLocked().draft.model.intensity.value;
+        MenuUnlock();
+        Check(shown < 0.4f, "panel: the draft follows the mouse while pressed (%.2f)", shown);
+    }
+    Centre("Intensity", &x, &y, 0.6f);
+    MoveTo(x, y);
+    Frame();
+    Check(Generation() == g0, "panel: dragging publishes nothing");
+    Button(0, false);
+    Frame();
+    Check(Generation() == g0 + 1, "panel: releasing publishes once (generation %u)", Generation());
+    const float intensity = SettingsCurrent()->model.intensity.value;
+    Check(SettingsCurrent()->model.intensity.set && Near(intensity, 0.9f, 0.1f),
+          "panel: the published Intensity is where the mouse let go (%.2f)", intensity);
+    Check(!FileHas("Intensity = 1", 0.3), "panel: the file is not written within 0.3 s of a commit");
+    Sleep(1000);
+    MenuOnEvaluate(nullptr);
+    char expected[32];
+    snprintf(expected, sizeof expected, "Intensity = %.4g", double(intensity));
+    Check(FileHas(expected, 5.0), "panel: a second after the commit the file holds %s", expected);
+    Check(FileHas("StatsLog = 0", 0.0) && FileHas("DumpEvery = 0", 0.0), "panel: StatsLog and DumpEvery untouched");
+
+    // A right-click: the model's default again (not set).
+    Check(Click("Intensity", 0.5f, 1), "panel: right-click Intensity");
+    Frame();
+    Check(Generation() == g0 + 2 && !SettingsCurrent()->model.intensity.set,
+          "panel: right-click makes it the model's default");
+
+    // A box commits at once.
+    Check(Click("Enabled"), "panel: click Enabled");
+    Check(Generation() == g0 + 3 && !SettingsCurrent()->enabled, "panel: Enabled off published at once");
+    Check(Click("Enabled"), "panel: click Enabled again");
+    Check(Generation() == g0 + 4 && SettingsCurrent()->enabled, "panel: Enabled on again");
+
+    // A/B: the pass sees Enabled 0, the draft keeps 1.
+    Check(Click("AB"), "panel: click A/B");
+    {
+        MenuLock();
+        const bool draftEnabled = MenuModelLocked().draft.enabled;
+        const bool abOff = MenuModelLocked().abOff;
+        MenuUnlock();
+        Check(Generation() == g0 + 5 && !SettingsCurrent()->enabled && draftEnabled && abOff,
+              "panel: A/B publishes Enabled 0 and keeps the draft's 1");
+    }
+    Check(Click("AB"), "panel: click A/B again");
+    Check(Generation() == g0 + 6 && SettingsCurrent()->enabled, "panel: A/B back");
+
+    // The card freezes; the freeze box unfreezes and takes the card with it. The card is on the compare page.
+    Check(!FreezeWanted(), "panel: not frozen to begin with");
+    Check(!Centre("Card", &x, &y), "panel: the card is not there while the tuning page shows");
+    Check(Click("TabCompare"), "panel: open the compare page");
+    Check(!Centre("Intensity", &x, &y), "panel: the tuning page is hidden now");
+    Check(Click("Card"), "panel: click the card");
+    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g0 + 7, "panel: the card freezes the frame");
+    Check(Click("Freeze"), "panel: click the freeze box");
+    Check(!FreezeWanted(), "panel: unfrozen");
+    Check(Generation() == g0 + 8 && !SettingsCurrent()->card, "panel: the card went with the freeze");
+    // Unticking the card undoes the freeze it made; a freeze made by hand stays.
+    Check(Click("Card"), "panel: click the card again");
+    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g0 + 9, "panel: the card freezes again");
+    Check(Click("Card"), "panel: untick the card");
+    Check(!FreezeWanted() && !SettingsCurrent()->card && Generation() == g0 + 10,
+          "panel: the card off undoes the freeze it made");
+    Check(Click("Freeze") && FreezeWanted(), "panel: freeze by hand");
+    Check(Click("Card") && SettingsCurrent()->card && Generation() == g0 + 11,
+          "panel: the card on a frame frozen by hand");
+    Check(Click("Card") && !SettingsCurrent()->card && Generation() == g0 + 12, "panel: the card off again");
+    Check(FreezeWanted(), "panel: the freeze made by hand stays");
+    Check(Click("Freeze") && !FreezeWanted(), "panel: unfrozen by hand");
+    Check(Click("TabTune"), "panel: back to the tuning page");
+    Check(Centre("Intensity", &x, &y), "panel: the tuning page shows again");
+
+    // A choice commits at once and a reload behind the menu is followed.
+    WriteAll(g_ini, "Enabled = 1\r\nIntensity = 0.3\r\nWhiteEV = 2\r\nStatsLog = 0\r\nDumpEvery = 0\r\n");
+    Check(SettingsReloadIfChanged(), "panel: the file changed behind the menu and was read");
+    MenuOnEvaluate(nullptr);
+    Frame();
+    {
+        MenuLock();
+        const Settings& d = MenuModelLocked().draft;
+        MenuUnlock();
+        Check(d.model.intensity.set && Near(d.model.intensity.value, 0.3f, 1e-6f) && Near(d.whiteEV, 2.0f, 1e-6f),
+              "panel: the draft follows the reloaded file");
+    }
+    const unsigned g1 = Generation();
+
+    // A refused model parameter set goes back to the last that worked.
+    {
+        MenuLock();
+        ModelSettings created = MenuModelLocked().draft.model;
+        MenuUnlock();
+        created.intensity = { true, 0.5f };
+        memcpy(g_fakeStatus.createdModel, &created, sizeof created);
+        ModelSettings refused;
+        MenuLock();
+        refused = MenuModelLocked().draft.model; // Intensity 0.3
+        MenuUnlock();
+        memcpy(g_fakeStatus.refusedModel, &refused, sizeof refused);
+        g_fakeStatus.refused = true;
+        Frame();
+        Check(Generation() == g1 + 1 && Near(SettingsCurrent()->model.intensity.value, 0.5f, 1e-6f),
+              "panel: a refusal puts the last working model parameters back and publishes them");
+        Frame();
+        Check(Generation() == g1 + 1, "panel: the refusal is acted on once");
+        g_fakeStatus.refused = false;
+    }
+
+    // All defaults, through the confirmation.
+    Check(Click("Defaults"), "panel: click all defaults");
+    Frame();
+    Check(Click("DefaultsYes"), "panel: confirm");
+    Check(Generation() == g1 + 2 && !SettingsCurrent()->model.intensity.set &&
+              Near(SettingsCurrent()->whiteEV, 0.0f, 1e-6f),
+          "panel: all defaults published");
+
+    // Closing writes the file at once.
+    {
+        MenuLock();
+        MenuModelLocked().draft.shoulder = 0.9f;
+        MenuCommitLocked("test");
+        MenuUnlock();
+    }
+    Check(Click("Close"), "panel: click close");
+    Check(!MenuIsOpen(), "panel: the menu is closed");
+    Check(FileHas("Shoulder = 0.9", 5.0), "panel: the file was written on close");
+    Check(!FileHas("Intensity", 0.0) && FileHas("WhiteEV = 0", 0.0),
+          "panel: a model parameter back at the model's default lost its line, a key with a line keeps it");
+    Check(FileHas("StatsLog = 0", 0.0), "panel: StatsLog still there");
+
+    ImGui::DestroyContext();
+}
+} // namespace
+
+int main()
+{
+    const DWORD length = GetTempPathW(MAX_PATH, g_directory);
+    if (length == 0 || length + 32 >= MAX_PATH)
+    {
+        std::puts("no temp directory");
+        return 1;
+    }
+    wcscat_s(g_directory, MAX_PATH, L"banana-zero-menutest\\");
+    CreateDirectoryW(g_directory, nullptr);
+    swprintf_s(g_ini, MAX_PATH, L"%sdlssnr.ini", g_directory);
+    wchar_t logPath[MAX_PATH];
+    swprintf_s(logPath, MAX_PATH, L"%smenutest.log", g_directory);
+    LogOpen(logPath);
+    std::printf("menutest: files under %ls\n", g_directory);
+
+    TestKeys();
+    TestWrite();
+    TestModel();
+    TestPanel();
+
+    std::printf("%d checks, %d failed\n", g_checks, g_failed);
+    if (g_log != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_log);
+        g_log = INVALID_HANDLE_VALUE;
+        char text[16384];
+        if (ReadAll(logPath, text, sizeof text))
+            std::printf("--- the menu's log ---\n%s", text);
+    }
+    return g_failed;
+}

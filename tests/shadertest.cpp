@@ -1,0 +1,1786 @@
+// shadertest: runs the NR shaders (src/nr.hlsl and src/nr_stats.hlsl, as the build embeds them in nr_shader.h and
+// nr_stats_shader.h) on this PC's D3D12 device over synthetic frames, and checks what they write against a CPU copy
+// of their formulas. No game, no model, nothing written outside this process.
+//
+//   build\Release\shadertest.exe
+//
+// For the two Output formats the games use (R16G16B16A16_FLOAT, R11G11B10_FLOAT), and a display-encoded one
+// (R8G8B8A8_UNORM), it checks:
+//   - the encode: white point (with and without an exposure texture), shoulder, sRGB; a copy for display-encoded input
+//   - that a model returning its input, and DetailStrength 0, leave the Output bit for bit as the game made it
+//   - the composite for a model that brightens by half a stop, one that brightens by three (the MaxGainEV clamp) and
+//     one with HighlightRestore at work, against the CPU formula, and that pixels outside the frame are left alone
+//   - the calibration card: the same in the model's input whatever the white point, and its value times the white
+//     point in the Output
+//   - the statistics: counts, histograms, and the frame stamps at both ends
+//   - the scene meter: the white point it works out afresh, eased from an older one, and kept when there is nothing
+//     to measure, against the CPU from the same histogram and from the sorted pixels themselves
+//   - the frame dump: header, closing word, pictures, and the zebra classes in the proxy's alpha
+//   - the preview's zebra stripes
+// Formats whose typed UAV loads this GPU lacks are skipped, as dxgi.dll skips them. The exit code is the number of
+// failed checks.
+
+#include <windows.h>
+
+#include <d3d12.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <vector>
+
+#include "nr_shader.h"
+#include "nr_shared.h"
+#include "nr_stats_shader.h"
+
+namespace
+{
+int g_checks = 0;
+int g_failed = 0;
+
+void Check(bool ok, const char* format, ...)
+{
+    ++g_checks;
+    if (!ok)
+        ++g_failed;
+    std::fputs(ok ? "ok    " : "FAIL  ", stdout);
+    va_list args;
+    va_start(args, format);
+    std::vprintf(format, args);
+    va_end(args);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+void Say(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    std::vprintf(format, args);
+    va_end(args);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+[[noreturn]] void Die(const char* what, HRESULT hr)
+{
+    Say("FAIL  %s: 0x%08lX", what, static_cast<unsigned long>(hr));
+    std::exit(100);
+}
+
+void Must(HRESULT hr, const char* what)
+{
+    if (FAILED(hr))
+        Die(what, hr);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Number formats.
+
+float HalfToFloat(uint16_t h)
+{
+    const uint32_t exponent = (h >> 10) & 0x1F;
+    const uint32_t mantissa = h & 0x3FF;
+    float value;
+    if (exponent == 0)
+        value = std::ldexp(float(mantissa), -24);
+    else if (exponent == 31)
+        value = mantissa == 0 ? INFINITY : NAN;
+    else
+        value = std::ldexp(float(mantissa | 0x400), int(exponent) - 25);
+    return (h & 0x8000) != 0 ? -value : value;
+}
+
+// Round to nearest even, as the GPU stores.
+uint16_t FloatToHalf(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, 4);
+    const uint16_t sign = uint16_t((bits >> 16) & 0x8000);
+    const uint32_t magnitude = bits & 0x7FFFFFFF;
+    if (magnitude > 0x7F800000)
+        return uint16_t(sign | 0x7E00);
+    if (magnitude >= 0x477FF000) // 65520 and up round to infinity
+        return uint16_t(sign | 0x7C00);
+    if (magnitude < 0x38800000) // below the smallest normal half: a multiple of 2^-24
+        return uint16_t(sign | uint16_t(std::nearbyint(std::fabs(value) * 16777216.0f)));
+    uint32_t half = ((magnitude >> 23) - 112) << 10 | ((magnitude & 0x7FFFFF) >> 13);
+    const uint32_t rest = magnitude & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (half & 1) != 0))
+        ++half; // a carry into the exponent is still right
+    return uint16_t(sign | half);
+}
+
+// The unsigned small floats of R11G11B10_FLOAT: 5 exponent bits (bias 15), 6 or 5 mantissa bits, no sign.
+float SmallToFloat(uint32_t bits, int mantissaBits)
+{
+    const uint32_t mantissa = bits & ((1u << mantissaBits) - 1);
+    const uint32_t exponent = bits >> mantissaBits;
+    if (exponent == 0)
+        return std::ldexp(float(mantissa), -14 - mantissaBits);
+    if (exponent == 31)
+        return mantissa == 0 ? INFINITY : NAN;
+    return std::ldexp(float(mantissa | (1u << mantissaBits)), int(exponent) - 15 - mantissaBits);
+}
+
+uint32_t FloatToSmall(float value, int mantissaBits)
+{
+    if (std::isnan(value))
+        return (31u << mantissaBits) | 1u;
+    if (!(value > 0.0f))
+        return 0;
+    if (std::isinf(value))
+        return 31u << mantissaBits;
+    int exponent = 0;
+    const float fraction = std::frexp(value, &exponent); // value = fraction 2^exponent, fraction in [0.5, 1)
+    const int biased = exponent - 1 + 15;
+    uint32_t result;
+    if (biased <= 0)
+        result = uint32_t(std::nearbyint(std::ldexp(value, 14 + mantissaBits)));
+    else
+        result = (uint32_t(biased) << mantissaBits) +
+                 uint32_t(std::nearbyint(std::ldexp(2.0f * fraction - 1.0f, mantissaBits)));
+    const uint32_t largest = (30u << mantissaBits) | ((1u << mantissaBits) - 1);
+    return result > largest ? largest : result;
+}
+
+struct Pixel
+{
+    float r = 0.0f, g = 0.0f, b = 0.0f, a = 1.0f;
+};
+
+struct Format
+{
+    DXGI_FORMAT dxgi;
+    const char* name;
+    UINT bytes;  // per pixel
+    bool linear; // linear HDR, as the games give it; else display-encoded
+};
+
+const Format kHalf = { DXGI_FORMAT_R16G16B16A16_FLOAT, "R16G16B16A16_FLOAT", 8, true };
+const Format kSmall = { DXGI_FORMAT_R11G11B10_FLOAT, "R11G11B10_FLOAT", 4, true };
+const Format kUnorm = { DXGI_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM", 4, false };
+
+uint8_t ToUnorm8(float v) { return uint8_t(std::nearbyint((std::isnan(v) ? 0.0f : std::clamp(v, 0.0f, 1.0f)) * 255.0f)); }
+
+void Encode(const Format& f, const Pixel& p, uint8_t* out)
+{
+    if (f.dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT)
+    {
+        const uint16_t h[4] = { FloatToHalf(p.r), FloatToHalf(p.g), FloatToHalf(p.b), FloatToHalf(p.a) };
+        std::memcpy(out, h, 8);
+    }
+    else if (f.dxgi == DXGI_FORMAT_R11G11B10_FLOAT)
+    {
+        const uint32_t bits = FloatToSmall(p.r, 6) | FloatToSmall(p.g, 6) << 11 | FloatToSmall(p.b, 5) << 22;
+        std::memcpy(out, &bits, 4);
+    }
+    else
+    {
+        out[0] = ToUnorm8(p.r);
+        out[1] = ToUnorm8(p.g);
+        out[2] = ToUnorm8(p.b);
+        out[3] = ToUnorm8(p.a);
+    }
+}
+
+Pixel Decode(const Format& f, const uint8_t* in)
+{
+    if (f.dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT)
+    {
+        uint16_t h[4];
+        std::memcpy(h, in, 8);
+        return { HalfToFloat(h[0]), HalfToFloat(h[1]), HalfToFloat(h[2]), HalfToFloat(h[3]) };
+    }
+    if (f.dxgi == DXGI_FORMAT_R11G11B10_FLOAT)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, in, 4);
+        return { SmallToFloat(bits & 0x7FF, 6), SmallToFloat((bits >> 11) & 0x7FF, 6), SmallToFloat(bits >> 22, 5), 1.0f };
+    }
+    return { in[0] / 255.0f, in[1] / 255.0f, in[2] / 255.0f, in[3] / 255.0f };
+}
+
+Pixel Quantise(const Format& f, const Pixel& p)
+{
+    uint8_t bytes[8];
+    Encode(f, p, bytes);
+    return Decode(f, bytes);
+}
+
+// Within two steps of the format (the GPU's float maths and ours differ by far less than one), NaN matching NaN.
+bool Close(const Format& f, int channel, float got, float want)
+{
+    if (std::isnan(got) || std::isnan(want))
+        return std::isnan(got) && std::isnan(want);
+    if (std::isinf(got) || std::isinf(want))
+        return got == want;
+    float relative, absolute;
+    if (f.dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT)
+        relative = 1.0f / 512.0f, absolute = 1.2e-7f;
+    else if (f.dxgi == DXGI_FORMAT_R11G11B10_FLOAT)
+        relative = channel == 2 ? 1.0f / 16.0f : 1.0f / 32.0f, absolute = 4.0e-6f;
+    else
+        relative = 0.0f, absolute = 1.5f / 255.0f;
+    return std::fabs(got - want) <= std::max(absolute, relative * std::fabs(want));
+}
+
+bool ClosePixel(const Format& f, const Pixel& got, const Pixel& want)
+{
+    return Close(f, 0, got.r, want.r) && Close(f, 1, got.g, want.g) && Close(f, 2, got.b, want.b);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The CPU copy of nr_common.hlsli and nr.hlsl. Same operations in the same order, in float.
+
+namespace ref
+{
+struct F3
+{
+    float r, g, b;
+};
+F3 operator+(F3 a, F3 b) { return { a.r + b.r, a.g + b.g, a.b + b.b }; }
+F3 operator-(F3 a, F3 b) { return { a.r - b.r, a.g - b.g, a.b - b.b }; }
+F3 operator*(F3 a, float s) { return { a.r * s, a.g * s, a.b * s }; }
+F3 operator/(F3 a, float s) { return { a.r / s, a.g / s, a.b / s }; }
+
+const F3 kLuma = { 0.2126f, 0.7152f, 0.0722f };
+const float kGainFloor = 1.0f / 4096.0f;
+const float kChromaFloor = 1.0f / 16384.0f;
+const float kMaxU = 1.0f - 1.0f / 4096.0f;
+const float kMaxOutput = 65024.0f;
+const float kHeavyT = 1.8284271f;
+const float kHeavyU = 0.64644661f;
+
+float Dot(F3 a, F3 b) { return a.r * b.r + a.g * b.g + a.b * b.b; }
+float Max(float a, float b) { return std::isnan(a) ? b : std::isnan(b) ? a : (a > b ? a : b); } // HLSL max
+float Min(float a, float b) { return std::isnan(a) ? b : std::isnan(b) ? a : (a < b ? a : b); }
+float Max3(F3 v) { return Max(v.r, Max(v.g, v.b)); }
+float Saturate(float v) { return std::isnan(v) ? 0.0f : Min(Max(v, 0.0f), 1.0f); }
+F3 Saturate(F3 v) { return { Saturate(v.r), Saturate(v.g), Saturate(v.b) }; }
+float Clean1(float v) { return std::isnan(v) ? 0.0f : Min(Max(v, 0.0f), 1.0e30f); }
+F3 Clean(F3 c) { return { Clean1(c.r), Clean1(c.g), Clean1(c.b) }; }
+float SrgbEncode1(float v) { return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f; }
+F3 SrgbEncode(F3 v) { return { SrgbEncode1(v.r), SrgbEncode1(v.g), SrgbEncode1(v.b) }; }
+float SrgbDecode1(float e) { return e <= 0.04045f ? e / 12.92f : std::pow((e + 0.055f) / 1.055f, 2.4f); }
+F3 SrgbDecode(F3 e) { return { SrgbDecode1(e.r), SrgbDecode1(e.g), SrgbDecode1(e.b) }; }
+
+float WhitePoint(float whiteScale, bool exposureFlag, float exposure)
+{
+    float white = whiteScale;
+    if (exposureFlag && exposure > 1.0e-20f && exposure < 1.0e20f)
+        white /= exposure;
+    return white > 1.0e-20f && white < 1.0e20f ? white : 1.0f;
+}
+
+float Shoulder(float m, float s)
+{
+    if (m <= s)
+        return m;
+    const float t = (m - s) / (1.0f - s);
+    return s + (1.0f - s) * (t / (1.0f + t));
+}
+
+float ShoulderInverse(float y, float s)
+{
+    if (y <= s)
+        return y;
+    const float u = Min((y - s) / (1.0f - s), kMaxU);
+    return s + (1.0f - s) * (u / (1.0f - u));
+}
+
+float InverseScale(float y, float s) { return y > s ? ShoulderInverse(y, s) / Max(y, 1.0e-20f) : 1.0f; }
+float RestoreScale(float y, float s) { return InverseScale(Min(y, s + kHeavyU * (1.0f - s)), s); }
+
+F3 EncodeLinear(F3 frame, float white, float s)
+{
+    const F3 x = Clean(frame) / white;
+    const float m = Max3(x);
+    return m > s ? x * (Shoulder(m, s) / m) : x;
+}
+
+F3 ProxyLinear(F3 e) { return SrgbDecode(Saturate(e)); }
+F3 ModelLinear(F3 e, F3 pe)
+{
+    const F3 c = { std::isnan(e.r) ? pe.r : e.r, std::isnan(e.g) ? pe.g : e.g, std::isnan(e.b) ? pe.b : e.b };
+    return SrgbDecode({ Min(Max(c.r, 0.0f), 2.0f), Min(Max(c.g, 0.0f), 2.0f), Min(Max(c.b, 0.0f), 2.0f) });
+}
+
+struct Knobs
+{
+    float shoulder = 0.7f, detail = 1.0f, colour = 1.0f, maxGain = 1.0f, highlight = 0.0f;
+};
+
+float ModelGain(F3 p, F3 o, bool linear, const Knobs& k)
+{
+    const float yp = Dot(p, kLuma);
+    const float yo = Dot(o, kLuma);
+    float gain = yo == yp ? 0.0f : std::log2((yo + kGainFloor) / (yp + kGainFloor));
+    if (linear && k.highlight != 0.0f)
+    {
+        const float mp = Max3(p);
+        const float mo = Max3(o);
+        if (mp > k.shoulder || mo > k.shoulder)
+            gain += k.highlight * (std::log2(RestoreScale(mo, k.shoulder)) - std::log2(RestoreScale(mp, k.shoulder)));
+    }
+    return gain;
+}
+
+F3 ModelChroma(F3 p, F3 o)
+{
+    const float yp = Dot(p, kLuma);
+    const float yo = Dot(o, kLuma);
+    return yp > kChromaFloor && yo > kChromaFloor ? o / yo - p / yp : F3 { 0.0f, 0.0f, 0.0f };
+}
+
+F3 Composite(F3 frame, F3 pe, F3 me, bool linear, const Knobs& k)
+{
+    const F3 p = ProxyLinear(pe);
+    const F3 o = ModelLinear(me, pe);
+    const float gain = Min(Max(ModelGain(p, o, linear, k) * k.detail, -k.maxGain), k.maxGain);
+    const F3 c = linear ? frame : SrgbDecode(Saturate(frame));
+    const F3 scaled = c * std::exp2(gain);
+    const F3 positive = { Max(scaled.r, 0.0f), Max(scaled.g, 0.0f), Max(scaled.b, 0.0f) };
+    F3 result = scaled + ModelChroma(p, o) * (k.detail * k.colour * Dot(positive, kLuma));
+    result = { Min(Max(result.r, Min(scaled.r, 0.0f)), Max(c.r, kMaxOutput)),
+               Min(Max(result.g, Min(scaled.g, 0.0f)), Max(c.g, kMaxOutput)),
+               Min(Max(result.b, Min(scaled.b, 0.0f)), Max(c.b, kMaxOutput)) };
+    return linear ? result : SrgbEncode(Saturate(result));
+}
+
+unsigned ZebraClass(F3 pe, bool linear, float s)
+{
+    if (!linear)
+        return 0;
+    const float m = Max3(SrgbDecode(Saturate(pe)));
+    if (m > s + kHeavyU * (1.0f - s))
+        return 2;
+    return m > s ? 1 : 0;
+}
+
+struct Rect
+{
+    unsigned x, y, w, h;
+};
+
+bool InCard(unsigned qx, unsigned qy, const Rect& r) { return qx - r.x < r.w && qy - r.y < r.h; }
+
+F3 Card(unsigned qx, unsigned qy, const Rect& r)
+{
+    const float px = float(qx - r.x) + 0.5f, py = float(qy - r.y) + 0.5f;
+    const float w = float(r.w), h = float(r.h);
+    const float gap = Max(2.0f, std::floor(w / 240.0f));
+    const float row1 = std::floor(h * 0.40f);
+    const float row2 = std::floor(h * 0.70f);
+    float x0, x1, y0, y1;
+    F3 value;
+    if (py < row1)
+    {
+        const float cell = w / 13.0f;
+        const float i = Min(std::floor(px / cell), 12.0f);
+        x0 = i * cell;
+        x1 = x0 + cell;
+        y0 = 0.0f;
+        y1 = row1;
+        const float ev = i - 8.0f;
+        const float v = std::exp2(ev);
+        value = { v, v, v };
+        if (ev >= 1.0f)
+        {
+            const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+            const float radius = 0.30f * Min(cell, row1);
+            const float d1x = px - cx, d1y = py - cy;
+            const float d2x = px - (cx + 0.30f * radius), d2y = py - (cy + -0.30f * radius);
+            if (d1x * d1x + d1y * d1y < radius * radius && d2x * d2x + d2y * d2y >= 0.64f * radius * radius)
+                value = value * std::exp2(1.0f / 3.0f);
+        }
+    }
+    else if (py < row2)
+    {
+        const float cell = w / 3.0f;
+        const float i = Min(std::floor(px / cell), 2.0f);
+        x0 = i * cell;
+        x1 = x0 + cell;
+        y0 = row1;
+        y1 = row2;
+        if (i < 0.5f)
+            value = { 0.18f, 0.18f, 0.18f };
+        else if (i < 1.5f)
+            value = { 1.0f, 1.0f, 1.0f };
+        else
+        {
+            const float dx = px - (x0 + x1) * 0.5f, dy = py - (y0 + y1) * 0.5f;
+            const float radius = 0.08f * h;
+            const float v = dx * dx + dy * dy < radius * radius ? 64.0f : 0.0f;
+            value = { v, v, v };
+        }
+    }
+    else
+    {
+        const float cell = w / 6.0f;
+        const float i = Min(std::floor(px / cell), 5.0f);
+        x0 = i * cell;
+        x1 = x0 + cell;
+        y0 = row2;
+        y1 = h;
+        const float level = i < 2.5f ? 1.0f : 4.0f;
+        const float k = i < 2.5f ? i : i - 3.0f;
+        value = { k < 0.5f ? level : 0.0f, k > 0.5f && k < 1.5f ? level : 0.0f, k > 1.5f ? level : 0.0f };
+    }
+    if (px < x0 + gap || px >= x1 - gap || py < y0 + gap || py >= y1 - gap)
+        value = { 0.0f, 0.0f, 0.0f };
+    return value;
+}
+} // namespace ref
+
+ref::F3 Rgb(const Pixel& p) { return { p.r, p.g, p.b }; }
+Pixel WithAlpha(ref::F3 c, float a) { return { c.r, c.g, c.b, a }; }
+bool Finite(const Pixel& p) { return std::isfinite(p.r) && std::isfinite(p.g) && std::isfinite(p.b); }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The device, and the same root signature as dxgi.dll's (nr_shared.h): the constants, then t0-t3, u0-u1.
+
+struct Gpu
+{
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE event = nullptr;
+    uint64_t fenceValue = 0;
+    ID3D12RootSignature* root = nullptr;
+    ID3D12PipelineState* nr = nullptr;
+    ID3D12PipelineState* stats = nullptr;
+    ID3D12DescriptorHeap* heap = nullptr;
+    UINT increment = 0;
+    unsigned nextTable = 0;
+    std::vector<ID3D12Resource*> staging; // upload and readback buffers of the list being recorded
+};
+Gpu g;
+
+constexpr unsigned kTables = 64;
+
+void Submit()
+{
+    Must(g.list->Close(), "Close");
+    ID3D12CommandList* lists[] = { g.list };
+    g.queue->ExecuteCommandLists(1, lists);
+    Must(g.queue->Signal(g.fence, ++g.fenceValue), "Signal");
+    if (g.fence->GetCompletedValue() < g.fenceValue)
+    {
+        Must(g.fence->SetEventOnCompletion(g.fenceValue, g.event), "SetEventOnCompletion");
+        WaitForSingleObject(g.event, INFINITE);
+    }
+    const HRESULT removed = g.device->GetDeviceRemovedReason();
+    if (FAILED(removed))
+        Die("the device was removed", removed);
+    Must(g.allocator->Reset(), "allocator Reset");
+    Must(g.list->Reset(g.allocator, nullptr), "list Reset");
+    for (ID3D12Resource* r : g.staging)
+        r->Release();
+    g.staging.clear();
+    g.nextTable = 0;
+}
+
+void Init()
+{
+    Must(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g.device)), "D3D12CreateDevice");
+    D3D12_COMMAND_QUEUE_DESC queue = {};
+    queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Must(g.device->CreateCommandQueue(&queue, IID_PPV_ARGS(&g.queue)), "CreateCommandQueue");
+    Must(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g.allocator)),
+         "CreateCommandAllocator");
+    Must(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.allocator, nullptr, IID_PPV_ARGS(&g.list)),
+         "CreateCommandList");
+    Must(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)), "CreateFence");
+    g.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 4;
+    ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 2;
+    ranges[1].OffsetInDescriptorsFromTableStart = 4;
+    D3D12_ROOT_PARAMETER parameters[2] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = NR_CONSTANTS_DWORDS;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 2;
+    parameters[1].DescriptorTable.pDescriptorRanges = ranges;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC desc = {};
+    desc.NumParameters = 2;
+    desc.pParameters = parameters;
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* error = nullptr;
+    Must(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error), "D3D12SerializeRootSignature");
+    Must(g.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g.root)),
+         "CreateRootSignature");
+    blob->Release();
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
+    pipeline.pRootSignature = g.root;
+    pipeline.CS = { nr_cso, sizeof nr_cso };
+    Must(g.device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&g.nr)), "CreateComputePipelineState(nr)");
+    pipeline.CS = { nr_stats_cso, sizeof nr_stats_cso };
+    Must(g.device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&g.stats)),
+         "CreateComputePipelineState(nr_stats)");
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors = kTables * 6;
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    Must(g.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g.heap)), "CreateDescriptorHeap");
+    g.increment = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+bool TypedLoad(DXGI_FORMAT format)
+{
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+    support.Format = format;
+    return SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) &&
+           (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+}
+
+ID3D12Resource* MakeTexture(DXGI_FORMAT format, UINT width, UINT height, D3D12_RESOURCE_STATES state)
+{
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    // The game's exposure texture is a plain one, as a game's would be. Every other texture here is written by a
+    // shader, the scene white point too (R32_FLOAT as well, made in the UAV state).
+    const bool plain = format == DXGI_FORMAT_R32_FLOAT && state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    desc.Flags = plain ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* resource = nullptr;
+    Must(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource)),
+         "CreateCommittedResource(texture)");
+    return resource;
+}
+
+ID3D12Resource* MakeBuffer(UINT64 bytes, D3D12_HEAP_TYPE type)
+{
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = type;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = type == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_RESOURCE_STATES state = type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
+                                        : type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                                           : D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* resource = nullptr;
+    Must(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource)),
+         "CreateCommittedResource(buffer)");
+    return resource;
+}
+
+void Barrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    if (before == after)
+        return;
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    g.list->ResourceBarrier(1, &barrier);
+}
+
+void UavBarrier(ID3D12Resource* resource)
+{
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = resource;
+    g.list->ResourceBarrier(1, &barrier);
+}
+
+// Writes `data` (rows packed tightly) into a texture that is in `state`, and leaves it there.
+void Upload(ID3D12Resource* texture, const std::vector<uint8_t>& data, UINT bytesPerPixel, D3D12_RESOURCE_STATES state)
+{
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT rows = 0;
+    UINT64 rowBytes = 0, total = 0;
+    g.device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &rowBytes, &total);
+    ID3D12Resource* staging = MakeBuffer(total, D3D12_HEAP_TYPE_UPLOAD);
+    g.staging.push_back(staging);
+    uint8_t* mapped = nullptr;
+    Must(staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(upload)");
+    const size_t packed = size_t(desc.Width) * bytesPerPixel;
+    for (UINT y = 0; y < rows; ++y)
+        std::memcpy(mapped + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch, data.data() + y * packed, packed);
+    staging->Unmap(0, nullptr);
+    Barrier(texture, state, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION to = {};
+    to.pResource = texture;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION from = {};
+    from.pResource = staging;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    from.PlacedFootprint = footprint;
+    g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    Barrier(texture, D3D12_RESOURCE_STATE_COPY_DEST, state);
+}
+
+// Runs everything recorded so far plus a copy of the texture (in `state`, left there), and returns its rows packed.
+std::vector<uint8_t> Read(ID3D12Resource* texture, UINT bytesPerPixel, D3D12_RESOURCE_STATES state)
+{
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT rows = 0;
+    UINT64 rowBytes = 0, total = 0;
+    g.device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &rowBytes, &total);
+    ID3D12Resource* staging = MakeBuffer(total, D3D12_HEAP_TYPE_READBACK);
+    staging->AddRef(); // kept past Submit, which releases the list's staging buffers
+    g.staging.push_back(staging);
+    Barrier(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION to = {};
+    to.pResource = staging;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION from = {};
+    from.pResource = texture;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    from.SubresourceIndex = 0;
+    g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    Barrier(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+    Submit();
+    const size_t packed = size_t(desc.Width) * bytesPerPixel;
+    std::vector<uint8_t> out(packed * rows);
+    uint8_t* mapped = nullptr;
+    Must(staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(readback)");
+    for (UINT y = 0; y < rows; ++y)
+        std::memcpy(out.data() + y * packed, mapped + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch, packed);
+    staging->Unmap(0, nullptr);
+    staging->Release();
+    return out;
+}
+
+// The same for a buffer in `state`.
+std::vector<uint32_t> ReadBuffer(ID3D12Resource* buffer, UINT64 bytes, D3D12_RESOURCE_STATES state)
+{
+    ID3D12Resource* staging = MakeBuffer(bytes, D3D12_HEAP_TYPE_READBACK);
+    staging->AddRef();
+    g.staging.push_back(staging);
+    Barrier(buffer, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(staging, 0, buffer, 0, bytes);
+    Barrier(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+    Submit();
+    std::vector<uint32_t> out(size_t(bytes / 4));
+    void* mapped = nullptr;
+    Must(staging->Map(0, nullptr, &mapped), "Map(readback buffer)");
+    std::memcpy(out.data(), mapped, out.size() * 4);
+    staging->Unmap(0, nullptr);
+    staging->Release();
+    return out;
+}
+
+struct View
+{
+    ID3D12Resource* resource = nullptr;
+    DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+};
+
+D3D12_CPU_DESCRIPTOR_HANDLE Cpu(unsigned slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = g.heap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += SIZE_T(slot) * g.increment;
+    return handle;
+}
+
+// A descriptor table as dxgi.dll lays it out; slots left empty hold null descriptors.
+unsigned Table(View t0, View t1, View t2, View t3, View u0, ID3D12Resource* u1 = nullptr, UINT64 u1Bytes = 0)
+{
+    if (g.nextTable == kTables)
+        Die("out of descriptor tables", E_FAIL);
+    const unsigned table = g.nextTable++ * 6;
+    const View srvs[4] = { t0, t1, t2, t3 };
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = srvs[i].format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        g.device->CreateShaderResourceView(srvs[i].resource, &srv, Cpu(table + i));
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = u0.format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(u0.resource, nullptr, &uav, Cpu(table + 4));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw = {};
+    raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    raw.Buffer.NumElements = u1 != nullptr ? UINT(u1Bytes / 4) : 1;
+    raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    g.device->CreateUnorderedAccessView(u1, nullptr, &raw, Cpu(table + 5));
+    return table;
+}
+
+void Dispatch(ID3D12PipelineState* pipeline, unsigned table, const NrConstants& c, UINT groupsX, UINT groupsY)
+{
+    ID3D12DescriptorHeap* heaps[] = { g.heap };
+    g.list->SetDescriptorHeaps(1, heaps);
+    g.list->SetComputeRootSignature(g.root);
+    g.list->SetPipelineState(pipeline);
+    g.list->SetComputeRoot32BitConstants(0, NR_CONSTANTS_DWORDS, &c, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE handle = g.heap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += UINT64(table) * g.increment;
+    g.list->SetComputeRootDescriptorTable(1, handle);
+    g.list->Dispatch(groupsX, groupsY, 1);
+}
+
+UINT Groups(UINT size, UINT per) { return (size + per - 1) / per; }
+
+// ---------------------------------------------------------------------------------------------------------------
+// A synthetic frame: a ramp from 12 EV below the white point to 6 above, in six colours, with a NaN, an infinity,
+// negative, zero and tiny values in its first row, inside a larger texture whose border must never change. A
+// display-encoded frame is a plain 0..1 ramp in the same colours.
+
+constexpr float kWhite = 2.5f;
+
+struct Scene
+{
+    const Format* format = nullptr;
+    UINT width = 0, height = 0;  // the frame
+    UINT baseX = 0, baseY = 0;   // where it lies in the texture
+    UINT textureWidth = 0, textureHeight = 0;
+    std::vector<uint8_t> bytes;  // the texture as uploaded
+    std::vector<Pixel> texture;  // the same, decoded: what the GPU reads
+    ID3D12Resource* output = nullptr;   // the game's Output, in the UAV state between steps
+    ID3D12Resource* proxy = nullptr;    // RGBA16F, UAV between steps
+    ID3D12Resource* model = nullptr;    // RGBA16F, NPSR between steps
+    ID3D12Resource* exposure = nullptr; // R32_FLOAT 1x1, NPSR
+
+    const Pixel& Frame(UINT x, UINT y) const { return texture[size_t(y + baseY) * textureWidth + x + baseX]; }
+};
+
+Pixel SceneValue(const Format& f, UINT x, UINT y, UINT width)
+{
+    static const float kHues[6][3] = { { 1.0f, 1.0f, 1.0f },   { 1.0f, 0.62f, 0.31f }, { 0.33f, 1.0f, 0.41f },
+                                       { 0.27f, 0.36f, 1.0f }, { 1.0f, 0.06f, 0.03f }, { 0.03f, 0.91f, 1.0f } };
+    const float* hue = kHues[(y / 3) % 6];
+    if (!f.linear)
+    {
+        const float v = (float(x) + 0.5f) / float(width);
+        return { v * hue[0], v * hue[1], v * hue[2], 0.75f };
+    }
+    if (y == 0 && x < 6)
+    {
+        switch (x)
+        {
+        case 0: return { NAN, 0.5f, 0.5f, 0.75f };
+        case 1: return { 0.5f, INFINITY, 0.5f, 0.75f };
+        case 2: return { -0.5f, 0.2f, 0.2f, 0.75f };
+        case 3: return { 0.0f, 0.0f, 0.0f, 0.75f };
+        case 4: return { 1.0e-9f, 0.0f, 0.0f, 0.75f };
+        default: return { -0.0f, -0.0f, -0.0f, 0.75f };
+        }
+    }
+    const float ev = -12.0f + 18.0f * (float(x) + 0.37f) / float(width);
+    const float v = kWhite * std::exp2(ev);
+    return { v * hue[0], v * hue[1], v * hue[2], 0.75f };
+}
+
+Scene MakeScene(const Format& f, UINT width, UINT height, UINT border)
+{
+    Scene s;
+    s.format = &f;
+    s.width = width;
+    s.height = height;
+    s.baseX = border;
+    s.baseY = border / 2;
+    s.textureWidth = width + 2 * border;
+    s.textureHeight = height + border;
+    s.bytes.resize(size_t(s.textureWidth) * s.textureHeight * f.bytes);
+    s.texture.resize(size_t(s.textureWidth) * s.textureHeight);
+    for (UINT y = 0; y < s.textureHeight; ++y)
+    {
+        for (UINT x = 0; x < s.textureWidth; ++x)
+        {
+            const bool inside = x >= s.baseX && x < s.baseX + width && y >= s.baseY && y < s.baseY + height;
+            const Pixel p = inside ? SceneValue(f, x - s.baseX, y - s.baseY, width) : Pixel { 0.5f, 0.25f, 0.125f, 0.5f };
+            const size_t i = size_t(y) * s.textureWidth + x;
+            Encode(f, p, s.bytes.data() + i * f.bytes);
+            s.texture[i] = Decode(f, s.bytes.data() + i * f.bytes);
+        }
+    }
+    s.output = MakeTexture(f.dxgi, s.textureWidth, s.textureHeight, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.proxy = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.model = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    s.exposure = MakeTexture(DXGI_FORMAT_R32_FLOAT, 1, 1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return s;
+}
+
+void Drop(Scene& s)
+{
+    ID3D12Resource* const resources[] = { s.output, s.proxy, s.model, s.exposure };
+    for (ID3D12Resource* r : resources)
+    {
+        if (r != nullptr)
+            r->Release();
+    }
+    s = {};
+}
+
+// The settings of one run of the passes, as nr_dx12.cpp turns the ini keys into constants.
+struct Setup
+{
+    bool linear = true;
+    float whiteScale = kWhite;
+    bool useExposure = false;
+    float exposure = 1.0f;
+    ref::Knobs knobs;
+    bool card = false;
+    ref::Rect cardRect = { 6, 5, 96, 40 };
+    uint32_t frame = 12345;
+};
+
+NrConstants Constants(const Scene& s, const Setup& u, uint32_t mode)
+{
+    NrConstants c = {};
+    c.mode = mode;
+    c.width = s.width;
+    c.height = s.height;
+    c.baseX = s.baseX;
+    c.baseY = s.baseY;
+    c.frame = u.frame;
+    c.whiteScale = u.whiteScale;
+    c.shoulder = u.knobs.shoulder;
+    c.detail = u.knobs.detail;
+    c.colour = u.knobs.colour;
+    c.maxGain = u.knobs.maxGain;
+    c.highlight = u.knobs.highlight;
+    if (u.linear)
+        c.flags |= NR_FLAG_LINEAR_HDR;
+    if (u.useExposure)
+        c.flags |= NR_FLAG_EXPOSURE;
+    if (u.card)
+    {
+        c.flags |= NR_FLAG_CARD;
+        c.cardX = u.cardRect.x;
+        c.cardY = u.cardRect.y;
+        c.cardW = u.cardRect.w;
+        c.cardH = u.cardRect.h;
+    }
+    return c;
+}
+
+float WhiteOf(const Setup& u) { return u.linear ? ref::WhitePoint(u.whiteScale, u.useExposure, u.exposure) : 1.0f; }
+
+View OutputView(const Scene& s) { return { s.output, s.format->dxgi }; }
+View ExposureView(const Scene& s, const Setup& u) { return u.useExposure ? View { s.exposure, DXGI_FORMAT_R32_FLOAT } : View {}; }
+
+// The game's frame back into the Output, the exposure value into its texture.
+void Reset(Scene& s, const Setup& u)
+{
+    Upload(s.output, s.bytes, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    std::vector<uint8_t> exposure(4);
+    std::memcpy(exposure.data(), &u.exposure, 4);
+    Upload(s.exposure, exposure, 4, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
+
+// Records the encode: Output -> proxy. The Output is back in UAV and the proxy still in UAV afterwards.
+void RecordEncode(Scene& s, const Setup& u)
+{
+    Barrier(s.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const unsigned table = Table(OutputView(s), {}, {}, ExposureView(s, u), { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT });
+    Dispatch(g.nr, table, Constants(s, u, NR_MODE_ENCODE), Groups(s.width, 8), Groups(s.height, 8));
+    Barrier(s.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    UavBarrier(s.proxy);
+}
+
+std::vector<Pixel> DecodeAll(const Format& f, const std::vector<uint8_t>& bytes)
+{
+    std::vector<Pixel> out(bytes.size() / f.bytes);
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = Decode(f, bytes.data() + i * f.bytes);
+    return out;
+}
+
+std::vector<uint8_t> Encode(const std::vector<Pixel>& pixels)
+{
+    std::vector<uint8_t> out(pixels.size() * 8);
+    for (size_t i = 0; i < pixels.size(); ++i)
+        Encode(kHalf, pixels[i], out.data() + i * 8);
+    return out;
+}
+
+// Encodes and reads the proxy back (as half floats) and decoded.
+std::vector<uint8_t> EncodeAndReadProxy(Scene& s, const Setup& u)
+{
+    Reset(s, u);
+    RecordEncode(s, u);
+    return Read(s.proxy, 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+// The CPU encode of frame pixel (x, y).
+Pixel ExpectedProxy(const Scene& s, const Setup& u, UINT x, UINT y)
+{
+    const Pixel& f = s.Frame(x, y);
+    if (!u.linear)
+        return WithAlpha(ref::Saturate(ref::Clean(Rgb(f))), 1.0f);
+    const float white = WhiteOf(u);
+    const ref::F3 c = u.card && ref::InCard(x, y, u.cardRect) ? ref::Card(x, y, u.cardRect) * white : Rgb(f);
+    ref::F3 e = ref::EncodeLinear(c, white, u.knobs.shoulder);
+    e = { ref::Min(e.r, 1.0f), ref::Min(e.g, 1.0f), ref::Min(e.b, 1.0f) };
+    return WithAlpha(ref::SrgbEncode(e), 1.0f);
+}
+
+void CheckEncode(Scene& s, const Setup& u, const char* what)
+{
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, EncodeAndReadProxy(s, u));
+    size_t bad = 0;
+    UINT firstX = 0, firstY = 0;
+    Pixel got, want;
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            const Pixel p = proxy[size_t(y) * s.width + x];
+            const Pixel e = ExpectedProxy(s, u, x, y);
+            if (!ClosePixel(kHalf, p, e) || p.a != 1.0f)
+            {
+                if (bad++ == 0)
+                    firstX = x, firstY = y, got = p, want = e;
+            }
+        }
+    }
+    if (bad == 0)
+        Check(true, "encode, %s, %s: %ux%u pixels as the CPU formula", s.format->name, what, s.width, s.height);
+    else
+        Check(false, "encode, %s, %s: %zu pixels differ; first (%u,%u) got %g %g %g %g, want %g %g %g", s.format->name,
+              what, bad, firstX, firstY, got.r, got.g, got.b, got.a, want.r, want.g, want.b);
+}
+
+// A model: the proxy's linear light changed by `change`, clipped to 0..1 and sRGB-encoded again as half floats.
+std::vector<Pixel> MakeModel(const std::vector<Pixel>& proxy, const std::function<ref::F3(ref::F3, size_t)>& change)
+{
+    std::vector<Pixel> model(proxy.size());
+    for (size_t i = 0; i < proxy.size(); ++i)
+    {
+        ref::F3 o = change(ref::ProxyLinear(Rgb(proxy[i])), i);
+        o = { std::clamp(o.r, 0.0f, 1.0f), std::clamp(o.g, 0.0f, 1.0f), std::clamp(o.b, 0.0f, 1.0f) };
+        model[i] = Quantise(kHalf, WithAlpha(ref::SrgbEncode(o), 1.0f));
+    }
+    return model;
+}
+
+// Runs encode, the given model output, and the composite; returns the Output texture's bytes.
+std::vector<uint8_t> RunComposite(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes)
+{
+    Reset(s, u);
+    RecordEncode(s, u);
+    Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT }, { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                 ExposureView(s, u), OutputView(s));
+    Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    return Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+// What the composite must leave in texture pixel i (x, y in the texture), given the proxy and model the GPU used.
+// `exact` is set when the pixel must be the game's own bits.
+Pixel ExpectedOutput(const Scene& s, const Setup& u, const std::vector<Pixel>& proxy, const std::vector<Pixel>& model,
+                     UINT tx, UINT ty, bool* exact)
+{
+    const size_t i = size_t(ty) * s.textureWidth + tx;
+    *exact = true;
+    if (tx < s.baseX || tx >= s.baseX + s.width || ty < s.baseY || ty >= s.baseY + s.height)
+        return s.texture[i];
+    const UINT x = tx - s.baseX, y = ty - s.baseY;
+    Pixel frame = s.texture[i];
+    const float white = WhiteOf(u);
+    bool written = false;
+    if (u.card && ref::InCard(x, y, u.cardRect))
+    {
+        const ref::F3 c = ref::Card(x, y, u.cardRect) * white;
+        frame = { c.r, c.g, c.b, frame.a };
+        written = true;
+    }
+    Pixel result = frame;
+    const Pixel& pe = proxy[size_t(y) * s.width + x];
+    const Pixel& me = model[size_t(y) * s.width + x];
+    if (u.knobs.detail != 0.0f && Finite(frame) && (me.r != pe.r || me.g != pe.g || me.b != pe.b))
+    {
+        const ref::F3 r = ref::Composite(Rgb(frame), Rgb(pe), Rgb(me), u.linear, u.knobs);
+        result = { r.r, r.g, r.b, frame.a };
+        written = true;
+    }
+    *exact = !written;
+    return written ? Quantise(*s.format, result) : result;
+}
+
+// Compares a composite's Output with the CPU: untouched pixels bit for bit, the rest within two steps of the format.
+void CheckComposite(const Scene& s, const Setup& u, const std::vector<Pixel>& proxy, const std::vector<Pixel>& model,
+                    const std::vector<uint8_t>& output, const char* what)
+{
+    size_t bad = 0, changed = 0;
+    UINT firstX = 0, firstY = 0;
+    Pixel got, want;
+    for (UINT ty = 0; ty < s.textureHeight; ++ty)
+    {
+        for (UINT tx = 0; tx < s.textureWidth; ++tx)
+        {
+            bool exact = false;
+            const Pixel e = ExpectedOutput(s, u, proxy, model, tx, ty, &exact);
+            const size_t i = size_t(ty) * s.textureWidth + tx;
+            const Pixel o = Decode(*s.format, output.data() + i * s.format->bytes);
+            bool ok;
+            if (exact)
+                ok = std::memcmp(output.data() + i * s.format->bytes, s.bytes.data() + i * s.format->bytes,
+                                 s.format->bytes) == 0;
+            else
+            {
+                ++changed;
+                ok = ClosePixel(*s.format, o, e) && (s.format->bytes == 4 && s.format->linear ? true : o.a == e.a);
+            }
+            if (!ok && bad++ == 0)
+                firstX = tx, firstY = ty, got = o, want = e;
+        }
+    }
+    if (bad == 0)
+        Check(true, "composite, %s, %s: %zu pixels as the CPU formula, the other %zu bit for bit as they were",
+              s.format->name, what, changed, size_t(s.textureWidth) * s.textureHeight - changed);
+    else
+        Check(false, "composite, %s, %s: %zu pixels wrong; first (%u,%u) got %g %g %g %g, want %g %g %g %g",
+              s.format->name, what, bad, firstX, firstY, got.r, got.g, got.b, got.a, want.r, want.g, want.b, want.a);
+}
+
+// The whole Output bit for bit as the game made it.
+void CheckUntouched(const Scene& s, const std::vector<uint8_t>& output, const char* what)
+{
+    size_t bad = 0;
+    for (size_t i = 0; i < s.texture.size(); ++i)
+        bad += std::memcmp(output.data() + i * s.format->bytes, s.bytes.data() + i * s.format->bytes, s.format->bytes) != 0;
+    Check(bad == 0, "composite, %s, %s: the Output is bit for bit the game's (%zu pixels differ)", s.format->name, what,
+          bad);
+}
+
+// The Output over the frame, in the game's units, for brightness ratios.
+float Luma(const Pixel& p) { return 0.2126f * p.r + 0.7152f * p.g + 0.0722f * p.b; }
+
+// Over the pixels where the model's change was not clipped and far above the gain floor, Output / frame luminance
+// must be 2^ev: a check of the composite that does not lean on the CPU copy of its formula.
+void CheckRatio(const Scene& s, const std::vector<Pixel>& proxy, const std::vector<uint8_t>& output, float ev,
+                const char* what)
+{
+    size_t counted = 0, bad = 0;
+    double worst = 0.0;
+    for (UINT y = 1; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            const ref::F3 p = ref::ProxyLinear(Rgb(proxy[size_t(y) * s.width + x]));
+            // Both the proxy and the model below the shoulder and well above the floor.
+            if (ref::Max3(p) > 0.08f || ref::Dot(p, ref::kLuma) < 0.02f)
+                continue;
+            const Pixel& f = s.Frame(x, y);
+            const size_t i = size_t(y + s.baseY) * s.textureWidth + x + s.baseX;
+            const Pixel o = Decode(*s.format, output.data() + i * s.format->bytes);
+            const double ratio = std::log2(double(Luma(o)) / double(Luma(f)));
+            worst = std::max(worst, std::fabs(ratio - ev));
+            ++counted;
+            bad += std::fabs(ratio - ev) > (s.format->dxgi == DXGI_FORMAT_R11G11B10_FLOAT ? 0.06 : 0.02);
+        }
+    }
+    Check(counted > 100 && bad == 0, "composite, %s, %s: Output / frame is %+.2f EV over %zu mid-tone pixels (worst "
+                                     "off by %.3f EV)",
+          s.format->name, what, double(ev), counted, worst);
+}
+
+// A model that pushes the brightest pixels to the top of its range (largest channel 1, hue kept), as one trained on
+// 8-bit pictures does with a bright sky. With HighlightRestore 1 they come back brighter by the plain ratio (under
+// 0.2 EV here) plus at most the restore up to 3 EV of compression (under 0.5 EV at Shoulder 0.70), never by the
+// MaxGainEV an inverse taken all the way to 1 gave them.
+void CheckClippedWhite(Scene& s, const std::vector<Pixel>& proxy)
+{
+    Setup u;
+    u.knobs.highlight = 1.0f;
+    const float heavy = u.knobs.shoulder + ref::kHeavyU * (1.0f - u.knobs.shoulder);
+    const std::vector<Pixel> clipped = MakeModel(proxy, [heavy](ref::F3 p, size_t) {
+        return ref::Max3(p) > heavy ? p / ref::Max3(p) : p;
+    });
+    const std::vector<uint8_t> output = RunComposite(s, u, Encode(clipped));
+    CheckComposite(s, u, proxy, clipped, output, "model pushes the heavy highlights to 1, HighlightRestore 1");
+    size_t counted = 0;
+    double worst = -100.0;
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            const ref::F3 p = ref::ProxyLinear(Rgb(proxy[size_t(y) * s.width + x]));
+            const Pixel& f = s.Frame(x, y);
+            if (ref::Max3(p) <= heavy || !std::isfinite(Luma(f)) || Luma(f) <= 0.0f)
+                continue;
+            const size_t i = size_t(y + s.baseY) * s.textureWidth + x + s.baseX;
+            const Pixel o = Decode(*s.format, output.data() + i * s.format->bytes);
+            worst = std::max(worst, std::log2(double(Luma(o)) / double(Luma(f))));
+            ++counted;
+        }
+    }
+    Check(counted > 100 && worst < 0.9,
+          "composite, %s: highlights the model pushed to 1 come back at most %+.2f EV brighter over %zu pixels "
+          "(MaxGainEV 1)",
+          s.format->name, worst, counted);
+}
+
+// The card in the model's input does not depend on the white point; in the Output it is the white point times its
+// value.
+void CheckCard(Scene& s)
+{
+    Setup low, high;
+    low.card = high.card = true;
+    high.whiteScale = low.whiteScale * 8.0f;
+    const std::vector<Pixel> a = DecodeAll(kHalf, EncodeAndReadProxy(s, low));
+    const std::vector<Pixel> b = DecodeAll(kHalf, EncodeAndReadProxy(s, high));
+    size_t inside = 0, bad = 0, outsideSame = 0;
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            const size_t i = size_t(y) * s.width + x;
+            if (ref::InCard(x, y, low.cardRect))
+            {
+                ++inside;
+                bad += !ClosePixel(kHalf, a[i], b[i]);
+            }
+            else
+                outsideSame += std::memcmp(&a[i], &b[i], sizeof(Pixel)) == 0 && ref::Max3(Rgb(a[i])) > 0.01f;
+        }
+    }
+    Check(inside == size_t(low.cardRect.w) * low.cardRect.h && bad == 0 && outsideSame < 50,
+          "card, %s: the model's input inside the card is the same at two white points 3 EV apart (%zu pixels, %zu "
+          "differ), the scene around it is not",
+          s.format->name, inside, bad);
+    CheckEncode(s, high, "card, white point x8");
+
+    // With a model that returns its input, the Output inside the card is exactly the card at the white point.
+    const std::vector<uint8_t> proxyBytes = EncodeAndReadProxy(s, low);
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, proxyBytes);
+    const std::vector<uint8_t> output = RunComposite(s, low, proxyBytes);
+    CheckComposite(s, low, proxy, proxy, output, "card, model returns its input");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The statistics (nr_stats.hlsl) against the CPU.
+
+struct CpuStats
+{
+    uint32_t counts[NR_COUNTS] = {};
+    uint32_t maxHist[NR_HIST_BINS] = {};
+    uint32_t lumHist[NR_HIST_BINS] = {};
+    uint32_t gainHist[NR_GAIN_BINS] = {};
+    float largest = 0.0f;
+};
+
+int Bin(float value, float lowEv, float perEv, int bins)
+{
+    const float at = std::floor((std::log2(value) - lowEv) * perEv);
+    return at < 0.0f ? -1 : at >= float(bins) ? bins : int(at);
+}
+
+CpuStats ExpectedStats(const Scene& s, const Setup& u, const std::vector<Pixel>& proxy, const std::vector<Pixel>& model)
+{
+    CpuStats c;
+    const float white = WhiteOf(u);
+    const float sh = u.knobs.shoulder;
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            ++c.counts[NR_C_PIXELS];
+            const Pixel& f = s.Frame(x, y);
+            if (!Finite(f))
+            {
+                ++c.counts[NR_C_NONFINITE];
+                continue;
+            }
+            if (f.r < 0.0f || f.g < 0.0f || f.b < 0.0f)
+                ++c.counts[NR_C_NEGATIVE];
+            const ref::F3 x3 = ref::Clean(Rgb(f)) / white;
+            c.largest = std::max(c.largest, ref::Max3(ref::Clean(Rgb(f))));
+            const float m = ref::Max3(x3);
+            if (m <= 0.0f)
+            {
+                ++c.counts[NR_C_BLACK];
+                ++c.counts[NR_C_DARK];
+                continue;
+            }
+            const int bin = Bin(m, float(NR_HIST_EV_MIN), float(NR_HIST_PER_EV), NR_HIST_BINS);
+            if (bin < 0)
+                ++c.counts[NR_C_BELOW];
+            else if (bin >= NR_HIST_BINS)
+                ++c.counts[NR_C_ABOVE];
+            else
+                ++c.maxHist[bin];
+            const float l = ref::Dot(x3, ref::kLuma);
+            if (l > 0.0f)
+            {
+                const int lumBin = Bin(l, float(NR_HIST_EV_MIN), float(NR_HIST_PER_EV), NR_HIST_BINS);
+                if (lumBin >= 0 && lumBin < NR_HIST_BINS)
+                    ++c.lumHist[lumBin];
+            }
+            if (u.linear && m > sh)
+                ++c.counts[NR_C_SHOULDER];
+            if (u.linear && m > sh + ref::kHeavyT * (1.0f - sh))
+                ++c.counts[NR_C_HEAVY];
+            if (m < 0.5f / 255.0f / 12.92f)
+                ++c.counts[NR_C_DARK];
+        }
+    }
+    for (size_t i = 0; i < proxy.size(); ++i)
+    {
+        ++c.counts[NR_C_GAIN_PIXELS];
+        const ref::F3 p = ref::ProxyLinear(Rgb(proxy[i]));
+        const ref::F3 o = ref::ModelLinear(Rgb(model[i]), Rgb(proxy[i]));
+        const float gain = ref::ModelGain(p, o, u.linear, u.knobs) * u.knobs.detail;
+        if (gain < -u.knobs.maxGain)
+            ++c.counts[NR_C_GAIN_LOW];
+        else if (gain > u.knobs.maxGain)
+            ++c.counts[NR_C_GAIN_HIGH];
+        const float at = std::clamp(std::floor((gain - float(NR_GAIN_EV_MIN)) * float(NR_GAIN_PER_EV)), 0.0f,
+                                    float(NR_GAIN_BINS - 1));
+        ++c.gainHist[int(at)];
+        const ref::F3 chroma = ref::ModelChroma(p, o);
+        if (std::fabs(chroma.r) + std::fabs(chroma.g) + std::fabs(chroma.b) > 0.05f)
+            ++c.counts[NR_C_COLOUR];
+    }
+    return c;
+}
+
+// Histograms as running totals, allowing `slack` pixels to sit in a neighbouring bin (log2 at a bin's edge).
+bool SameHistogram(const uint32_t* got, const uint32_t* want, int bins, uint32_t slack)
+{
+    int64_t a = 0, b = 0;
+    for (int i = 0; i < bins; ++i)
+    {
+        a += got[i];
+        b += want[i];
+        if (std::llabs(a - b) > int64_t(slack))
+            return false;
+    }
+    return a == b;
+}
+
+bool Near(uint32_t got, uint32_t want, uint32_t slack) { return (got > want ? got - want : want - got) <= slack; }
+
+float Bits(uint32_t bits)
+{
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes)
+{
+    const UINT64 bytes = NR_S_WORDS * 4;
+    ID3D12Resource* stats = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+    Reset(s, u);
+    RecordEncode(s, u);
+    Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(stats, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(s.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const unsigned input = Table(OutputView(s), {}, {}, ExposureView(s, u), {}, stats, bytes);
+    const unsigned gain = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT }, { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                ExposureView(s, u), {}, stats, bytes);
+    Dispatch(g.stats, input, Constants(s, u, NR_STATS_CLEAR), 1, 1);
+    UavBarrier(stats);
+    Dispatch(g.stats, input, Constants(s, u, NR_STATS_INPUT), Groups(s.width, 32), Groups(s.height, 32));
+    UavBarrier(stats);
+    Dispatch(g.stats, gain, Constants(s, u, NR_STATS_GAIN), Groups(s.width, 32), Groups(s.height, 32));
+    Barrier(s.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<uint32_t> w = ReadBuffer(stats, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    stats->Release();
+
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, EncodeAndReadProxy(s, u));
+    const std::vector<Pixel> model = DecodeAll(kHalf, modelBytes);
+    const CpuStats e = ExpectedStats(s, u, proxy, model);
+    const uint32_t* c = w.data() + NR_S_COUNTS;
+    Check(w[NR_S_TAG_FIRST] == u.frame && w[NR_S_TAG_LAST] == u.frame,
+          "statistics, %s: stamped %u and %u at the two ends (frame %u)", s.format->name, w[NR_S_TAG_FIRST],
+          w[NR_S_TAG_LAST], u.frame);
+    const bool exactCounts = c[NR_C_PIXELS] == e.counts[NR_C_PIXELS] && c[NR_C_NONFINITE] == e.counts[NR_C_NONFINITE] &&
+                             c[NR_C_NEGATIVE] == e.counts[NR_C_NEGATIVE] && c[NR_C_BLACK] == e.counts[NR_C_BLACK] &&
+                             c[NR_C_GAIN_PIXELS] == e.counts[NR_C_GAIN_PIXELS];
+    Check(exactCounts, "statistics, %s: pixels %u/%u, not finite %u/%u, negative %u/%u, black %u/%u, gain pixels %u/%u",
+          s.format->name, c[NR_C_PIXELS], e.counts[NR_C_PIXELS], c[NR_C_NONFINITE], e.counts[NR_C_NONFINITE],
+          c[NR_C_NEGATIVE], e.counts[NR_C_NEGATIVE], c[NR_C_BLACK], e.counts[NR_C_BLACK], c[NR_C_GAIN_PIXELS],
+          e.counts[NR_C_GAIN_PIXELS]);
+    const uint32_t slack = 3;
+    const bool nearCounts = Near(c[NR_C_BELOW], e.counts[NR_C_BELOW], slack) &&
+                            Near(c[NR_C_ABOVE], e.counts[NR_C_ABOVE], slack) &&
+                            Near(c[NR_C_SHOULDER], e.counts[NR_C_SHOULDER], slack) &&
+                            Near(c[NR_C_HEAVY], e.counts[NR_C_HEAVY], slack) &&
+                            Near(c[NR_C_DARK], e.counts[NR_C_DARK], slack) &&
+                            Near(c[NR_C_GAIN_LOW], e.counts[NR_C_GAIN_LOW], slack) &&
+                            Near(c[NR_C_GAIN_HIGH], e.counts[NR_C_GAIN_HIGH], slack) &&
+                            Near(c[NR_C_COLOUR], e.counts[NR_C_COLOUR], slack);
+    Check(nearCounts,
+          "statistics, %s: below %u/%u, above %u/%u, shoulder %u/%u, heavy %u/%u, dark %u/%u, gain low %u/%u, high "
+          "%u/%u, colour %u/%u",
+          s.format->name, c[NR_C_BELOW], e.counts[NR_C_BELOW], c[NR_C_ABOVE], e.counts[NR_C_ABOVE], c[NR_C_SHOULDER],
+          e.counts[NR_C_SHOULDER], c[NR_C_HEAVY], e.counts[NR_C_HEAVY], c[NR_C_DARK], e.counts[NR_C_DARK],
+          c[NR_C_GAIN_LOW], e.counts[NR_C_GAIN_LOW], c[NR_C_GAIN_HIGH], e.counts[NR_C_GAIN_HIGH], c[NR_C_COLOUR],
+          e.counts[NR_C_COLOUR]);
+    Check(SameHistogram(w.data() + NR_S_MAX_HIST, e.maxHist, NR_HIST_BINS, slack) &&
+              SameHistogram(w.data() + NR_S_LUM_HIST, e.lumHist, NR_HIST_BINS, slack) &&
+              SameHistogram(w.data() + NR_S_GAIN_HIST, e.gainHist, NR_GAIN_BINS, slack),
+          "statistics, %s: the three histograms", s.format->name);
+    Check(Bits(c[NR_C_WHITE]) == WhiteOf(u) && Bits(c[NR_C_EXPOSURE]) == (u.useExposure ? u.exposure : 0.0f) &&
+              Bits(c[NR_C_MAX_BITS]) == e.largest,
+          "statistics, %s: white point %g (want %g), exposure %g, largest value %g (want %g)", s.format->name,
+          double(Bits(c[NR_C_WHITE])), double(WhiteOf(u)), double(Bits(c[NR_C_EXPOSURE])),
+          double(Bits(c[NR_C_MAX_BITS])), double(e.largest));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The scene meter (nr_stats.hlsl's METER and RESOLVE passes).
+
+const float kSceneKey = 0.2f;
+const float kSceneLow = 0.25f;
+const float kSceneHigh = 0.75f;
+const float kSceneSeconds = 0.5f;
+
+// Whether the meter counts a pixel, and the log2 of its luminance if so.
+bool Metered(const Pixel& p, float* ev)
+{
+    const float l = ref::Dot(ref::Clean(Rgb(p)), ref::kLuma);
+    if (!Finite(p) || !(l > 0.0f))
+        return false;
+    *ev = std::log2(l);
+    return true;
+}
+
+// The histogram the METER pass makes of the frame.
+std::vector<uint32_t> MeterBins(const Scene& s)
+{
+    std::vector<uint32_t> bins(NR_METER_BINS);
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            float ev = 0.0f;
+            if (!Metered(s.Frame(x, y), &ev))
+                continue;
+            const float at = std::floor((ev - float(NR_METER_EV_MIN)) * float(NR_METER_PER_EV));
+            ++bins[size_t(std::clamp(at, 0.0f, float(NR_METER_BINS - 1)))];
+        }
+    }
+    return bins;
+}
+
+// What the RESOLVE pass aims for, from that histogram: the log2 of the exposure that puts the mean log2 luminance of
+// the middle half of the pixels at the key.
+double MeterTarget(const std::vector<uint32_t>& bins)
+{
+    double total = 0.0;
+    for (const uint32_t b : bins)
+        total += b;
+    const double low = double(kSceneLow) * total;
+    const double high = double(kSceneHigh) * total;
+    double below = 0.0;
+    double sum = 0.0;
+    for (size_t k = 0; k < bins.size(); ++k)
+    {
+        const double inside = std::min(below + bins[k], high) - std::max(below, low);
+        if (inside > 0.0)
+            sum += inside * (NR_METER_EV_MIN + (double(k) + 0.5) / NR_METER_PER_EV);
+        below += bins[k];
+    }
+    return std::log2(double(kSceneKey)) - sum / (high - low);
+}
+
+// The same from the sorted pixels themselves, without bins: what the histogram stands for.
+double MeterTargetExact(const Scene& s)
+{
+    std::vector<double> evs;
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            float ev = 0.0f;
+            if (Metered(s.Frame(x, y), &ev))
+                evs.push_back(ev);
+        }
+    }
+    std::sort(evs.begin(), evs.end());
+    const size_t from = size_t(double(kSceneLow) * double(evs.size()));
+    const size_t to = size_t(double(kSceneHigh) * double(evs.size()));
+    double sum = 0.0;
+    for (size_t i = from; i < to; ++i)
+        sum += evs[i];
+    return std::log2(double(kSceneKey)) - sum / double(to - from);
+}
+
+void CheckMeter(Scene& s)
+{
+    const Setup u; // for Reset alone: the meter works in the frame's own units, whatever the white point
+    const UINT64 bytes = NR_METER_WORDS * 4;
+    ID3D12Resource* meter = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+    ID3D12Resource* scene = MakeTexture(DXGI_FORMAT_R32_FLOAT, 1, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_RESOURCE_STATES meterState = D3D12_RESOURCE_STATE_COMMON;
+    std::vector<uint32_t> left; // the meter's buffer after the resolve
+    // The scene texture holding `old`, the meter over the frame (unless `measure` is false), then the resolve; returns
+    // what the resolve stored.
+    auto run = [&](bool measure, float old, bool reset, float seconds) {
+        Reset(s, u);
+        std::vector<uint8_t> value(4);
+        std::memcpy(value.data(), &old, 4);
+        Upload(scene, value, 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Barrier(meter, meterState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        meterState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        Barrier(s.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const unsigned table = Table(OutputView(s), {}, {}, {}, { scene, DXGI_FORMAT_R32_FLOAT }, meter, bytes);
+        if (measure)
+            Dispatch(g.stats, table, Constants(s, u, NR_STATS_METER), Groups(s.width, 32), Groups(s.height, 32));
+        UavBarrier(meter);
+        NrConstants c = Constants(s, u, NR_STATS_RESOLVE);
+        c.seconds = seconds;
+        if (reset)
+            c.flags |= NR_FLAG_SCENE_RESET;
+        Dispatch(g.stats, table, c, 1, 1);
+        Barrier(s.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        left = ReadBuffer(meter, bytes, meterState);
+        const std::vector<uint8_t> got = Read(scene, 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        float stored = 0.0f;
+        std::memcpy(&stored, got.data(), 4);
+        return stored;
+    };
+    auto empty = [&] { return std::all_of(left.begin(), left.end(), [](uint32_t w) { return w == 0; }); };
+
+    const double want = MeterTarget(MeterBins(s));
+    const double exact = MeterTargetExact(s);
+    const double fresh = std::log2(double(run(true, 123.0f, true, 0.0f)));
+    Check(std::fabs(fresh - want) < 0.01 && std::fabs(fresh - exact) < 0.0625,
+          "scene meter, %s: afresh, exposure 2^%+.3f (the CPU from the same bins 2^%+.3f, from the sorted pixels "
+          "2^%+.3f)",
+          s.format->name, fresh, want, exact);
+    Check(empty(), "scene meter, %s: the histogram is empty again after the resolve", s.format->name);
+
+    // A quarter of a second after a white point 3 EV away: 1 - e^-0.5 = 39% of the way.
+    const float old = float(std::exp2(want + 3.0));
+    const double eased = std::log2(double(run(true, old, false, 0.25f)));
+    const double wantEased = want + 3.0 * std::exp(-0.25 / double(kSceneSeconds));
+    Check(std::fabs(eased - wantEased) < 0.01, "scene meter, %s: eased for 0.25 s from 2^%+.3f: 2^%+.3f (want 2^%+.3f)",
+          s.format->name, want + 3.0, eased, wantEased);
+
+    // Nothing to measure (the meter did not run, so the histogram is empty): the last value stays, even on a reset.
+    const float kept = run(false, old, true, 0.0f);
+    Check(kept == old && empty(), "scene meter, %s: with nothing to measure the last value stays (%g, want %g)",
+          s.format->name, double(kept), double(old));
+
+    // A stored value that is not a number is replaced by this frame's, without a reset.
+    const double replaced = std::log2(double(run(true, NAN, false, 0.25f)));
+    Check(std::fabs(replaced - want) < 0.01, "scene meter, %s: a stored NaN gives way to 2^%+.3f (want 2^%+.3f)",
+          s.format->name, replaced, want);
+    meter->Release();
+    scene->Release();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The frame dump (nr.hlsl's DUMP modes) and the preview.
+
+void CheckDump(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes)
+{
+    const UINT rw = s.width / NR_DUMP_SCALE, rh = s.height / NR_DUMP_SCALE;
+    const UINT cw = std::min<UINT>(NR_DUMP_CROP, s.width), ch = std::min<UINT>(NR_DUMP_CROP, s.height);
+    const UINT cx = (s.width - cw) / 2, cy = (s.height - ch) / 2;
+    const UINT64 end = NR_DUMP_HEADER_BYTES + UINT64(NR_DUMP_PICTURES) * (UINT64(rw) * rh + UINT64(cw) * ch) * 8;
+    const UINT64 bytes = end + 8;
+    ID3D12Resource* dump = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+
+    Reset(s, u);
+    RecordEncode(s, u);
+    Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(dump, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(s.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const unsigned dumpTable = Table(OutputView(s), { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                     { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT }, ExposureView(s, u), {}, dump, bytes);
+    const unsigned compositeTable = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                          { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT }, ExposureView(s, u), OutputView(s));
+    auto dumpPasses = [&](uint32_t mode) {
+        NrConstants c = Constants(s, u, mode);
+        c.part = 0;
+        c.outWidth = rw;
+        c.outHeight = rh;
+        Dispatch(g.nr, dumpTable, c, Groups(rw, 8), Groups(rh, 8));
+        c.part = 1;
+        c.outWidth = cw;
+        c.outHeight = ch;
+        Dispatch(g.nr, dumpTable, c, Groups(cw, 8), Groups(ch, 8));
+    };
+    dumpPasses(NR_MODE_DUMP_BEFORE);
+    Barrier(s.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Dispatch(g.nr, compositeTable, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
+    Barrier(s.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    dumpPasses(NR_MODE_DUMP_AFTER);
+    Barrier(s.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<uint32_t> w = ReadBuffer(dump, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dump->Release();
+    const std::vector<uint8_t> outputBytes = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, EncodeAndReadProxy(s, u));
+    const std::vector<Pixel> model = DecodeAll(kHalf, modelBytes);
+
+    Check(w[NR_D_TAG] == u.frame && w[end / 4] == u.frame && Bits(w[NR_D_WHITE]) == WhiteOf(u) &&
+              Bits(w[NR_D_EXPOSURE]) == (u.useExposure ? u.exposure : 0.0f),
+          "dump, %s: frame %u at both ends (%u, %u), white point %g, exposure %g", s.format->name, u.frame, w[NR_D_TAG],
+          w[end / 4], double(Bits(w[NR_D_WHITE])), double(Bits(w[NR_D_EXPOSURE])));
+
+    auto stored = [&](UINT part, UINT picture, UINT x, UINT y) {
+        const UINT64 pixel = part == 0 ? UINT64(picture) * rw * rh + UINT64(y) * rw + x
+                                       : UINT64(NR_DUMP_PICTURES) * rw * rh + UINT64(picture) * cw * ch + UINT64(y) * cw + x;
+        const uint32_t* p = w.data() + (NR_DUMP_HEADER_BYTES + pixel * 8) / 4;
+        return Pixel { HalfToFloat(uint16_t(p[0])), HalfToFloat(uint16_t(p[0] >> 16)), HalfToFloat(uint16_t(p[1])),
+                       HalfToFloat(uint16_t(p[1] >> 16)) };
+    };
+    auto outputAt = [&](UINT x, UINT y) {
+        const size_t i = size_t(y + s.baseY) * s.textureWidth + x + s.baseX;
+        return Decode(*s.format, outputBytes.data() + i * s.format->bytes);
+    };
+    // The reduced pictures, everywhere; the crop, everywhere.
+    size_t bad = 0;
+    for (UINT y = 0; y < rh; ++y)
+    {
+        for (UINT x = 0; x < rw; ++x)
+        {
+            Pixel mean[4] = {};
+            unsigned zebra = 0;
+            for (UINT dy = 0; dy < NR_DUMP_SCALE; ++dy)
+            {
+                for (UINT dx = 0; dx < NR_DUMP_SCALE; ++dx)
+                {
+                    const UINT fx = x * NR_DUMP_SCALE + dx, fy = y * NR_DUMP_SCALE + dy;
+                    const Pixel sources[4] = { s.Frame(fx, fy), proxy[size_t(fy) * s.width + fx],
+                                               model[size_t(fy) * s.width + fx], outputAt(fx, fy) };
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        mean[k].r += sources[k].r;
+                        mean[k].g += sources[k].g;
+                        mean[k].b += sources[k].b;
+                        mean[k].a += sources[k].a;
+                    }
+                    zebra = std::max(zebra, ref::ZebraClass(Rgb(sources[1]), u.linear, u.knobs.shoulder));
+                }
+            }
+            for (int k = 0; k < 4; ++k)
+            {
+                const float n = float(NR_DUMP_SCALE * NR_DUMP_SCALE);
+                Pixel want = { mean[k].r / n, mean[k].g / n, mean[k].b / n, mean[k].a / n };
+                if (k == 1)
+                    want.a = float(zebra);
+                const Pixel got = stored(0, UINT(k), x, y);
+                bad += !ClosePixel(kHalf, got, Quantise(kHalf, want)) || (k == 1 && got.a != want.a);
+            }
+        }
+    }
+    for (UINT y = 0; y < ch; ++y)
+    {
+        for (UINT x = 0; x < cw; ++x)
+        {
+            const UINT fx = cx + x, fy = cy + y;
+            const Pixel p = proxy[size_t(fy) * s.width + fx];
+            const Pixel wants[4] = { s.Frame(fx, fy),
+                                     { p.r, p.g, p.b, float(ref::ZebraClass(Rgb(p), u.linear, u.knobs.shoulder)) },
+                                     model[size_t(fy) * s.width + fx], outputAt(fx, fy) };
+            for (int k = 0; k < 4; ++k)
+            {
+                const Pixel got = stored(1, UINT(k), x, y);
+                bad += !ClosePixel(kHalf, got, Quantise(kHalf, wants[k])) || (k == 1 && got.a != wants[k].a);
+            }
+        }
+    }
+    Check(bad == 0, "dump, %s: the four %ux%u reduced pictures and the four %ux%u crops, zebra classes in the proxy's "
+                    "alpha (%zu values wrong)",
+          s.format->name, rw, rh, cw, ch, bad);
+}
+
+void CheckPreview(Scene& s, const Setup& u)
+{
+    const UINT scale = 4, pw = Groups(s.width, scale), ph = Groups(s.height, scale);
+    const std::vector<uint8_t> proxyBytes = EncodeAndReadProxy(s, u);
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, proxyBytes);
+    ID3D12Resource* preview = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, pw, ph, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Upload(s.model, proxyBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT }, { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                 {}, { preview, DXGI_FORMAT_R16G16B16A16_FLOAT });
+    NrConstants c = Constants(s, u, NR_MODE_PREVIEW);
+    c.flags |= NR_FLAG_ZEBRA;
+    c.scale = scale;
+    c.outWidth = pw;
+    c.outHeight = ph;
+    Dispatch(g.nr, table, c, Groups(pw, 8), Groups(ph, 8));
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<Pixel> got = DecodeAll(kHalf, Read(preview, 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    preview->Release();
+
+    size_t bad = 0, striped[3] = {};
+    for (UINT y = 0; y < ph; ++y)
+    {
+        for (UINT x = 0; x < pw; ++x)
+        {
+            Pixel sum = {};
+            unsigned marked = 0;
+            for (UINT dy = 0; dy < scale; ++dy)
+            {
+                for (UINT dx = 0; dx < scale; ++dx)
+                {
+                    const UINT qx = std::min(x * scale + dx, s.width - 1), qy = std::min(y * scale + dy, s.height - 1);
+                    const Pixel e = WithAlpha(ref::Saturate(Rgb(proxy[size_t(qy) * s.width + qx])), 1.0f);
+                    sum.r += e.r;
+                    sum.g += e.g;
+                    sum.b += e.b;
+                    marked = std::max(marked, ref::ZebraClass(Rgb(e), true, u.knobs.shoulder));
+                }
+            }
+            const float n = float(scale * scale);
+            Pixel want = { sum.r / n, sum.g / n, sum.b / n, 1.0f };
+            if (marked != 0 && ((x + y) / 4) % 2 == 0)
+            {
+                want = marked == 2 ? Pixel { 1.0f, 0.15f, 0.15f, 1.0f } : Pixel { 0.95f, 0.3f, 0.95f, 1.0f };
+                ++striped[marked];
+            }
+            bad += !ClosePixel(kHalf, got[size_t(y) * pw + x], Quantise(kHalf, want));
+        }
+    }
+    Check(bad == 0 && striped[1] > 0 && striped[2] > 0,
+          "preview, %s: %ux%u at 1/%u, zebra stripes on %zu shoulder and %zu heavy squares (%zu pixels wrong)",
+          s.format->name, pw, ph, scale, striped[1], striped[2], bad);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+
+void TestLinear(const Format& f, UINT border)
+{
+    if (!TypedLoad(f.dxgi))
+    {
+        Say("skip  %s: this GPU cannot load it through a UAV, so dxgi.dll stands down for it too", f.name);
+        return;
+    }
+    Scene s = MakeScene(f, 203, 117, border);
+    Setup base;
+
+    CheckEncode(s, base, "white point 2.5, Shoulder 0.70");
+    Setup exposure = base;
+    exposure.whiteScale = 5.0f;
+    exposure.useExposure = true;
+    exposure.exposure = 2.0f;
+    CheckEncode(s, exposure, "pre-exposure 5 over an exposure texture of 2");
+    Setup soft = base;
+    soft.knobs.shoulder = 0.5f;
+    soft.whiteScale = 0.8f;
+    CheckEncode(s, soft, "white point 0.8, Shoulder 0.50");
+
+    const std::vector<uint8_t> proxyBytes = EncodeAndReadProxy(s, base);
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, proxyBytes);
+    CheckUntouched(s, RunComposite(s, base, proxyBytes), "the model returns its input");
+
+    const std::vector<Pixel> brighter = MakeModel(proxy, [](ref::F3 p, size_t) { return p * std::exp2(0.5f); });
+    const std::vector<uint8_t> brighterBytes = Encode(brighter);
+    Setup off = base;
+    off.knobs.detail = 0.0f;
+    CheckUntouched(s, RunComposite(s, off, brighterBytes), "DetailStrength 0");
+
+    std::vector<uint8_t> output = RunComposite(s, base, brighterBytes);
+    CheckComposite(s, base, proxy, brighter, output, "model +0.5 EV");
+    CheckRatio(s, proxy, output, 0.5f, "model +0.5 EV");
+
+    const std::vector<Pixel> much = MakeModel(proxy, [](ref::F3 p, size_t) { return p * 8.0f; });
+    output = RunComposite(s, base, Encode(much));
+    CheckComposite(s, base, proxy, much, output, "model +3 EV, MaxGainEV 1");
+    CheckRatio(s, proxy, output, 1.0f, "model +3 EV, MaxGainEV 1");
+
+    // Some pixels a little brighter and warmer, every third left exactly as the model got it, with the highlights
+    // handed back.
+    std::vector<Pixel> mixed =
+        MakeModel(proxy, [](ref::F3 p, size_t) { return ref::F3 { p.r * 1.12f, p.g * 1.05f, p.b * 0.97f }; });
+    for (size_t i = 0; i < mixed.size(); i += 3)
+        mixed[i] = proxy[i];
+    Setup highlight = base;
+    highlight.knobs.highlight = 1.0f;
+    highlight.knobs.colour = 1.5f;
+    highlight.knobs.detail = 1.3f;
+    CheckComposite(s, highlight, proxy, mixed, RunComposite(s, highlight, Encode(mixed)),
+                   "mixed model, HighlightRestore 1, ColourStrength 1.5, DetailStrength 1.3");
+    CheckClippedWhite(s, proxy);
+
+    CheckCard(s);
+    CheckStats(s, base, brighterBytes);
+    Setup statsExposure = exposure;
+    statsExposure.frame = 777;
+    CheckStats(s, statsExposure, Encode(mixed));
+    CheckMeter(s);
+    CheckDump(s, base, brighterBytes);
+    CheckPreview(s, base);
+    Drop(s);
+}
+
+void TestDisplayEncoded(const Format& f)
+{
+    if (!TypedLoad(f.dxgi))
+    {
+        Say("skip  %s: this GPU cannot load it through a UAV, so dxgi.dll stands down for it too", f.name);
+        return;
+    }
+    Scene s = MakeScene(f, 160, 90, 0);
+    Setup base;
+    base.linear = false;
+    base.whiteScale = 1.0f;
+    CheckEncode(s, base, "display-encoded: a copy");
+    const std::vector<uint8_t> proxyBytes = EncodeAndReadProxy(s, base);
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, proxyBytes);
+    CheckUntouched(s, RunComposite(s, base, proxyBytes), "the model returns its input");
+    const std::vector<Pixel> brighter = MakeModel(proxy, [](ref::F3 p, size_t) { return p * std::exp2(0.5f); });
+    Setup off = base;
+    off.knobs.detail = 0.0f;
+    CheckUntouched(s, RunComposite(s, off, Encode(brighter)), "DetailStrength 0");
+    CheckComposite(s, base, proxy, brighter, RunComposite(s, base, Encode(brighter)), "model +0.5 EV");
+    Drop(s);
+}
+} // namespace
+
+int main()
+{
+    Init();
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options);
+    Say("shadertest: nr_cso %zu bytes, nr_stats_cso %zu bytes, typed UAV loads of the additional formats: %s",
+        sizeof nr_cso, sizeof nr_stats_cso, options.TypedUAVLoadAdditionalFormats ? "yes" : "no");
+    TestLinear(kHalf, 4); // inside a larger texture, as a game with an output subrect
+    TestLinear(kSmall, 0);
+    TestDisplayEncoded(kUnorm);
+    Say("shadertest: %d checks, %d failed", g_checks, g_failed);
+    if (g_failed == 0)
+        std::puts("PASS");
+    else
+        std::printf("FAIL (%d)\n", g_failed);
+    return g_failed;
+}

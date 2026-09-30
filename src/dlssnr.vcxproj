@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{7378DF31-CB8D-4CAA-9364-F920CCE94691}</ProjectGuid>
+    <RootNamespace>dlssnr</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <!-- MASM: the export stubs in dxgi_stubs.asm. -->
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  </ImportGroup>
+  <PropertyGroup>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\'))</RepoRoot>
+    <OutDir>$(RepoRoot)build\$(Configuration)\</OutDir>
+    <IntDir>$(RepoRoot)build\$(Configuration)\obj\</IntDir>
+    <!-- The game loads us as dxgi.dll. -->
+    <TargetName>dxgi</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <WarningLevel>Level3</WarningLevel>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;IMGUI_DISABLE_DEMO_WINDOWS;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;IMGUI_IMPL_WIN32_DISABLE_GAMEPAD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- sdk: the NGX headers. IntDir: build_hash.h and the shaders. third_party/imgui: Dear ImGui and its two backends. -->
+      <AdditionalIncludeDirectories>$(RepoRoot)sdk;$(IntDir);$(RepoRoot)third_party\imgui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ModuleDefinitionFile>$(MSBuildProjectDirectory)\dxgi.def</ModuleDefinitionFile>
+      <!-- The menu: D3D12 and DXGI for the overlay, comctl32 for the window subclass, d3dcompiler for the overlay's
+           own shaders (the ImGui DX12 backend compiles its shaders the same way). -->
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;comctl32.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <!-- Static CRT: nothing extra to find in a game's directory. -->
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="*.cpp" />
+    <ClInclude Include="*.h" />
+    <MASM Include="*.asm" />
+  </ItemGroup>
+  <!-- Dear ImGui (version and configuration in THIRD_PARTY_NOTICES.txt): the core and the Win32 and DX12 backends, compiled as they are.
+       Their warnings are theirs: the dlssnr sources keep the project's warning level. -->
+  <ItemGroup>
+    <ClCompile Include="$(RepoRoot)third_party\imgui\imgui.cpp;$(RepoRoot)third_party\imgui\imgui_draw.cpp;$(RepoRoot)third_party\imgui\imgui_widgets.cpp;$(RepoRoot)third_party\imgui\imgui_tables.cpp;$(RepoRoot)third_party\imgui\backends\imgui_impl_win32.cpp;$(RepoRoot)third_party\imgui\backends\imgui_impl_dx12.cpp">
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+  </ItemGroup>
+  <!-- Each shader is compiled to DXIL by the Windows SDK's own DXC (the SDK above is needed anyway) and embedded as
+       <name>_shader.h, array <name>_cso, in the build folder. It is rebuilt whenever the .hlsl is newer than the
+       header, so an edited shader cannot ship stale. -->
+  <PropertyGroup>
+    <Dxc>$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe</Dxc>
+  </PropertyGroup>
+  <ItemGroup>
+    <CustomBuild Include="*.hlsl">
+      <!-- MSBuild echoes the message through cmd, so it must not hold a ">": "->" wrote it into src\<name>_shader.h,
+           which then shadowed the real header. -->
+      <Message>dxc %(Filename).hlsl to %(Filename)_shader.h</Message>
+      <Command>"$(Dxc)" -T cs_6_0 -E CSMain -O3 -Qstrip_debug -Qstrip_reflect "%(FullPath)" -Fo "$(IntDir)%(Filename).cso" &amp;&amp; python "$(RepoRoot)tools\create_header.py" "$(IntDir)%(Filename).cso" "$(IntDir)%(Filename)_shader.h" %(Filename)_cso</Command>
+      <Outputs>$(IntDir)%(Filename)_shader.h</Outputs>
+      <!-- What the shaders include (the shared constants and formulas), and the script that writes the header: a
+           change to any of them rebuilds. -->
+      <AdditionalInputs>%(RootDir)%(Directory)nr_shared.h;%(RootDir)%(Directory)nr_common.hlsli;$(RepoRoot)tools\create_header.py;%(AdditionalInputs)</AdditionalInputs>
+    </CustomBuild>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
+  </ImportGroup>
+  <Target Name="CheckDxc" BeforeTargets="CustomBuild" Condition="!Exists('$(Dxc)')">
+    <Error Text="No shader compiler at $(Dxc): install the Windows SDK $(TargetPlatformVersion) (Visual Studio Installer, Individual components)." />
+  </Target>
+  <!-- The exports must still be the local System32\dxgi.dll's: a Windows update can add one, and a game that imports
+       it would then not start. Warns with the differences; tools\gen_dxgi_exports.py regenerates the list. -->
+  <Target Name="CheckDxgiExports" AfterTargets="Build">
+    <Exec Command="python &quot;$(RepoRoot)tools\gen_dxgi_exports.py&quot; --check &quot;$(TargetPath)&quot;" ContinueOnError="WarnAndContinue" />
+  </Target>
+  <!-- build_hash.h: the commit being built, for the first line of dlssnr.log. Rewritten only when it changes. -->
+  <Target Name="StampBuildHash" BeforeTargets="ClCompile">
+    <Exec Command="git describe --always --dirty --abbrev=7 2&gt;nul" WorkingDirectory="$(MSBuildProjectDirectory)" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="BuildHash" />
+      <Output TaskParameter="ExitCode" PropertyName="BuildHashExit" />
+    </Exec>
+    <PropertyGroup Condition="'$(BuildHashExit)' != '0' or '$(BuildHash)' == ''">
+      <BuildHash>unknown</BuildHash>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntDir)" />
+    <WriteLinesToFile File="$(IntDir)build_hash.h" Lines="#define BUILD_HASH &quot;$(BuildHash)&quot;" Overwrite="true" WriteOnlyWhenDifferent="true" />
+  </Target>
+</Project>

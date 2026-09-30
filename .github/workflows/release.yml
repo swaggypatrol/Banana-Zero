@@ -1,0 +1,59 @@
+# Publishes a GitHub Release from a package that was built and tested on a Windows PC (README, "Releasing"). It
+# builds nothing.
+#
+# The PC pushes the branch release/<tag>: the annotated tag <tag>, which must be on main, plus one commit adding only
+# dist/<tag>/ (made by tools/package_release.py). This checks exactly that, checks the package again
+# (tools/package_release.py --verify) and publishes the release <tag> with the zip and SHA256SUMS.txt. The release
+# notes are the tag's own message followed by the package's file table. The push starts it; running it by hand on the
+# branch release/<tag> (Actions > release > Run workflow) does the same, as a retry.
+name: release
+
+on:
+  push:
+    branches: ['release/v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the branch and the package
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#release/}"
+          if [[ "$GITHUB_REF_NAME" != release/* || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::run this on a branch release/vX.Y.Z, not $GITHUB_REF_NAME"; exit 1
+          fi
+          if [ "$(git cat-file -t "refs/tags/$tag" 2>/dev/null)" != tag ]; then
+            echo "::error::the annotated tag $tag is not in the repository"; exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag" origin/main; then
+            echo "::error::the tag $tag is not on main"; exit 1
+          fi
+          if [ "$(git rev-parse HEAD~1)" != "$(git rev-parse "$tag^{commit}")" ]; then
+            echo "::error::release/$tag must be the tag $tag plus one commit"; exit 1
+          fi
+          extra="$(git diff --name-only "$tag" HEAD |
+            grep -v -x -E "dist/$tag/(Banana-Zero-$tag\.zip|SHA256SUMS\.txt)" || true)"
+          if [ -n "$extra" ]; then
+            echo "::error::the package commit changes more than dist/$tag/:"; echo "$extra"; exit 1
+          fi
+          python3 tools/package_release.py --verify "$tag" > "$RUNNER_TEMP/files.md"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes.md"
+          { git tag -l --format='%(contents)' "$TAG"; printf '\n## Files\n\n'; cat "$RUNNER_TEMP/files.md"; } > "$notes"
+          gh release create "$TAG" "dist/$TAG/Banana-Zero-$TAG.zip" "dist/$TAG/SHA256SUMS.txt" \
+            --verify-tag --title "Banana-Zero $TAG" --notes-file "$notes"

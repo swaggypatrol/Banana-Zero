@@ -1,0 +1,5 @@
+# Store text with LF, check it out native.
+* text=auto
+# Release packages (dist/ on the release/* branches) and DLLs are binary, whatever the heuristics say.
+*.zip binary
+*.dll binary

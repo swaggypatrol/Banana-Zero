@@ -1,0 +1,70 @@
+Banana-Zero third-party notices
+===============================
+
+Banana-Zero's own code is released under the MIT licence, see LICENSE.txt.
+
+dxgi.dll contains the third-party code in section 1 and was compiled against the headers in section 2.
+banana.nvngx.dll contains only Banana-Zero's own code. The release package holds no NVIDIA program files
+(section 3).
+
+
+1. Dear ImGui v1.92.9b (the in-game menu)
+-----------------------------------------
+
+https://github.com/ocornut/imgui, release v1.92.9b, commit f1cc2ae15e53a861a874c3034aae6798fde194ab. The copy in
+third_party/imgui/ is unmodified, not one byte changed: the core (imgui.cpp, imgui_draw.cpp, imgui_widgets.cpp,
+imgui_tables.cpp and the headers) and the backends imgui_impl_win32 and imgui_impl_dx12. The demo window, docs,
+examples and misc folders are left out. Configuration lives in src/dlssnr.vcxproj's preprocessor definitions
+(IMGUI_DISABLE_DEMO_WINDOWS, IMGUI_DISABLE_OBSOLETE_FUNCTIONS, IMGUI_IMPL_WIN32_DISABLE_GAMEPAD), not in imconfig.h.
+To upgrade, replace the whole folder and update the version and commit here.
+
+The MIT License (MIT)
+
+Copyright (c) 2014-2026 Omar Cornut
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Compiled in along with Dear ImGui:
+
+- imstb_rectpack.h, imstb_textedit.h, imstb_truetype.h: Sean Barrett's stb libraries (Copyright (c) 2017 Sean
+  Barrett), MIT licence or public domain (Unlicense), your choice; the full text is at the end of each file.
+- The built-in fonts ProggyClean (MIT, Copyright (c) 2004, 2005 Tristan Grimmer) and ProggyForever (MIT, Copyright
+  (c) 2026 Disco Hello, Copyright (c) 2019,2023 Tristan Grimmer). The menu normally uses Segoe UI from Windows; the
+  built-in font is only the fallback when Segoe UI is missing.
+
+
+2. NVIDIA NGX SDK headers
+-------------------------
+
+sdk/nvsdk_ngx*.h, Copyright (c) 2018-2022 NVIDIA CORPORATION & AFFILIATES, under NVIDIA's licence. dxgi.dll is
+compiled against the types and constants they define; the release package holds neither these headers nor any
+NVIDIA library.
+
+
+3. NVIDIA files that are not in the release package
+---------------------------------------------------
+
+- nvngx_dlssnr.dll (the DLSS neural rendering model): NVIDIA's, not ours to redistribute. You bring your own and
+  put it in the game folder.
+- _nvngx.dll (the NGX runtime): installed with the NVIDIA display driver. Banana-Zero calls it inside the game
+  process and never copies it.
+
+
+Used at build time, not in the release package: the DirectX Shader Compiler (dxc.exe, Microsoft) from the Windows
+SDK, which compiles src/*.hlsl into shader bytecode that is embedded in dxgi.dll.
