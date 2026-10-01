@@ -52,11 +52,12 @@ const char* const kMenuColourText[] = { "auto", "sdr", "hdr" };
 const char* const kMenuThemeText[] = { "dark", "paper" };
 
 // The keys in the order new lines are added. `wanted` is set for a key whose line should exist: a value away from
-// the default, or a model parameter that is set.
+// the default, or a model parameter that is set. Room for the 33 keys MakePlan adds and a few more: nothing checks.
+constexpr unsigned kMaxKeys = 40;
 struct Plan
 {
-    Key keys[32];
-    bool wanted[32];
+    Key keys[kMaxKeys];
+    bool wanted[kMaxKeys];
     unsigned count;
 };
 
@@ -139,6 +140,12 @@ Plan MakePlan(const Settings& s)
     AddChoice(&plan, "MenuColour", "MenuColor", unsigned(s.menuColour), unsigned(d.menuColour), kMenuColourText, 3);
     AddFloat(&plan, "MenuNits", s.menuNits, d.menuNits);
     AddChoice(&plan, "MenuTheme", nullptr, unsigned(s.menuTheme), unsigned(d.menuTheme), kMenuThemeText, 2);
+    AddBool(&plan, "DilateMotion", s.dilateMotion, d.dilateMotion);
+    AddFloat(&plan, "SkyTone", s.skyTone, d.skyTone);
+    AddFloat(&plan, "SkyStructure", s.skyStructure, d.skyStructure);
+    // The sky's stripes are not stored either, like the card.
+    AddBool(&plan, "ShowSky", s.showSky, d.showSky);
+    plan.wanted[plan.count - 1] = false;
     return plan;
 }
 
@@ -220,7 +227,7 @@ char* SettingsMergeIni(const char* text, const Settings& settings, size_t* lengt
     if (const char* first = text != nullptr ? strchr(text, '\n') : nullptr)
         eol = first > text && first[-1] == '\r' ? "\r\n" : "\n";
 
-    bool seen[32] = {};
+    bool seen[kMaxKeys] = {};
     if (text == nullptr)
     {
         const char* header = "; Banana-Zero dlssnr.ini: the in-game menu writes the keys it changed; the rest stay at "

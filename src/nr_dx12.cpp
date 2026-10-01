@@ -44,7 +44,7 @@ constexpr int kFeatureNR = 18;
 constexpr unsigned kRing = 8;                 // frames whose descriptors are kept apart; also how long retired
                                               // handles and textures are parked before release
 constexpr unsigned kTable = 6;                // one descriptor table: t0-t3, u0-u1 (nr_shared.h)
-constexpr unsigned kTablesPerFrame = 5;       // encode, composite, dump, preview, meter
+constexpr unsigned kTablesPerFrame = 7;       // encode, composite, dump, preview, meter, dilate, sky
 constexpr unsigned kDescriptorsPerFrame = kTable * kTablesPerFrame;
 constexpr uint64_t kEvaluatesBetweenCreates = 30; // the driver's feature slots
 constexpr unsigned kMaxCreates = 64;
@@ -230,6 +230,42 @@ DXGI_FORMAT ExposureFormat(DXGI_FORMAT format)
     }
 }
 
+// The format our passes read the game's depth with: its depth plane alone, as one channel, so that a depth-stencil
+// texture reads as the depth it holds. UNKNOWN: a format we do not know; DilateMotion and the sky then do nothing.
+DXGI_FORMAT DepthView(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// The format our passes read the game's motion vectors with, and the one the dilated ones are stored in, so that they
+// are the same numbers. UNKNOWN: a format we do not know; DilateMotion then does nothing.
+DXGI_FORMAT MotionView(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_SNORM: return format;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R32G32_TYPELESS: return TypedFormat(format);
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 const char* FormatName(DXGI_FORMAT format)
 {
     switch (format)
@@ -255,6 +291,8 @@ const char* FormatName(DXGI_FORMAT format)
     case DXGI_FORMAT_D24_UNORM_S8_UINT: return "D24_UNORM_S8_UINT";
     case DXGI_FORMAT_R32G8X24_TYPELESS: return "R32G8X24_TYPELESS";
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return "D32_FLOAT_S8X24_UINT";
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: return "R32_FLOAT_X8X24_TYPELESS";
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: return "R24_UNORM_X8_TYPELESS";
     case DXGI_FORMAT_R16_TYPELESS: return "R16_TYPELESS";
     case DXGI_FORMAT_R16_FLOAT: return "R16_FLOAT";
     case DXGI_FORMAT_R16_UNORM: return "R16_UNORM";
@@ -553,6 +591,14 @@ struct Nr
     Texture depthClone;
     Texture motionClone;
     Parked parked[kMaxParked];
+
+    // What the game's depth adds (DilateMotion, the sky sliders): made the first frame each is wanted and again when
+    // the guides change size or format, kept otherwise. Both rest in the UAV state.
+    Texture dilated; // the motion vectors dilated by depth, in the motion vectors' own typed format
+    Texture mask;    // the control mask: R16G16B16A16_FLOAT, one texel per depth texel
+    bool dilatedFailed = false;
+    bool maskFailed = false;
+    bool saidDepth = false; // what the depth's passes read has been logged
 
     // Statistics: made the first time the background thread or the preview asks.
     Buffer stats;
@@ -1125,6 +1171,31 @@ void ReleaseParked()
     }
 }
 
+// One of the depth's textures (the dilated motion vectors, the control mask) at this format and size: kept while they
+// stay, made again when they change (the old one parked for the command lists still in flight). One that cannot be
+// made is not tried again, and what wants it does nothing.
+bool EnsureGuide(Texture* texture, DXGI_FORMAT format, unsigned width, unsigned height, bool* failed, const char* what)
+{
+    if (texture->resource != nullptr && texture->format == format && texture->width == width &&
+        texture->height == height)
+        return true;
+    if (*failed)
+        return false;
+    if (texture->resource != nullptr)
+    {
+        ID3D12Resource* const old[1] = { texture->resource };
+        Park(nullptr, old, 1);
+        *texture = {};
+    }
+    if (!MakeTexture(texture, format, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, what))
+    {
+        *failed = true;
+        return false;
+    }
+    return true;
+}
+
 // The creation keys. Of the model's own parameters it reads only Preset when it creates the feature (the rest at
 // every evaluation: FillTunables); Preset is written when the user set it, and a key once written stays in the block.
 void FillCreate(NVSDK_NGX_Parameter* params, unsigned width, unsigned height, const ModelSettings& m)
@@ -1652,6 +1723,39 @@ void FillEvaluate(NVSDK_NGX_Parameter* p, const Frame& f, ID3D12Resource* depth,
     p->Set("DLSSNR.MVecScaleY", f.mvScaleY);
 }
 
+// The control mask (the sky sliders), or none. Every frame, like the rest. While it is given, the model leaves its own
+// auto mask off (the teardown).
+void FillMask(NVSDK_NGX_Parameter* p, const Texture* mask)
+{
+    ID3D12Resource* const resource = mask != nullptr ? mask->resource : nullptr;
+    p->Set("DLSSNR.ControlMask", resource);
+    p->Set("DLSSNR.ControlMaskSubrectBaseX", 0u);
+    p->Set("DLSSNR.ControlMaskSubrectBaseY", 0u);
+    p->Set("DLSSNR.ControlMaskSubrectWidth", mask != nullptr ? mask->width : 0u);
+    p->Set("DLSSNR.ControlMaskSubrectHeight", mask != nullptr ? mask->height : 0u);
+}
+
+// Whether the sky sliders are in use: either away from 1. At 1 the mask would be 1 everywhere, which is what no mask
+// does, so none is made.
+bool SkyWanted(const Settings& s) { return s.skyTone != 1.0f || s.skyStructure != 1.0f; }
+
+// Once, the first frame anything of the depth's is wanted: what its passes read, and what counts as sky.
+__declspec(noinline) void DescribeDepth(const Frame& f, DXGI_FORMAT depthView, DXGI_FORMAT motionView)
+{
+    char depth[32], depthAs[32], motion[32], motionAs[32];
+    DescribeFormat(f.depthDesc.Format, depth, sizeof depth);
+    DescribeFormat(depthView, depthAs, sizeof depthAs);
+    DescribeFormat(f.motionDesc.Format, motion, sizeof motion);
+    DescribeFormat(motionView, motionAs, sizeof motionAs);
+    Log("NR: the depth's passes read the depth (%s, %ux%u at %u,%u) %s%s, sky where it is %s; the motion vectors (%s, "
+        "%ux%u at %u,%u) %s%s",
+        depth, f.guideWidth, f.guideHeight, f.depthBaseX, f.depthBaseY, depthView != DXGI_FORMAT_UNKNOWN ? "as " : "",
+        depthView != DXGI_FORMAT_UNKNOWN ? depthAs : "not at all: DilateMotion, the sky sliders and ShowSky do nothing",
+        f.depthInverted ? "0 (inverted)" : "1", motion, f.motionWidth, f.motionHeight, f.motionBaseX, f.motionBaseY,
+        motionView != DXGI_FORMAT_UNKNOWN ? "as " : "",
+        motionView != DXGI_FORMAT_UNKNOWN ? motionAs : "not at all: DilateMotion does nothing");
+}
+
 bool LinearHdr(const Frame& f, const Settings& s)
 {
     return s.inputType == InputType::LinearHdr || (s.inputType == InputType::Auto && f.hdr);
@@ -1688,6 +1792,19 @@ NrConstants FrameConstants(const Frame& f, const Settings& s, WhiteSource source
     c.whiteScale = 1.0f;
     if (s.compare) // the split screen (M3): the original's share of the width, never the whole of it
         c.splitX = Min(unsigned(float(f.width) * s.compareSplit / 100.0f + 0.5f), f.width - 2) | 1u;
+    // What the game's depth adds; Run decides which of its passes run.
+    c.guideWidth = f.guideWidth;
+    c.guideHeight = f.guideHeight;
+    c.depthBaseX = f.depthBaseX;
+    c.depthBaseY = f.depthBaseY;
+    c.motionBaseX = f.motionBaseX;
+    c.motionBaseY = f.motionBaseY;
+    c.skyTone = s.skyTone;
+    c.skyStructure = s.skyStructure;
+    if (f.depthInverted)
+        c.flags |= NR_FLAG_DEPTH_INVERTED;
+    if (s.showSky && DepthView(f.depthDesc.Format) != DXGI_FORMAT_UNKNOWN)
+        c.flags |= NR_FLAG_SHOW_SKY;
     if (!LinearHdr(f, s))
         return c; // display-encoded already: the encode is a copy, no white point, no shoulder, no card
     c.flags |= NR_FLAG_LINEAR_HDR;
@@ -1769,6 +1886,8 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const unsigned dumpTable = base + 2 * kTable;
     const unsigned previewTable = base + 3 * kTable;
     const unsigned meterTable = base + 4 * kTable;
+    const unsigned dilateTable = base + 5 * kTable;
+    const unsigned skyTable = base + 6 * kTable;
     const DXGI_FORMAT outputView = ViewFormat(f.outputDesc.Format);
 
     // The scene meter runs on every linear HDR frame, whichever white point is in use, so that one switched to it
@@ -1808,6 +1927,25 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const DumpLayout layout = dumpDue ? Layout(f.width, f.height) : DumpLayout {};
     const bool preview = previewing && EnsurePreview(f);
 
+    // What the game's depth adds: the motion vectors dilated by it (DilateMotion), the control mask that sets the sky
+    // apart (the sky sliders), the stripes over the sky (ShowSky, in the constants already). Each needs the depth in
+    // a format our passes read, the dilation the motion vectors too.
+    const DXGI_FORMAT depthView = DepthView(f.depthDesc.Format);
+    const DXGI_FORMAT motionView = MotionView(f.motionDesc.Format);
+    if (!g_nr.saidDepth && (s.dilateMotion || SkyWanted(s) || s.showSky))
+    {
+        g_nr.saidDepth = true;
+        DescribeDepth(f, depthView, motionView);
+    }
+    const bool depthReadable = depthView != DXGI_FORMAT_UNKNOWN;
+    const bool dilate = s.dilateMotion && depthReadable && motionView != DXGI_FORMAT_UNKNOWN &&
+                        EnsureGuide(&g_nr.dilated, motionView, f.motionWidth, f.motionHeight, &g_nr.dilatedFailed,
+                                    "dilated motion vector");
+    const bool sky = SkyWanted(s) && depthReadable &&
+                     EnsureGuide(&g_nr.mask, DXGI_FORMAT_R16G16B16A16_FLOAT, f.guideWidth, f.guideHeight,
+                                 &g_nr.maskFailed, "control mask");
+    const bool showSky = (constants.flags & NR_FLAG_SHOW_SKY) != 0;
+
     // The descriptor tables (nr_shared.h has which pass reads which slot).
     WriteSrv(encodeTable + 0, f.output, outputView);
     WriteSrv(encodeTable + 1, nullptr, DXGI_FORMAT_UNKNOWN);
@@ -1815,7 +1953,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     WriteSrv(encodeTable + 3, exposure, exposureView);
     WriteTextureUav(encodeTable + 4, g_nr.proxy.resource, g_nr.proxy.format);
     WriteBufferUav(encodeTable + 5, stats ? &g_nr.stats : nullptr);
-    WriteSrv(compositeTable + 0, nullptr, DXGI_FORMAT_UNKNOWN);
+    WriteSrv(compositeTable + 0, showSky ? f.depth : nullptr, depthView);
     WriteSrv(compositeTable + 1, g_nr.modelOutput.resource, g_nr.modelOutput.format);
     WriteSrv(compositeTable + 2, g_nr.proxy.resource, g_nr.proxy.format);
     WriteSrv(compositeTable + 3, exposure, exposureView);
@@ -1848,13 +1986,31 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         WriteTextureUav(meterTable + 4, g_nr.scene.resource, DXGI_FORMAT_R32_FLOAT);
         WriteBufferUav(meterTable + 5, &g_nr.meter);
     }
+    if (dilate)
+    {
+        WriteSrv(dilateTable + 0, f.depth, depthView);
+        WriteSrv(dilateTable + 1, f.motion, motionView);
+        WriteSrv(dilateTable + 2, nullptr, DXGI_FORMAT_UNKNOWN);
+        WriteSrv(dilateTable + 3, nullptr, DXGI_FORMAT_UNKNOWN);
+        WriteTextureUav(dilateTable + 4, g_nr.dilated.resource, g_nr.dilated.format);
+        WriteBufferUav(dilateTable + 5, nullptr);
+    }
+    if (sky)
+    {
+        WriteSrv(skyTable + 0, f.depth, depthView);
+        WriteSrv(skyTable + 1, nullptr, DXGI_FORMAT_UNKNOWN);
+        WriteSrv(skyTable + 2, nullptr, DXGI_FORMAT_UNKNOWN);
+        WriteSrv(skyTable + 3, nullptr, DXGI_FORMAT_UNKNOWN);
+        WriteTextureUav(skyTable + 4, g_nr.mask.resource, g_nr.mask.format);
+        WriteBufferUav(skyTable + 5, nullptr);
+    }
     const unsigned groupsX = Groups(f.width, 8);
     const unsigned groupsY = Groups(f.height, 8);
     const unsigned statsX = Groups(f.width, 32); // nr_stats.hlsl: 16x16 threads, 2x2 pixels each
     const unsigned statsY = Groups(f.height, 32);
 
     // 1-2: the scene meter, the encode, and the frame's statistics.
-    D3D12_RESOURCE_BARRIER barriers[6];
+    D3D12_RESOURCE_BARRIER barriers[8];
     unsigned count = 0;
     Transition(&barriers[count++], f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1904,12 +2060,35 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         Dispatch(list, g_nr.statsPipeline, encodeTable, constants, statsX, statsY);
     }
 
-    // 3: the model's inputs.
+    // 3: the model's inputs. The depth's passes read the game's guides in the NPSR state they come in, before the
+    // clones move them.
+    if (dilate)
+    {
+        NrConstants c = constants;
+        c.mode = NR_MODE_DILATE;
+        c.outWidth = f.motionWidth;
+        c.outHeight = f.motionHeight;
+        Dispatch(list, g_nr.pipeline, dilateTable, c, Groups(f.motionWidth, 8), Groups(f.motionHeight, 8));
+    }
+    if (sky)
+    {
+        NrConstants c = constants;
+        c.mode = NR_MODE_SKY;
+        c.outWidth = f.guideWidth;
+        c.outHeight = f.guideHeight;
+        Dispatch(list, g_nr.pipeline, skyTable, c, Groups(f.guideWidth, 8), Groups(f.guideHeight, 8));
+    }
     count = 0;
     Transition(&barriers[count++], g_nr.proxy.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (stats)
         UavBarrier(&barriers[count++], g_nr.stats.resource);
+    if (dilate)
+        Transition(&barriers[count++], g_nr.dilated.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (sky)
+        Transition(&barriers[count++], g_nr.mask.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(count, barriers);
     ID3D12Resource* depth = f.depth;
     unsigned depthBaseX = f.depthBaseX, depthBaseY = f.depthBaseY;
@@ -1927,11 +2106,17 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         motion = g_nr.motionClone.resource;
         motionBaseX = motionBaseY = 0;
     }
+    if (dilate)
+    {
+        motion = g_nr.dilated.resource;
+        motionBaseX = motionBaseY = 0;
+    }
 
     // 4: the model.
     const unsigned reset = g_nr.resetNext || f.reset != 0 ? 1u : 0u;
     g_nr.resetNext = false;
     FillEvaluate(g_nr.evalParams, f, depth, depthBaseX, depthBaseY, motion, motionBaseX, motionBaseY, reset);
+    FillMask(g_nr.evalParams, sky ? &g_nr.mask : nullptr);
     FillTunables(g_nr.evalParams, s.model);
     const int result = g_nr.bridge.evaluate(list, g_nr.handle, g_nr.evalParams, nullptr);
     const bool delivered = result == NVSDK_NGX_Result_Success;
@@ -2054,6 +2239,12 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
                    D3D12_RESOURCE_STATE_COPY_DEST);
     if (meter)
         Transition(&barriers[count++], g_nr.scene.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (dilate)
+        Transition(&barriers[count++], g_nr.dilated.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (sky)
+        Transition(&barriers[count++], g_nr.mask.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->ResourceBarrier(count, barriers);
 }
@@ -2561,8 +2752,8 @@ unsigned ReleaseEverything()
         }
         p = {};
     }
-    Texture* const textures[] = { &g_nr.proxy,       &g_nr.modelOutput, &g_nr.depthClone,
-                                  &g_nr.motionClone, &g_nr.preview,     &g_nr.scene };
+    Texture* const textures[] = { &g_nr.proxy,   &g_nr.modelOutput, &g_nr.depthClone, &g_nr.motionClone,
+                                  &g_nr.preview, &g_nr.scene,       &g_nr.dilated,    &g_nr.mask };
     for (Texture* t : textures)
     {
         if (t->resource != nullptr)

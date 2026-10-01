@@ -1,7 +1,8 @@
 // The Neural Rendering pass around the model: the encode (the game's Output -> the
-// model's input), the composite (the model's output -> the game's Output, in place, plus the badge and the split
-// screen's divider), the preview
-// picture and the frame dump. One shader; g.mode picks the pass. The statistics are in nr_stats.hlsl, the
+// model's input), the composite (the model's output -> the game's Output, in place, plus the badge, the split
+// screen's divider and the sky's stripes), the preview
+// picture, the frame dump, and what the game's depth adds to the model's inputs (motion vectors dilated by it, the
+// control mask that sets the sky apart). One shader; g.mode picks the pass. The statistics are in nr_stats.hlsl, the
 // formulas both use in nr_common.hlsli.
 //
 // Precompiled: the build turns this file into nr_shader.h (array nr_cso). Commit the regenerated header with it.
@@ -84,6 +85,33 @@ float3 Card(uint2 q)
     if (p.x < x0 + gap || p.x >= x1 - gap || p.y < y0 + gap || p.y >= y1 - gap)
         value = float3(0.0, 0.0, 0.0);
     return value;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// What the game's depth adds (DilateMotion, the sky sliders, Show sky). The depth comes through t0, read through a
+// view of its depth plane alone (its first channel), the motion vectors through t1, each at its own subrect. Both are
+// at the render resolution in the two tested games; the passes do not count on it.
+
+// How close to the far end of the depth range a pixel must be to count as sky: where games draw the sky, or what they
+// clear the depth to and leave there. Anything real is much nearer: with the near plane at 10 cm, 1e-6 is 100 km away.
+static const float kSkyDepth = 1.0e-6;
+
+bool DepthInverted() { return (g.flags & NR_FLAG_DEPTH_INVERTED) != 0; }
+
+float GuideDepth(uint2 q) { return gFrame.Load(int3(q + uint2(g.depthBaseX, g.depthBaseY), 0)).x; }
+
+bool IsSky(float d) { return DepthInverted() ? d <= kSkyDepth : d >= 1.0 - kSkyDepth; }
+
+// Whether depth a is closer to the camera than depth b. Every comparison with a NaN is false: a NaN is never taken,
+// and a texel whose own depth is NaN keeps its own motion.
+bool Closer(float a, float b) { return DepthInverted() ? a > b : a < b; }
+
+// The depth texel under texel p of a picture of `size` that shows the same view (the motion vectors, the frame): the
+// one its centre falls in.
+uint2 DepthTexel(uint2 p, uint2 size)
+{
+    const uint2 guide = uint2(g.guideWidth, g.guideHeight);
+    return min((p * 2 + 1) * guide / (size * 2), guide - 1);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -194,6 +222,42 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const uint2 base = uint2(g.baseX, g.baseY);
     const bool linearHdr = (g.flags & NR_FLAG_LINEAR_HDR) != 0;
 
+    if (g.mode == NR_MODE_DILATE)
+    {
+        // Each motion vector texel takes the motion of the nearest, by depth, of itself and its four neighbours (as
+        // nrprobe's T7 did): along the edge of something in front, the texels just outside it move with it, so the
+        // display pixels its edge covers between two texels follow it rather than what lies behind.
+        if (id.x >= g.outWidth || id.y >= g.outHeight)
+            return;
+        const uint2 size = uint2(g.outWidth, g.outHeight);
+        const uint2 taps[4] = { uint2(id.x > 0 ? id.x - 1 : 0, id.y), uint2(min(id.x + 1, size.x - 1), id.y),
+                                uint2(id.x, id.y > 0 ? id.y - 1 : 0), uint2(id.x, min(id.y + 1, size.y - 1)) };
+        uint2 best = id.xy;
+        float bestDepth = GuideDepth(DepthTexel(best, size));
+        [unroll] for (uint i = 0; i < 4; ++i)
+        {
+            const float d = GuideDepth(DepthTexel(taps[i], size));
+            if (Closer(d, bestDepth))
+            {
+                best = taps[i];
+                bestDepth = d;
+            }
+        }
+        gTarget[id.xy] = float4(gModel.Load(int3(best + uint2(g.motionBaseX, g.motionBaseY), 0)).xy, 0.0, 0.0);
+        return;
+    }
+    if (g.mode == NR_MODE_SKY)
+    {
+        // The control mask, one texel per depth texel: .x times Intensity (the model's final blend), .y times
+        // LocalTone, .z times LocalStructure; .w unused (the teardown, nrprobe's T8). The sky gets the sky sliders,
+        // everything else 1, which is what no mask at all does.
+        if (id.x >= g.outWidth || id.y >= g.outHeight)
+            return;
+        const bool sky = IsSky(GuideDepth(id.xy));
+        gTarget[id.xy] = float4(1.0, sky ? g.skyTone : 1.0, sky ? g.skyStructure : 1.0, 1.0);
+        return;
+    }
+
     if (g.mode == NR_MODE_PREVIEW || g.mode == NR_MODE_DUMP_BEFORE || g.mode == NR_MODE_DUMP_AFTER)
     {
         if (id.x >= g.outWidth || id.y >= g.outHeight)
@@ -292,6 +356,16 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         if (any(modelEncoded != proxyEncoded))
         {
             result.rgb = Composite(frame.rgb, proxyEncoded, modelEncoded, linearHdr);
+            write = true;
+        }
+    }
+
+    // Show sky: purple stripes over what counts as sky, on both sides of the split screen, as bright as the white point.
+    if ((g.flags & NR_FLAG_SHOW_SKY) != 0 && ((id.x + id.y) / 8) % 2 == 0 && !InCard(id.xy))
+    {
+        if (IsSky(GuideDepth(DepthTexel(id.xy, uint2(g.width, g.height)))))
+        {
+            result.rgb = float3(0.95, 0.3, 0.95) * white;
             write = true;
         }
     }

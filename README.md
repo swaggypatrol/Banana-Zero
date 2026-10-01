@@ -119,7 +119,7 @@ frame or two after you let go.
 | **Model intensity** | 0 to 1 | Blends the model's result back towards its input, inside the model. Much the same job as Strength, which does it on the HDR frame and goes further, so leave this at 1 |
 | **Local structure** | 0 to 1.5 | Fine texture and small light-and-shade detail |
 | **Local tone** | 0 to 1.5 | Local contrast |
-| **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else |
+| **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else. Greyed out while a sky slider (Depth page) is away from 1: handed our map of the picture, the model switches its own off |
 | **Skin structure** | follows local structure, or 0 to 1.5 | Texture on skin. Only does anything with Auto mask on (greyed out otherwise). Turn it down for less texture on faces |
 
 *HDR encode.* Both tested games hand DLSS linear HDR values with no upper limit, even with Windows in SDR mode, but
@@ -148,6 +148,23 @@ point**, encoded like a display would, with highlights above the white point fol
 | **Zebra stripes** | On the Model input preview: purple where highlights enter the shoulder, red where they are squeezed more than 3 EV. Purple belongs on skies, lamps and reflections, not on walls and faces. Healthy scenes showed roughly 3 to 16% purple |
 | **Calibration card** | Draws a test chart onto a frozen frame, with grey steps, mid grey, white, a bright dot and colour patches, all in units of the white point. Put the split-screen divider through the middle: the two halves should look the same. Where they differ, that knob has gone too far |
 | **Card corner** | Where the card goes |
+
+### Depth (experimental)
+
+Two experiments with something the game hands DLSS anyway: how far away every pixel is. Neither does anything until
+you touch it, and Reset all puts both back.
+
+| Control | Range | What it does |
+|---|---|---|
+| **Dilate by depth** | Off, On | Each motion vector takes the motion of whatever is nearest among itself and its four neighbours, so the edge of a moving thing moves with the thing, not with what is behind it. `nrprobe --tuning` measured it a little better over most of the frame and a little worse right on thin moving things. Judge it in motion: pan the camera past poles, branches and railings against the sky |
+| **Sky local tone** | 0 to 1.5, default 1 | Local tone on the sky alone, as a multiple of Local tone. 1 is the same as the rest of the picture, 0.5 half as much, 0 none. Watch cloud contrast and smooth gradients |
+| **Sky local structure** | 0 to 1.5, default 1 | The same for Local structure: the fine texture in clouds. Turn it down if the sky looks grainy |
+| **Show what counts as sky** | Off, On | Purple stripes over what the sky sliders work on. Not saved |
+
+The sky is whatever sits at the far end of the game's depth: the sky dome, and anything else the game never gave a
+depth. Indoors, unless a window shows the sky, there is none and the sky sliders have nothing to work on; Show what
+counts as sky tells you. The model looks at the picture as a whole, so what the sky gets moves the rest of the
+picture too, by about a fifth as much.
 
 ### Keys and Menu
 
@@ -208,10 +225,15 @@ like to open the back panel.
 | `MenuColour` | `auto` / `sdr` / `hdr` | `auto` | Menu colour |
 | `MenuNits` | 80 to 400 | 200 | Menu brightness |
 | `Badge` | 0 to 10 seconds | 3 | Green badge |
+| `DilateMotion` | 1 / 0 | 0 | Dilate by depth |
+| `SkyTone` | 0 to 2 | 1 | Sky local tone |
+| `SkyStructure` | 0 to 2 | 1 | Sky local structure |
+| `ShowSky` | 1 / 0 | 0 | Show what counts as sky; the menu never saves it |
 | `StatsLog` | seconds, 0 = off | 0 | file only; a statistics line in the log every N seconds (`tools/bzstats.py` reads them) |
 | `DumpEvery` | seconds, 0 = off | 0 | file only; a frame dump to `%LOCALAPPDATA%\Banana-Zero\dumps` every N seconds, at most 16 (`tools/bzdump.py` turns them into pictures) |
 
-The file accepts wider ranges than the menu's sliders. Freeze, the calibration card and A/B are never saved.
+The file accepts wider ranges than the menu's sliders. Freeze, the calibration card, the sky's stripes and A/B are
+never saved.
 
 ## Troubleshooting
 

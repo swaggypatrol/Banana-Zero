@@ -119,6 +119,12 @@ struct Settings
     MenuColour menuColour = MenuColour::Auto;  // MenuColour
     float menuNits = 200.0f;                   // MenuNits: the menu's white on an HDR display, 80 .. 400
     MenuTheme menuTheme = MenuTheme::Paper;    // MenuTheme: dark | paper
+
+    // What the game's depth adds: the menu's experimental page. All of it does nothing until set.
+    bool dilateMotion = false; // DilateMotion: the model gets the motion vectors dilated by depth
+    float skyTone = 1.0f;      // SkyTone: Local tone on the sky, as a factor on LocalTone: 0 .. 2; 1 = as elsewhere
+    float skyStructure = 1.0f; // SkyStructure: the same for Local structure
+    bool showSky = false;      // ShowSky: stripes over what counts as sky (the menu will not store it)
 };
 
 // Reads the file (absent is fine: defaults), publishes the snapshot and logs what it read. Returns the snapshot.

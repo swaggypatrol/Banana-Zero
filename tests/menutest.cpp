@@ -8,13 +8,14 @@
 //   - keys.cpp: names and codes both ways, the hex fallback, unknown names
 //   - settings_write.cpp: a file with comments, unknown keys and StatsLog keeps every line it should; a model
 //     parameter set back to the model's default loses its line; a new file gets its header; what was written reads
-//     back the same
+//     back the same; the sky's stripes are never written
 //   - menu_model.cpp: the draft, A/B, when the file is due, a reload behind the menu
 //   - the panel: a slider dragged with the mouse publishes every step at once and logs the drag once, when the mouse
 //     lets go; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
 //     box unfreezes it, unticking the card undoes the freeze it made; skin structure takes no input until the auto
-//     mask is on; "all defaults"; closing the menu writes the file, and so does a second after a commit while it is
-//     open
+//     mask is on; "all defaults"; the depth page: a sky slider away from 1 greys out the auto mask until it is back,
+//     the stripes and the dilation commit at once; closing the menu writes the file, and so does a second after a
+//     commit while it is open
 
 #include <windows.h>
 
@@ -243,6 +244,10 @@ void TestWrite()
     full.freezeKey = 0x71; // F2
     full.menuColour = MenuColour::Hdr;
     full.menuNits = 250.0f;
+    full.dilateMotion = true;
+    full.skyTone = 0.5f;
+    full.skyStructure = 1.25f;
+    full.showSky = true;
     unsigned long error = 0;
     Check(SettingsWriteIni(g_ini, full, &error), "write: SettingsWriteIni (error %lu)", error);
     loaded = SettingsLoad(g_ini);
@@ -255,6 +260,10 @@ void TestWrite()
               loaded->toggleKey == full.toggleKey && loaded->freezeKey == full.freezeKey &&
               loaded->menuColour == full.menuColour && Near(loaded->menuNits, full.menuNits, 1e-6f),
           "write: the menu's keys read back the same");
+    Check(loaded->dilateMotion == full.dilateMotion && Near(loaded->skyTone, full.skyTone, 1e-6f) &&
+              Near(loaded->skyStructure, full.skyStructure, 1e-6f),
+          "write: the depth page's keys read back the same");
+    Check(!loaded->showSky && !FileHas("ShowSky", 0.0), "write: the sky's stripes are never written");
     Check(loaded->enabled && Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog still 2, Enabled back to 1");
 }
 
@@ -523,6 +532,28 @@ void TestPanel()
               Near(SettingsCurrent()->whiteEV, 0.0f, 1e-6f),
           "panel: all defaults published");
 
+    // The depth page. A sky slider away from 1 gives the model a control mask, and with one the model keeps its own
+    // auto mask off: the auto mask takes no input until both sky sliders are back at 1.
+    const unsigned g3 = Generation();
+    Check(!Centre("SkyStructure", &x, &y), "panel: the sky sliders wait on the depth page");
+    Check(Click("TabDepth"), "panel: open the depth page");
+    Check(!Centre("DetailStrength", &x, &y), "panel: the tuning page is hidden now");
+    Check(Click("SkyStructure", 0.1f), "panel: click sky local structure near its left end");
+    Check(Generation() == g3 + 1 && SettingsCurrent()->skyStructure < 0.3f,
+          "panel: the click publishes the value under the mouse at once (%.2f, generation %u)",
+          double(SettingsCurrent()->skyStructure), Generation());
+    Check(Click("ShowSky") && SettingsCurrent()->showSky && Generation() == g3 + 2, "panel: the sky's stripes on");
+    Check(Click("TabTune") && Centre("AutoMask", &x, &y), "panel: back on the tuning page, the auto mask is drawn");
+    Check(Click("AutoMask", 0.5f, 1) && Generation() == g3 + 2,
+          "panel: the auto mask takes no right-click while a sky slider is away from 1");
+    Check(Click("TabDepth") && Click("SkyStructure", 0.5f, 1), "panel: right-click sky local structure");
+    Check(Generation() == g3 + 3 && SettingsCurrent()->skyStructure == 1.0f, "panel: sky local structure back to 1");
+    Check(Click("TabTune") && Click("AutoMask", 0.5f, 1) && Generation() == g3 + 4,
+          "panel: with both sky sliders at 1 the auto mask takes a right-click again");
+    Check(Click("TabDepth") && Click("DilateMotion") && SettingsCurrent()->dilateMotion && Generation() == g3 + 5,
+          "panel: dilate by depth on, published at once");
+    Check(Click("TabTune"), "panel: back to the tuning page");
+
     // Closing writes the file at once.
     {
         MenuLock();
@@ -536,6 +567,8 @@ void TestPanel()
     Check(!FileHas("Intensity", 0.0) && FileHas("WhiteEV = 0", 0.0),
           "panel: a model parameter back at the model's default lost its line, a key with a line keeps it");
     Check(FileHas("StatsLog = 0", 0.0), "panel: StatsLog still there");
+    Check(FileHas("DilateMotion = 1", 0.0) && !FileHas("SkyStructure", 0.0) && !FileHas("ShowSky", 0.0),
+          "panel: DilateMotion written; a sky slider back at 1 and the stripes not");
 
     ImGui::DestroyContext();
 }

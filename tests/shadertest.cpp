@@ -17,8 +17,12 @@
 //     to measure, against the CPU from the same histogram and from the sorted pixels themselves
 //   - the frame dump: header, closing word, pictures, and the zebra classes in the proxy's alpha
 //   - the preview's zebra stripes
-// Formats whose typed UAV loads this GPU lacks are skipped, as dxgi.dll skips them. The exit code is the number of
-// failed checks.
+// Formats whose typed UAV loads this GPU lacks are skipped, as dxgi.dll skips them. Then, for every depth format
+// dxgi.dll reads (typeless and fully typed, drawn as a depth-stencil texture), with the depth inverted and not:
+//   - the sky's control mask
+//   - the motion vectors dilated by depth, at the render and at the display resolution, inside larger textures
+//   - Show sky's stripes in the composite, and every other pixel left as it was
+// The exit code is the number of failed checks.
 
 #include <windows.h>
 
@@ -1765,6 +1769,385 @@ void TestDisplayEncoded(const Format& f)
     CheckComposite(s, base, proxy, brighter, RunComposite(s, base, Encode(brighter)), "model +0.5 EV");
     Drop(s);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// What the game's depth adds (DilateMotion, the sky sliders, Show sky). The passes read the game's depth through a view
+// of its depth plane alone; whether such a view reads a depth-stencil texture made with a fully typed format (The Last
+// of Us Part II's) the documentation does not settle, so every depth format dxgi.dll reads is tried here, drawn the
+// way a game draws depth: as a depth-stencil texture.
+
+struct DepthCase
+{
+    const char* name;
+    DXGI_FORMAT resource; // the texture, as the game made it
+    DXGI_FORMAT target;   // its depth-stencil view, to draw the pattern with
+    DXGI_FORMAT view;     // what the passes read it as (nr_dx12.cpp, DepthView)
+    bool stencil;
+};
+
+const DepthCase kDepthCases[] = {
+    { "R32G8X24_TYPELESS (The Witcher 3)", DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+      DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, true },
+    { "D32_FLOAT_S8X24_UINT (The Last of Us Part II)", DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+      DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, true },
+    { "R32_TYPELESS", DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT, false },
+    { "D32_FLOAT", DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT, false },
+    { "R24G8_TYPELESS", DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+      true },
+    { "D24_UNORM_S8_UINT", DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D24_UNORM_S8_UINT,
+      DXGI_FORMAT_R24_UNORM_X8_TYPELESS, true },
+    { "R16_TYPELESS", DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM, false },
+    { "D16_UNORM", DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM, false },
+};
+
+// The pattern, in a 72x52 depth texture whose guide (the render subrect) is 64x48 at (5,3). Each rectangle is cleared
+// over the ones before it, and the CPU reads the same list. Depths as a game without inverted depth writes them, 0
+// nearest and 1 the far end; with inverted depth each is 1 minus that. 16- and 24-bit depth round them, which keeps
+// their order and keeps the far end at the far end.
+constexpr UINT kDepthWidth = 72, kDepthHeight = 52;
+constexpr UINT kGuideX = 5, kGuideY = 3, kGuideWidth = 64, kGuideHeight = 48;
+
+struct DepthRect
+{
+    float depth;
+    D3D12_RECT rect; // in the texture
+};
+
+std::vector<DepthRect> DepthPattern()
+{
+    std::vector<DepthRect> p;
+    auto add = [&p](float depth, LONG x0, LONG y0, LONG x1, LONG y1) { // in the guide's coordinates
+        p.push_back({ depth, { x0 + LONG(kGuideX), y0 + LONG(kGuideY), x1 + LONG(kGuideX), y1 + LONG(kGuideY) } });
+    };
+    // Around the guide: nearer than anything in it.
+    p.push_back({ 0.0625f, { 0, 0, LONG(kDepthWidth), LONG(kDepthHeight) } });
+    add(1.0f, 0, 0, 64, 48);    // the sky
+    add(0.75f, 0, 36, 64, 48);  // the ground, down to the guide's bottom edge
+    add(0.25f, 20, 10, 36, 26); // a square in front
+    add(0.5f, 44, 4, 45, 34);   // a bar one texel wide
+    add(0.5f, 2, 30, 18, 31);   // and one a texel tall
+    add(0.375f, 52, 6, 54, 30); // a bar two texels wide
+    add(0.125f, 8, 8, 9, 9);    // single texels, the nearest in the guide
+    add(0.125f, 60, 20, 61, 21);
+    add(0.125f, 0, 0, 1, 1); // on the guide's corners and its right edge
+    add(0.125f, 63, 47, 64, 48);
+    add(0.125f, 63, 10, 64, 11);
+    add(1.0f - 1.0e-4f, 10, 20, 11, 21); // all but at the far end: not sky
+    return p;
+}
+
+float Stored(float depth, bool inverted) { return inverted ? 1.0f - depth : depth; }
+
+// The depth the pattern leaves in texel (x, y) of the texture.
+float PatternDepth(const std::vector<DepthRect>& pattern, UINT x, UINT y, bool inverted)
+{
+    for (size_t i = pattern.size(); i-- > 0;)
+    {
+        const D3D12_RECT& r = pattern[i].rect;
+        if (LONG(x) >= r.left && LONG(x) < r.right && LONG(y) >= r.top && LONG(y) < r.bottom)
+            return Stored(pattern[i].depth, inverted);
+    }
+    return Stored(1.0f, inverted); // never: the first rectangle covers the texture
+}
+
+// The CPU copy of nr.hlsl's IsSky, Closer and DepthTexel.
+bool SkyDepth(float d, bool inverted) { return inverted ? d <= 1.0e-6f : d >= 1.0f - 1.0e-6f; }
+bool CloserDepth(float a, float b, bool inverted) { return inverted ? a > b : a < b; }
+UINT DepthTexel(UINT p, UINT size, UINT guide) { return std::min((p * 2 + 1) * guide / (size * 2), guide - 1); }
+
+// The depth under texel (x, y) of a picture of width x height that shows the guide's view.
+float DepthUnder(const std::vector<DepthRect>& pattern, UINT x, UINT y, UINT width, UINT height, bool inverted)
+{
+    return PatternDepth(pattern, kGuideX + DepthTexel(x, width, kGuideWidth),
+                        kGuideY + DepthTexel(y, height, kGuideHeight), inverted);
+}
+
+// The depth texture with the pattern on it, in the NPSR state a game hands its depth over in; null when this GPU will
+// not make this format a depth-stencil texture.
+ID3D12Resource* MakeDepth(const DepthCase& d, bool inverted, const std::vector<DepthRect>& pattern,
+                          ID3D12DescriptorHeap* targets)
+{
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = kDepthWidth;
+    desc.Height = kDepthHeight;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = d.resource;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    ID3D12Resource* depth = nullptr;
+    if (FAILED(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                 nullptr, IID_PPV_ARGS(&depth))))
+        return nullptr;
+    D3D12_DEPTH_STENCIL_VIEW_DESC view = {};
+    view.Format = d.target;
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    const D3D12_CPU_DESCRIPTOR_HANDLE handle = targets->GetCPUDescriptorHandleForHeapStart();
+    g.device->CreateDepthStencilView(depth, &view, handle);
+    // The first rectangle is the whole texture: a whole clear, the stencil with it.
+    g.list->ClearDepthStencilView(
+        handle, d.stencil ? D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL : D3D12_CLEAR_FLAG_DEPTH,
+        Stored(pattern[0].depth, inverted), 0, 0, nullptr);
+    for (size_t i = 1; i < pattern.size(); ++i)
+        g.list->ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH, Stored(pattern[i].depth, inverted), 0, 1,
+                                      &pattern[i].rect);
+    Barrier(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return depth;
+}
+
+// The guide's part of the constants, as nr_dx12.cpp fills it from the game's depth.
+void Guide(NrConstants* c, bool inverted)
+{
+    c->guideWidth = kGuideWidth;
+    c->guideHeight = kGuideHeight;
+    c->depthBaseX = kGuideX;
+    c->depthBaseY = kGuideY;
+    if (inverted)
+        c->flags |= NR_FLAG_DEPTH_INVERTED;
+}
+
+// The sky pass: the control mask, one texel per depth texel, (1, SkyTone, SkyStructure, 1) on the sky and 1 elsewhere.
+void CheckSkyMask(ID3D12Resource* depth, const DepthCase& d, bool inverted, const std::vector<DepthRect>& pattern,
+                  const char* what)
+{
+    ID3D12Resource* mask =
+        MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, kGuideWidth, kGuideHeight, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    NrConstants c = {};
+    c.mode = NR_MODE_SKY;
+    c.outWidth = kGuideWidth;
+    c.outHeight = kGuideHeight;
+    c.skyTone = 0.25f;
+    c.skyStructure = 1.5f;
+    Guide(&c, inverted);
+    const unsigned table = Table({ depth, d.view }, {}, {}, {}, { mask, DXGI_FORMAT_R16G16B16A16_FLOAT });
+    Dispatch(g.nr, table, c, Groups(kGuideWidth, 8), Groups(kGuideHeight, 8));
+    const std::vector<Pixel> got = DecodeAll(kHalf, Read(mask, 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    mask->Release();
+    size_t sky = 0, bad = 0;
+    UINT firstX = 0, firstY = 0;
+    Pixel first, want;
+    for (UINT y = 0; y < kGuideHeight; ++y)
+    {
+        for (UINT x = 0; x < kGuideWidth; ++x)
+        {
+            const bool isSky = SkyDepth(PatternDepth(pattern, kGuideX + x, kGuideY + y, inverted), inverted);
+            sky += isSky;
+            const Pixel e = { 1.0f, isSky ? 0.25f : 1.0f, isSky ? 1.5f : 1.0f, 1.0f };
+            const Pixel& o = got[size_t(y) * kGuideWidth + x];
+            if ((o.r != e.r || o.g != e.g || o.b != e.b || o.a != e.a) && bad++ == 0)
+                firstX = x, firstY = y, first = o, want = e;
+        }
+    }
+    if (bad == 0)
+        Check(sky > 0 && sky < size_t(kGuideWidth) * kGuideHeight,
+              "depth, %s: the sky mask as the CPU (%zu of %u texels sky)", what, sky, kGuideWidth * kGuideHeight);
+    else
+        Check(false, "depth, %s: the sky mask, %zu texels wrong; first (%u,%u) got %g %g %g %g, want %g %g %g %g", what,
+              bad, firstX, firstY, first.r, first.g, first.b, first.a, want.r, want.g, want.b, want.a);
+}
+
+// The dilate pass, for motion vectors of width x height at (baseX, baseY) in a larger texture: each texel's own motion
+// is (x + 0.25, -(y + 0.5)), so which texel a dilated one came from shows, and (1000, 1000) lies around them.
+void CheckDilate(ID3D12Resource* depth, const DepthCase& d, bool inverted, const std::vector<DepthRect>& pattern,
+                 DXGI_FORMAT format, UINT width, UINT height, UINT baseX, UINT baseY, const char* what)
+{
+    const bool wide = format == DXGI_FORMAT_R32G32_FLOAT;
+    const UINT bytes = wide ? 8 : 4;
+    const UINT textureWidth = width + 2 * baseX, textureHeight = height + 2 * baseY;
+    auto store = [wide](uint8_t* at, float x, float y) {
+        if (wide)
+        {
+            std::memcpy(at, &x, 4);
+            std::memcpy(at + 4, &y, 4);
+        }
+        else
+        {
+            const uint16_t h[2] = { FloatToHalf(x), FloatToHalf(y) };
+            std::memcpy(at, h, 4);
+        }
+    };
+    auto load = [wide](const uint8_t* at, float* x, float* y) {
+        if (wide)
+        {
+            std::memcpy(x, at, 4);
+            std::memcpy(y, at + 4, 4);
+        }
+        else
+        {
+            uint16_t h[2];
+            std::memcpy(h, at, 4);
+            *x = HalfToFloat(h[0]);
+            *y = HalfToFloat(h[1]);
+        }
+    };
+    std::vector<uint8_t> data(size_t(textureWidth) * textureHeight * bytes);
+    for (UINT ty = 0; ty < textureHeight; ++ty)
+    {
+        for (UINT tx = 0; tx < textureWidth; ++tx)
+        {
+            const bool inside = tx >= baseX && tx < baseX + width && ty >= baseY && ty < baseY + height;
+            store(data.data() + (size_t(ty) * textureWidth + tx) * bytes, inside ? float(tx - baseX) + 0.25f : 1000.0f,
+                  inside ? -(float(ty - baseY) + 0.5f) : 1000.0f);
+        }
+    }
+    ID3D12Resource* motion =
+        MakeTexture(format, textureWidth, textureHeight, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Upload(motion, data, bytes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12Resource* dilated = MakeTexture(format, width, height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    NrConstants c = {};
+    c.mode = NR_MODE_DILATE;
+    c.outWidth = width;
+    c.outHeight = height;
+    c.motionBaseX = baseX;
+    c.motionBaseY = baseY;
+    Guide(&c, inverted);
+    const unsigned table = Table({ depth, d.view }, { motion, format }, {}, {}, { dilated, format });
+    Dispatch(g.nr, table, c, Groups(width, 8), Groups(height, 8));
+    const std::vector<uint8_t> got = Read(dilated, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    motion->Release();
+    dilated->Release();
+
+    size_t moved = 0, bad = 0;
+    UINT firstX = 0, firstY = 0;
+    float gotX = 0.0f, gotY = 0.0f, wantX = 0.0f, wantY = 0.0f;
+    for (UINT y = 0; y < height; ++y)
+    {
+        for (UINT x = 0; x < width; ++x)
+        {
+            // Itself, then left, right, up, down, each clamped to the subrect; a tie keeps the one before.
+            const UINT taps[5][2] = { { x, y },
+                                      { x > 0 ? x - 1 : 0, y },
+                                      { std::min(x + 1, width - 1), y },
+                                      { x, y > 0 ? y - 1 : 0 },
+                                      { x, std::min(y + 1, height - 1) } };
+            unsigned best = 0;
+            float bestDepth = DepthUnder(pattern, x, y, width, height, inverted);
+            for (unsigned i = 1; i < 5; ++i)
+            {
+                const float depthHere = DepthUnder(pattern, taps[i][0], taps[i][1], width, height, inverted);
+                if (CloserDepth(depthHere, bestDepth, inverted))
+                {
+                    best = i;
+                    bestDepth = depthHere;
+                }
+            }
+            moved += best != 0;
+            const float ex = float(taps[best][0]) + 0.25f, ey = -(float(taps[best][1]) + 0.5f);
+            float ox, oy;
+            load(got.data() + (size_t(y) * width + x) * bytes, &ox, &oy);
+            if ((ox != ex || oy != ey) && bad++ == 0)
+                firstX = x, firstY = y, gotX = ox, gotY = oy, wantX = ex, wantY = ey;
+        }
+    }
+    const char* formatName = wide ? "R32G32_FLOAT" : "R16G16_FLOAT";
+    if (bad == 0)
+        Check(moved > 0,
+              "depth, %s: motion vectors dilated as the CPU (%s, %ux%u at %u,%u; %zu texels take a "
+              "neighbour's)",
+              what, formatName, width, height, baseX, baseY, moved);
+    else
+        Check(false,
+              "depth, %s: motion vectors dilated (%s, %ux%u at %u,%u), %zu texels wrong; first (%u,%u) got %g %g, "
+              "want %g %g",
+              what, formatName, width, height, baseX, baseY, bad, firstX, firstY, gotX, gotY, wantX, wantY);
+}
+
+// Show sky: the composite stripes the sky, as bright as the white point, and leaves every other pixel as it was
+// (DetailStrength 0, so the stripes are all it does). A frame of twice the guide's size, inside a larger texture.
+void CheckShowSky(ID3D12Resource* depth, const DepthCase& d, bool inverted, const std::vector<DepthRect>& pattern,
+                  const char* what)
+{
+    Scene s = MakeScene(kHalf, 2 * kGuideWidth, 2 * kGuideHeight, 4);
+    Setup u;
+    u.knobs.detail = 0.0f;
+    Reset(s, u);
+    NrConstants c = Constants(s, u, NR_MODE_COMPOSITE);
+    Guide(&c, inverted);
+    c.flags |= NR_FLAG_SHOW_SKY;
+    const unsigned table = Table({ depth, d.view }, {}, {}, ExposureView(s, u), OutputView(s));
+    Dispatch(g.nr, table, c, Groups(s.width, 8), Groups(s.height, 8));
+    const std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const float white = WhiteOf(u);
+    size_t striped = 0, bad = 0;
+    UINT firstX = 0, firstY = 0;
+    Pixel got, want;
+    for (UINT ty = 0; ty < s.textureHeight; ++ty)
+    {
+        for (UINT tx = 0; tx < s.textureWidth; ++tx)
+        {
+            const size_t i = size_t(ty) * s.textureWidth + tx;
+            const bool inside = tx >= s.baseX && tx < s.baseX + s.width && ty >= s.baseY && ty < s.baseY + s.height;
+            const UINT x = tx - s.baseX, y = ty - s.baseY;
+            const bool stripe = inside && ((x + y) / 8) % 2 == 0 &&
+                                SkyDepth(DepthUnder(pattern, x, y, s.width, s.height, inverted), inverted);
+            const Pixel o = Decode(kHalf, output.data() + i * 8);
+            bool ok;
+            Pixel e = s.texture[i];
+            if (stripe)
+            {
+                ++striped;
+                e = Quantise(kHalf, { 0.95f * white, 0.3f * white, 0.95f * white, s.texture[i].a });
+                ok = ClosePixel(kHalf, o, e) && o.a == e.a;
+            }
+            else
+                ok = std::memcmp(output.data() + i * 8, s.bytes.data() + i * 8, 8) == 0;
+            if (!ok && bad++ == 0)
+                firstX = tx, firstY = ty, got = o, want = e;
+        }
+    }
+    if (bad == 0)
+        Check(striped > 0, "depth, %s: Show sky stripes %zu pixels of a %ux%u frame, the rest bit for bit as they were",
+              what, striped, s.width, s.height);
+    else
+        Check(false, "depth, %s: Show sky, %zu pixels wrong; first (%u,%u) got %g %g %g %g, want %g %g %g %g", what,
+              bad, firstX, firstY, got.r, got.g, got.b, got.a, want.r, want.g, want.b, want.a);
+    Drop(s);
+}
+
+void TestDepth()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options = {};
+    const bool said = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof options));
+    Say("depth: this GPU %s a fully typed format in another format of its family",
+        !said                                      ? "does not say whether it views"
+        : options.CastingFullyTypedFormatSupported ? "views"
+                                                   : "does not view");
+    D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    heap.NumDescriptors = 1;
+    ID3D12DescriptorHeap* targets = nullptr;
+    Must(g.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&targets)), "CreateDescriptorHeap(DSV)");
+    const std::vector<DepthRect> pattern = DepthPattern();
+    for (const DepthCase& d : kDepthCases)
+    {
+        for (const bool inverted : { false, true })
+        {
+            char what[96];
+            std::snprintf(what, sizeof what, "%s%s", d.name, inverted ? ", inverted" : "");
+            ID3D12Resource* depth = MakeDepth(d, inverted, pattern, targets);
+            if (depth == nullptr)
+            {
+                Check(false, "depth, %s: this GPU will not make it a depth-stencil texture", what);
+                continue;
+            }
+            CheckSkyMask(depth, d, inverted, pattern, what);
+            // At the render resolution, as both games give them; at the display resolution, as others may.
+            CheckDilate(depth, d, inverted, pattern, DXGI_FORMAT_R16G16_FLOAT, kGuideWidth, kGuideHeight, 3, 1, what);
+            CheckDilate(depth, d, inverted, pattern, DXGI_FORMAT_R16G16_FLOAT, 2 * kGuideWidth, 2 * kGuideHeight, 1, 1,
+                        what);
+            if (&d == &kDepthCases[0])
+                CheckDilate(depth, d, inverted, pattern, DXGI_FORMAT_R32G32_FLOAT, kGuideWidth, kGuideHeight, 2, 2,
+                            what);
+            CheckShowSky(depth, d, inverted, pattern, what);
+            depth->Release();
+        }
+    }
+    targets->Release();
+}
 } // namespace
 
 int main()
@@ -1777,6 +2160,7 @@ int main()
     TestLinear(kHalf, 4); // inside a larger texture, as a game with an output subrect
     TestLinear(kSmall, 0);
     TestDisplayEncoded(kUnorm);
+    TestDepth(); // last: a view this GPU cannot read may take the device down with it
     Say("shadertest: %d checks, %d failed", g_checks, g_failed);
     if (g_failed == 0)
         std::puts("PASS");
