@@ -33,15 +33,16 @@ unsigned g_generation = 0;
 // (the menu, M3) on the present thread and the render thread.
 SRWLOCK g_publishLock = SRWLOCK_INIT;
 
-// Snapshots replaced by a reload. An evaluation reads the pointer once and is done with it within a frame, so a
-// replaced snapshot is freed once it has been out of use for kRetireSeconds.
+// Snapshots replaced by a reload or by the menu. An evaluation reads the pointer once and is done with it within a
+// frame, so a replaced snapshot is freed once it has been out of use for kRetireSeconds. A dragged slider publishes
+// a snapshot at every step, up to one a frame, hence the room for a few seconds of them.
 constexpr double kRetireSeconds = 5.0;
 struct Retired
 {
     const Settings* settings = nullptr;
     double at = 0.0;
 };
-Retired g_retired[16];
+Retired g_retired[256];
 
 void Retire(const Settings* old)
 {
@@ -61,7 +62,7 @@ void Retire(const Settings* old)
     }
     if (slot != nullptr)
         *slot = { old, now };
-    // All sixteen replaced within a few seconds: keep the old one for ever rather than free it too soon.
+    // All of them replaced within the last few seconds: keep the old one for ever rather than free it too soon.
 }
 
 // Reads a whole file, NUL-terminated; nullptr if it does not exist or cannot be read. Freed with delete[].

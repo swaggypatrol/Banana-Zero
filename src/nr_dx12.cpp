@@ -503,7 +503,6 @@ struct Nr
     std::atomic<uint64_t> skipped[kSkipCount] = {};
     std::atomic<bool> said[kSkipCount] = {};
     std::atomic<bool> coreGone { false };
-    std::atomic<unsigned> rebuilds { 0 };
 
     // Set by the background thread, taken by the render thread.
     std::atomic<bool> statsWanted { false };
@@ -520,7 +519,6 @@ struct Nr
     wchar_t dataPath[MAX_PATH] = {};  // what the model's Init_Ext accepted
     ID3D12Device* device = nullptr;
     Bridge bridge;
-    AllocateParameters allocate = nullptr;     // the core's, for a fresh creation block (CreationBlock)
     NVSDK_NGX_Parameter* createParams = nullptr;
     NVSDK_NGX_Parameter* evalParams = nullptr;
     NVSDK_NGX_Parameter* capability = nullptr; // the core's, for the fallbacks; never destroyed
@@ -537,11 +535,7 @@ struct Nr
     std::atomic<bool> bound { false };
     std::atomic<unsigned> sourceId { 0 };
 
-    void* handle = nullptr;        // the model's feature
-    void* pendingHandle = nullptr; // a feature just created with new model parameters: evaluated from the next frame
-    ModelSettings createdModel;    // what the live feature was created with
-    ModelSettings refusedModel;    // model parameters a rebuild could not create with: not tried again until they change
-    bool haveRefused = false;
+    void* handle = nullptr; // the model's feature
     unsigned createdWidth = 0;
     unsigned createdHeight = 0;
     unsigned creates = 0;
@@ -795,13 +789,13 @@ bool InitModel()
 // Our own blocks from the core's AllocateParameters; the capability block if that is not to be had.
 bool MakeBlocks(HMODULE core)
 {
-    g_nr.allocate = Proc<AllocateParameters>(core, "NVSDK_NGX_D3D12_AllocateParameters");
+    const auto allocate = Proc<AllocateParameters>(core, "NVSDK_NGX_D3D12_AllocateParameters");
     NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_NotImplemented;
-    if (g_nr.allocate != nullptr)
+    if (allocate != nullptr)
     {
-        result = g_nr.allocate(&g_nr.createParams);
+        result = allocate(&g_nr.createParams);
         if (result == NVSDK_NGX_Result_Success)
-            result = g_nr.allocate(&g_nr.evalParams);
+            result = allocate(&g_nr.evalParams);
     }
     if (result == NVSDK_NGX_Result_Success && g_nr.createParams != nullptr && g_nr.evalParams != nullptr)
     {
@@ -811,7 +805,7 @@ bool MakeBlocks(HMODULE core)
     else
     {
         Log("NR: AllocateParameters -> 0x%08X %s; falling back to the core's capability block", unsigned(result),
-            g_nr.allocate != nullptr ? ResultName(int(result)) : "(not exported)");
+            allocate != nullptr ? ResultName(int(result)) : "(not exported)");
         if (g_nr.capability == nullptr)
             return false;
         g_nr.createParams = g_nr.capability;
@@ -1131,13 +1125,8 @@ void ReleaseParked()
     }
 }
 
-template <typename T> void SetTunable(NVSDK_NGX_Parameter* params, const char* name, const Tunable<T>& t)
-{
-    if (t.set)
-        params->Set(name, t.value);
-}
-
-// The creation keys plus the tunables the user set; the rest stay the model's defaults.
+// The creation keys. Of the model's own parameters it reads only Preset when it creates the feature (the rest at
+// every evaluation: FillTunables); Preset is written when the user set it, and a key once written stays in the block.
 void FillCreate(NVSDK_NGX_Parameter* params, unsigned width, unsigned height, const ModelSettings& m)
 {
     params->Set("DLSSNR.Enabled", 1u);
@@ -1145,53 +1134,22 @@ void FillCreate(NVSDK_NGX_Parameter* params, unsigned width, unsigned height, co
     params->Set("DLSSNR.Height", height);
     params->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
     params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-    SetTunable(params, "DLSSNR.Hint.Render.Preset", m.preset);
-    SetTunable(params, "DLSSNR.Intensity", m.intensity);
-    SetTunable(params, "DLSSNR.Style", m.style);
-    SetTunable(params, "DLSSNR.LocalStructureStrength", m.localStructure);
-    SetTunable(params, "DLSSNR.LocalToneStrength", m.localTone);
-    SetTunable(params, "DLSSNR.SkinStructureStrength", m.skinStructure);
-    SetTunable(params, "DLSSNR.UseAutoMask", m.autoMask);
+    if (m.preset.set)
+        params->Set("DLSSNR.Hint.Render.Preset", m.preset.value);
 }
 
-// The ini key of a model parameter the live feature was created with that `next` no longer sets, or nullptr.
-const char* RemovedTunable(const ModelSettings& live, const ModelSettings& next)
+// The model's own parameters, which it reads at every evaluation, so a change shows from the next frame (a change of
+// Style, the two local strengths, skin structure or the auto mask also restarts the model's history). A key once
+// written stays in the block, so one the user has not set is written as the model's default, which is also what the
+// model takes for a key that is absent. Each with the type the model reads it as.
+void FillTunables(NVSDK_NGX_Parameter* p, const ModelSettings& m)
 {
-    if (live.preset.set && !next.preset.set)
-        return "Preset";
-    if (live.intensity.set && !next.intensity.set)
-        return "Intensity";
-    if (live.style.set && !next.style.set)
-        return "Style";
-    if (live.localStructure.set && !next.localStructure.set)
-        return "LocalStructure";
-    if (live.localTone.set && !next.localTone.set)
-        return "LocalTone";
-    if (live.skinStructure.set && !next.skinStructure.set)
-        return "SkinStructure";
-    if (live.autoMask.set && !next.autoMask.set)
-        return "AutoMask";
-    return nullptr;
-}
-
-// The block to create a feature with `next`. A key once written stays in a block, and the model reads what is
-// there; when the user took a parameter out of dlssnr.ini, a fresh block (populated like the first) gives the model
-// its own default back. The old block is left allocated: destroying our blocks makes the core's Shutdown1 fault.
-NVSDK_NGX_Parameter* CreationBlock(const ModelSettings& next)
-{
-    const char* removed = RemovedTunable(g_nr.createdModel, next);
-    if (removed == nullptr)
-        return g_nr.createParams;
-    NVSDK_NGX_Parameter* fresh = nullptr;
-    if (g_nr.ownBlocks && g_nr.allocate != nullptr && g_nr.allocate(&fresh) == NVSDK_NGX_Result_Success &&
-        fresh != nullptr)
-    {
-        g_nr.bridge.populate(fresh);
-        return fresh;
-    }
-    Log("NR: %s was taken out of dlssnr.ini, but the model keeps its last value for it until the game restarts",
-        removed);
-    return g_nr.createParams;
+    p->Set("DLSSNR.Intensity", m.intensity.set ? m.intensity.value : 1.0f);
+    p->Set("DLSSNR.Style", m.style.set ? m.style.value : 0u);
+    p->Set("DLSSNR.LocalStructureStrength", m.localStructure.set ? m.localStructure.value : 1.0f);
+    p->Set("DLSSNR.LocalToneStrength", m.localTone.set ? m.localTone.value : 1.0f);
+    p->Set("DLSSNR.SkinStructureStrength", m.skinStructure.set ? m.skinStructure.value : -1.0f);
+    p->Set("DLSSNR.UseAutoMask", m.autoMask.set && m.autoMask.value != 0 ? 1 : 0);
 }
 
 void DescribeFrame(const Frame& f)
@@ -1263,14 +1221,11 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Frame& f, const ModelS
     }
 
     ++g_nr.creates;
-    NVSDK_NGX_Parameter* block = CreationBlock(model);
-    FillCreate(block, f.width, f.height, model);
+    FillCreate(g_nr.createParams, f.width, f.height, model);
     void* handle = nullptr;
-    int result = g_nr.bridge.create(list, kFeatureNR, block, &handle);
+    int result = g_nr.bridge.create(list, kFeatureNR, g_nr.createParams, &handle);
     Log("NR: CreateFeature(18, %ux%u, %s) -> 0x%08X %s, handle %p, creation %u", f.width, f.height,
         g_nr.ownBlocks ? "own block" : "capability block", unsigned(result), ResultName(result), handle, g_nr.creates);
-    if (result == NVSDK_NGX_Result_Success)
-        g_nr.createParams = block;
     if (result != NVSDK_NGX_Result_Success && g_nr.ownBlocks && g_nr.capability != nullptr)
     {
         // The fallback: the model may want the block it populated the callbacks into to be the core's own.
@@ -1297,51 +1252,11 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Frame& f, const ModelS
         return false;
     }
     g_nr.handle = handle;
-    g_nr.createdModel = model;
     g_nr.createdWidth = f.width;
     g_nr.createdHeight = f.height;
     g_nr.createdAt = g_nr.evaluatesSeen;
     g_nr.resetNext = true;
     return true;
-}
-
-// The model's parameters changed in dlssnr.ini: a feature with the new ones is created now and evaluated
-// from the next frame on, so this frame still runs the old one, which is parked for kRing frames. A refusal keeps the
-// old feature; the refused parameters are not tried again until one of them changes.
-void MaybeRebuild(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s)
-{
-    if (g_nr.handle == nullptr || s.model == g_nr.createdModel || (g_nr.haveRefused && s.model == g_nr.refusedModel) ||
-        g_nr.evaluatesSeen - g_nr.createdAt < kEvaluatesBetweenCreates)
-        return;
-    if (g_nr.creates >= kMaxCreates)
-    {
-        g_nr.refusedModel = s.model;
-        g_nr.haveRefused = true;
-        Log("NR: the model's feature has been created %u times; new model parameters wait for a game restart",
-            g_nr.creates);
-        return;
-    }
-    NVSDK_NGX_Parameter* block = CreationBlock(s.model);
-    ++g_nr.creates;
-    FillCreate(block, f.width, f.height, s.model);
-    void* handle = nullptr;
-    const int result = g_nr.bridge.create(list, kFeatureNR, block, &handle);
-    g_nr.createdAt = g_nr.evaluatesSeen;
-    char model[256];
-    SettingsDescribeModel(s.model, model, sizeof model);
-    Log("NR: new model parameters (%s): CreateFeature(18, %ux%u) -> 0x%08X %s, handle %p, creation %u", model + 1,
-        f.width, f.height, unsigned(result), ResultName(result), handle, g_nr.creates);
-    if (result != NVSDK_NGX_Result_Success || handle == nullptr)
-    {
-        g_nr.refusedModel = s.model;
-        g_nr.haveRefused = true;
-        Log("NR: the feature with the previous model parameters stays");
-        return;
-    }
-    g_nr.createParams = block;
-    g_nr.pendingHandle = handle;
-    g_nr.createdModel = s.model;
-    g_nr.rebuilds.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2017,6 +1932,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const unsigned reset = g_nr.resetNext || f.reset != 0 ? 1u : 0u;
     g_nr.resetNext = false;
     FillEvaluate(g_nr.evalParams, f, depth, depthBaseX, depthBaseY, motion, motionBaseX, motionBaseY, reset);
+    FillTunables(g_nr.evalParams, s.model);
     const int result = g_nr.bridge.evaluate(list, g_nr.handle, g_nr.evalParams, nullptr);
     const bool delivered = result == NVSDK_NGX_Result_Success;
     const bool dump = dumpDue && delivered;
@@ -2457,7 +2373,6 @@ void StartWorker()
 // way round); the menu holds the lock only to copy it out.
 SRWLOCK g_statusLock = SRWLOCK_INIT;
 NrStatusState g_status = {};
-static_assert(sizeof(ModelSettings) <= sizeof(g_status.createdModel), "NrStatusState carries a ModelSettings");
 
 void NoteFrame(const Frame& f, unsigned feature)
 {
@@ -2473,7 +2388,7 @@ void NoteFrame(const Frame& f, unsigned feature)
     ReleaseSRWLockExclusive(&g_statusLock);
 }
 
-void PublishStatus(const Settings& s)
+void PublishStatus()
 {
     AcquireSRWLockExclusive(&g_statusLock);
     g_status.attempted = g_nr.attempted.load(std::memory_order_relaxed);
@@ -2482,14 +2397,10 @@ void PublishStatus(const Settings& s)
     g_status.ready = g_nr.ready;
     g_status.haveFeature = g_nr.handle != nullptr;
     g_status.creates = g_nr.creates;
-    g_status.rebuilds = g_nr.rebuilds.load(std::memory_order_relaxed);
     g_status.frames = g_nr.frames.load(std::memory_order_relaxed);
     g_status.failed = g_nr.failed.load(std::memory_order_relaxed);
     g_status.evaluatesSeen = g_nr.evaluatesSeen;
     g_status.sinceCreate = g_nr.evaluatesSeen - g_nr.createdAt;
-    g_status.refused = g_nr.haveRefused && s.model == g_nr.refusedModel;
-    memcpy(g_status.createdModel, &g_nr.createdModel, sizeof(ModelSettings));
-    memcpy(g_status.refusedModel, &g_nr.refusedModel, sizeof(ModelSettings));
     g_status.linear = g_nr.haveEncodeKey && (g_nr.encodeKey.inputType == InputType::LinearHdr ||
                                              (g_nr.encodeKey.inputType == InputType::Auto && g_status.hdr));
     ReleaseSRWLockExclusive(&g_statusLock);
@@ -2584,23 +2495,11 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
             g_nr.describedFrame = true;
             DescribeFrame(frame);
         }
-        // Model parameters the model refused earlier (MaybeRebuild) are not tried again for a new frame size: that
-        // refusal would turn NR off, while the parameters of the feature it replaces are known to work.
-        const bool refused = g_nr.haveRefused && s->model == g_nr.refusedModel;
-        if (!CreateFeature(list, frame, refused ? g_nr.createdModel : s->model))
+        if (!CreateFeature(list, frame, s->model))
             return kSkipOff;
         return kSkipCreated;
     }
-    MaybeRebuild(list, frame, *s);
     Run(list, frame, *s, source.feature, previewing);
-    if (g_nr.pendingHandle != nullptr)
-    {
-        // The frame just recorded used the old feature; from the next one on, the new feature runs.
-        Park(g_nr.handle, nullptr, 0);
-        g_nr.handle = g_nr.pendingHandle;
-        g_nr.pendingHandle = nullptr;
-        g_nr.resetNext = true;
-    }
     return kSkipNone;
 }
 } // namespace
@@ -2619,7 +2518,7 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
     }
     const Skip skip = Evaluate(list, params, source);
     if (g_nr.attempted.load(std::memory_order_relaxed))
-        PublishStatus(*SettingsCurrent());
+        PublishStatus();
     ReleaseSRWLockExclusive(&g_lock);
     if (skip != kSkipNone)
         CountSkip(skip, source);
@@ -2642,17 +2541,12 @@ namespace
 unsigned ReleaseEverything()
 {
     unsigned released = 0;
-    void* const live[] = { g_nr.handle, g_nr.pendingHandle };
-    for (void* handle : live)
+    if (g_nr.handle != nullptr)
     {
-        if (handle != nullptr)
-        {
-            g_nr.bridge.release(handle);
-            ++released;
-        }
+        g_nr.bridge.release(g_nr.handle);
+        ++released;
     }
     g_nr.handle = nullptr;
-    g_nr.pendingHandle = nullptr;
     for (Parked& p : g_nr.parked)
     {
         if (p.handle != nullptr)
@@ -2759,15 +2653,11 @@ size_t NrDescribe(char* out, size_t size)
     uint64_t skipped = 0;
     for (unsigned i = 1; i < kSkipCount; ++i)
         skipped += g_nr.skipped[i].load(std::memory_order_relaxed);
-    const unsigned rebuilds = g_nr.rebuilds.load(std::memory_order_relaxed);
-    char rebuilt[48] = "";
-    if (rebuilds != 0)
-        snprintf(rebuilt, sizeof rebuilt, ", %u rebuilt for new model parameters", rebuilds);
     const char* reason = g_nr.offReason.load(std::memory_order_relaxed);
-    const int written = snprintf(out, size, "NR %llu frames, %llu skipped, %llu failed%s%s%s",
+    const int written = snprintf(out, size, "NR %llu frames, %llu skipped, %llu failed%s%s",
                                  static_cast<unsigned long long>(g_nr.frames.load(std::memory_order_relaxed)),
                                  static_cast<unsigned long long>(skipped),
-                                 static_cast<unsigned long long>(g_nr.failed.load(std::memory_order_relaxed)), rebuilt,
+                                 static_cast<unsigned long long>(g_nr.failed.load(std::memory_order_relaxed)),
                                  reason != nullptr ? "; off: " : "", reason != nullptr ? reason : "");
     return written > 0 ? (size_t(written) < size ? size_t(written) : size - 1) : 0;
 }

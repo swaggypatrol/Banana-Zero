@@ -6,7 +6,7 @@ move air. It moves pixels, gently, in the direction NVIDIA's DLSS Neural Renderi
 In plain words: Banana-Zero runs NVIDIA's DLSS Neural Rendering (NR) model inside DirectX 12 games that already use
 DLSS. Every time the game finishes its own DLSS Super Resolution (SR) or Ray Reconstruction (RR) pass, the NR model
 gets one more go at that same frame, at display resolution, and the result goes back into the game's picture. Press
-`End` in game for a menu with sliders; a change applies the moment you let go of the mouse.
+`End` in game for a menu with sliders; the picture follows a slider while you drag it.
 
 **RTX 50 series only.** NVIDIA's model does not run on anything older. We checked. It sulks.
 
@@ -75,7 +75,7 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
 `End` again, `Esc`, or the Close menu button.
 
 - While the menu is open the game gets no keyboard or mouse input, and gets it all back when the menu closes.
-- **Sliders apply when you let go**, not while you drag. No Apply button. We trust you.
+- **Sliders apply while you drag**: the picture follows the mouse, step by step. No Apply button. We trust you.
 - **Right-click a slider** to put it back to its default. `Ctrl`+click to type a number.
 - A **hollow slider** means "not set, the model uses its own default". Click or drag it to take over; right-click to
   hand it back.
@@ -100,22 +100,24 @@ Three knobs. For most people, three knobs is plenty.
 | Control | Range | What it does |
 |---|---|---|
 | **Strength** | 0 to 1.5, default 1 | How much of the model's change lands on screen. **0 is bit-for-bit what DLSS made.** 1 is the model's change as it is; 1.5 adds half again. Want more or less? This one |
-| **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness |
-| **Style** | model default, Standard, Natural, Cinematic | The model's built-in styles. NVIDIA has not documented what they do, so audition them. Changing it rebuilds the model (the picture hitches once) |
+| **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness. In The Witcher 3 the model cools the whole picture whenever there is a lot of sky in view, so the colours drift as you look around; 0 stops that |
+| **Style** | Standard, Natural, Cinematic | The model's three built-in styles. NVIDIA has not documented what they do, so audition them. Takes effect on the next frame |
 
 **Advanced (rarely needed)** is folded away below, on purpose.
 
-*Model (rebuilds when you let go).* The model's own knobs. NVIDIA has not documented any of them, so the meanings
-below are educated guesses from their names. If the model rejects a set, the sliders go back to the last set that
-worked and the panel says so.
+*Model.* The model's own knobs. NVIDIA has not documented any of them. What they feed and where comes from taking the
+model's DLL apart; what they look like is our best guess from their names. Each one takes effect on the next frame,
+so you see it while you drag. Style, Local structure, Local tone, Auto mask and Skin structure also restart the
+model's memory of earlier frames at every step, so the picture looks a touch rougher while you drag them and for a
+frame or two after you let go.
 
 | Control | Range | Our best guess |
 |---|---|---|
-| **Model intensity** | 0 to 1.5 | How hard the model works internally (not the same as Strength, which scales the result) |
+| **Model intensity** | 0 to 1 | Blends the model's result back towards its input, inside the model. Much the same job as Strength, which does it on the HDR frame and goes further, so leave this at 1 |
 | **Local structure** | 0 to 1.5 | Fine texture and small light-and-shade detail |
 | **Local tone** | 0 to 1.5 | Local contrast |
-| **Skin structure** | follows local structure, or 0 to 1.5 | Texture on skin. Turn it down for less texture on faces |
-| **Auto mask** | model default, Off, On | Lets the model decide which areas to leave alone |
+| **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else |
+| **Skin structure** | follows local structure, or 0 to 1.5 | Texture on skin. Only does anything with Auto mask on (greyed out otherwise). Turn it down for less texture on faces |
 
 *HDR encode.* Both tested games hand DLSS linear HDR values with no upper limit, even with Windows in SDR mode, but
 the model expects a finished-looking picture. So Banana-Zero shows it a stand-in: the frame divided by a **white
@@ -178,12 +180,12 @@ like to open the back panel.
 | `Enabled` | 1 / 0 | 1 | NR on |
 | `DetailStrength` | 0 to 2 | 1 | Strength |
 | `ColourStrength` | 0 to 2 | 1 | Colour |
-| `Style` | 0 standard, 1 natural, 2 cinematic | not set | Style |
-| `Intensity` | 0 to 2 | not set | Model intensity |
-| `LocalStructure` | 0 to 2 | not set | Local structure |
-| `LocalTone` | 0 to 2 | not set | Local tone |
-| `SkinStructure` | 0 to 2, -1 follows local structure | not set | Skin structure |
-| `AutoMask` | 1 / 0 | not set | Auto mask |
+| `Style` | 0 standard, 1 natural, 2 cinematic | not set (standard) | Style |
+| `Intensity` | 0 to 1; more acts as 1 | not set (1) | Model intensity |
+| `LocalStructure` | 0 to 2 | not set (1) | Local structure |
+| `LocalTone` | 0 to 2 | not set (1) | Local tone |
+| `SkinStructure` | 0 to 2, -1 follows local structure; only with `AutoMask = 1` | not set (-1) | Skin structure |
+| `AutoMask` | 1 / 0 | not set (0) | Auto mask |
 | `Preset` | integer | not set | file only; model 310.8 carries a single set of weights, so every number gives the same model |
 | `InputType` | `auto` / `linear` / `tonemapped` | `auto` | file only; `auto` follows the game's own HDR flag |
 | `WhiteSource` | `auto` / `exposure` / `scene` / `manual` | `auto` | White point from |
@@ -273,9 +275,10 @@ Run these from the repository root after a build. The exit code is the number of
 |---|---|---|
 | `build\Release\dxgitest.exe` | nothing special | The export table matches the real `dxgi.dll`, every export reaches its real function, and a DXGI factory and D3D12 device can be made through ours |
 | `build\Release\ngxtest.exe` | nothing special | The five hooks against a fake NGX runtime and the bridge against a fake model |
-| `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks commit-on-release, right-click reset and the ini write-back |
+| `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back |
 | `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU |
 | `build\Release\nrprobe.exe [--model <path>]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll` |
+| `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
 
 ### Regenerating the export stubs
 
