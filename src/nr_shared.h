@@ -10,17 +10,21 @@
 //   meter             read       -             -          -             -              meter
 //   meter resolve     -          -             -          -             scene exposure meter
 //   encode            read       -             -          read          proxy          -
-//   composite         -          read          read       read          game Output    -
+//   composite         (depth)    read          read       read          game Output    -
 //   preview           -          read          read       -             preview        -
 //   dump (before)     read       read          read       read          -              dump
 //   dump (after)      read       -             -          -             -              dump
 //   stats clear       -          -             -          -             -              stats
 //   stats input       read       -             -          read          -              stats
 //   stats gain        -          read          read       -             -              stats
+//   dilate            depth      motion        -          -             dilated motion -
+//   sky               depth      -             -          -             control mask   -
 //
 // "frame" is the game's Output, read through a shader resource view while it is in the NPSR state; the composite
 // reads and writes it through u0 instead, in place. "exposure" is the game's exposure texture, or with the scene
-// white point our own 1x1 texture that the meter's resolve pass writes.
+// white point our own 1x1 texture that the meter's resolve pass writes. "depth" is the game's depth texture, read
+// through a view of its depth plane alone, "motion" its motion vectors, both in the NPSR state the game hands them
+// over in; the composite reads the depth only to stripe the sky (NR_FLAG_SHOW_SKY).
 
 #ifdef __cplusplus
 #include <cstdint>
@@ -37,6 +41,8 @@
 #define NR_MODE_PREVIEW 2     // the proxy or the model's output -> the small preview picture
 #define NR_MODE_DUMP_BEFORE 3 // frame dump, before the composite: the frame, the proxy, the model's output
 #define NR_MODE_DUMP_AFTER 4  // frame dump, after the composite: the result
+#define NR_MODE_DILATE 5      // the game's motion vectors -> the same, dilated by depth (DilateMotion)
+#define NR_MODE_SKY 6         // the game's depth -> the control mask: the sky sliders on the sky, 1 elsewhere
 
 // nr_stats.hlsl
 #define NR_STATS_CLEAR 0 // zero the statistics buffer and stamp the frame number into both ends
@@ -54,6 +60,8 @@
 #define NR_FLAG_ZEBRA 0x10          // the preview marks the shoulder and heavy compression
 #define NR_FLAG_PREVIEW_OUTPUT 0x20 // the preview shows the model's output instead of its input
 #define NR_FLAG_SCENE_RESET 0x40    // the scene white point jumps to this frame's instead of easing towards it
+#define NR_FLAG_DEPTH_INVERTED 0x80 // the game's depth is inverted (DLSS's DepthInverted): 1 nearest, 0 the far end
+#define NR_FLAG_SHOW_SKY 0x100      // the composite stripes what counts as sky (Show sky); t0 holds the depth
 
 struct NrConstants
 {
@@ -80,16 +88,27 @@ struct NrConstants
 
     NR_UINT part;        // dump: 0 the reduced whole frame, 1 the full-resolution crop from the centre
     NR_UINT scale;       // preview and dump: frame pixels per picture pixel along each axis
-    NR_UINT outWidth;    // preview and dump: the picture's size (the dispatch covers it)
+    NR_UINT outWidth;    // preview, dump, dilate and sky: the size of what the pass writes (the dispatch covers it)
     NR_UINT outHeight;
 
     NR_FLOAT seconds;  // meter resolve: seconds since the frame metered before this one
     NR_UINT splitX;    // the split screen (Compare): the composite leaves pixels left of this x as DLSS
                        // made them and draws the divider there; 0 = no split (M3)
+
+    // What the game's depth adds (DilateMotion, the sky sliders, Show sky). The dilate pass writes the motion vectors'
+    // subrect, the sky pass the depth's (outWidth x outHeight).
+    NR_UINT guideWidth; // the depth's subrect: the render resolution
+    NR_UINT guideHeight;
+    NR_UINT depthBaseX; // where it starts inside the depth texture
+    NR_UINT depthBaseY;
+    NR_UINT motionBaseX; // where the motion vectors' subrect starts inside theirs
+    NR_UINT motionBaseY;
+    NR_FLOAT skyTone;      // SkyTone: the control mask's .y on the sky, a factor on LocalTone
+    NR_FLOAT skyStructure; // SkyStructure: its .z, a factor on LocalStructure
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(NrConstants) == 96, "NrConstants is passed as root constants: 4-byte scalars, 16-byte multiple");
+static_assert(sizeof(NrConstants) == 128, "NrConstants is passed as root constants: 4-byte scalars, 16-byte multiple");
 #define NR_CONSTANTS_DWORDS (uint32_t(sizeof(NrConstants) / 4))
 #endif
 

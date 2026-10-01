@@ -328,6 +328,16 @@ bool Apply(Settings* s, const char* key, const char* value, const char** problem
         return ParseRange(value, 80.0f, 400.0f, &s->menuNits, problem);
     if (_stricmp(key, "MenuTheme") == 0)
         return ParseChoice(value, kMenuThemeNames, kMenuThemeValues, &s->menuTheme);
+
+    // What the game's depth adds.
+    if (_stricmp(key, "DilateMotion") == 0)
+        return ParseBool(value, &s->dilateMotion);
+    if (_stricmp(key, "SkyTone") == 0)
+        return ParseRange(value, 0.0f, 2.0f, &s->skyTone, problem);
+    if (_stricmp(key, "SkyStructure") == 0)
+        return ParseRange(value, 0.0f, 2.0f, &s->skyStructure, problem);
+    if (_stricmp(key, "ShowSky") == 0)
+        return ParseBool(value, &s->showSky);
     *problem = "unknown key";
     return false;
 }
@@ -386,6 +396,8 @@ void SettingsDescribe(const Settings& s, char* out, size_t size)
            s.compare ? 1 : 0, double(s.compareSplit), KeyName(s.menuKey, menuKey, sizeof menuKey),
            KeyName(s.toggleKey, toggleKey, sizeof toggleKey), KeyName(s.freezeKey, freezeKey, sizeof freezeKey),
            kMenuColourText[unsigned(s.menuColour) % 3], double(s.menuNits), kMenuThemeText[unsigned(s.menuTheme) % 2]);
+    Append(out, size, &length, "; depth DilateMotion %d, SkyTone %.2f, SkyStructure %.2f, ShowSky %d",
+           s.dilateMotion ? 1 : 0, double(s.skyTone), double(s.skyStructure), s.showSky ? 1 : 0);
 }
 
 void SettingsDescribeModel(const ModelSettings& m, char* out, size_t size)

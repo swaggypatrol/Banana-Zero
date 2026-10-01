@@ -32,7 +32,7 @@ struct ItemRect
     ImVec2 max;
     unsigned frame; // the draw it was last part of: a control on a page that is not showing is not found
 };
-ItemRect g_items[48];
+ItemRect g_items[64];
 unsigned g_itemCount = 0;
 unsigned g_frame = 0;
 
@@ -670,13 +670,22 @@ void MenuDraw()
                 commit |=
                     TunableFloat("LocalStructure", "Local structure", &mm.localStructure, 0.0f, 1.5f, 25, 1.0f, "%.2f");
                 commit |= TunableFloat("LocalTone", "Local tone", &mm.localTone, 0.0f, 1.5f, 25, 1.0f, "%.2f");
+                // While the sky sliders (the depth page) are in use, the model gets a control mask, and with one it
+                // keeps its own auto mask off (the teardown): then neither the auto mask nor skin structure reaches it.
+                const bool skyMask = d.skyTone != 1.0f || d.skyStructure != 1.0f;
+                ImGui::BeginDisabled(skyMask);
                 {
                     const char* const masks[] = { "Off", "On" };
-                    commit |= TunableChoice("AutoMask", "Auto mask", &mm.autoMask, 0, masks, 2);
+                    commit |= TunableChoice("AutoMask", skyMask ? "Auto mask (off: sky sliders in use)" : "Auto mask",
+                                            &mm.autoMask, 0, masks, 2);
                 }
-                const bool skin = mm.autoMask.set && mm.autoMask.value != 0;
+                ImGui::EndDisabled();
+                const bool skin = !skyMask && mm.autoMask.set && mm.autoMask.value != 0;
                 ImGui::BeginDisabled(!skin);
-                commit |= TunableFloat("SkinStructure", skin ? "Skin structure" : "Skin structure (needs Auto mask)",
+                commit |= TunableFloat("SkinStructure",
+                                       skin      ? "Skin structure"
+                                       : skyMask ? "Skin structure (off: sky sliders in use)"
+                                                 : "Skin structure (needs Auto mask)",
                                        &mm.skinStructure, 0.0f, 1.5f, 25, -1.0f, "%.2f", "follows local structure");
                 ImGui::EndDisabled();
 
@@ -742,6 +751,31 @@ void MenuDraw()
             if (haveStatus && !st.linear)
                 ImGui::TextDisabled("%s",
                                     "SDR or tone-mapped input: the card, zebra and histogram have nothing to say");
+            ImGui::EndTabItem();
+        }
+
+        // What the game's depth adds, as experiments to judge by eye. The motion vectors dilated by depth: in
+        // nrprobe's T7 worse right on thin moving things and better over the rest of the frame. The sky's own Local
+        // tone and Local structure, through a control mask: in T8 the mask does exactly what the sliders do, and
+        // what one part of the picture is given moves the rest by about a fifth as much.
+        const bool depthPage = ImGui::BeginTabItem("Depth (experimental)");
+        Record("TabDepth");
+        if (depthPage)
+        {
+            ImGui::SeparatorText("Motion vectors");
+            commit |= Bool("DilateMotion", "Dilate by depth", &d.dilateMotion, def.dilateMotion);
+            ImGui::TextDisabled("%s", "Moving edges take the motion of what is in front. Judge it in motion.");
+
+            ImGui::SeparatorText("Sky");
+            commit |= Float("SkyTone", "Sky local tone", &d.skyTone, 0.0f, 1.5f, 25, false, def.skyTone, "%.2f");
+            commit |= Float("SkyStructure", "Sky local structure", &d.skyStructure, 0.0f, 1.5f, 25, false,
+                            def.skyStructure, "%.2f");
+            commit |= Bool("ShowSky", "Show what counts as sky (purple stripes)", &d.showSky, def.showSky);
+            ImGui::TextDisabled("%s", "1 = as the rest of the picture (times Local tone / Local structure).");
+            ImGui::TextDisabled("%s", "Sky = the far end of the game's depth. Stripes are never saved.");
+            if ((d.skyTone != 1.0f || d.skyStructure != 1.0f) && d.model.autoMask.set && d.model.autoMask.value != 0)
+                ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s",
+                                   "Auto mask is off while either sky slider is away from 1");
             ImGui::EndTabItem();
         }
 
