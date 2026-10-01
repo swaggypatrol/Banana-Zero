@@ -1633,15 +1633,15 @@ void CollectDump()
 // ---------------------------------------------------------------------------------------------------------------
 // ModelScale: the model on a smaller copy of the frame.
 
-// The model's picture for this frame: the frame itself at 100%; below, that share of each side (in whole percent),
-// rounded to whole 8x8 tiles and at least 64 pixels. The feature stays at the frame's size and is handed this much of
-// its input and output (subrects), so the slider moves without a rebuild (nrprobe's T9: the same picture as a
-// feature made at that size, nothing outside the subrect touched).
+// The model's picture for this frame: the frame itself at 100%; below, that share of each side (in the slider's steps,
+// ModelScaleStep), rounded to whole 8x8 tiles and at least 64 pixels. The feature stays at the frame's size and is
+// handed this much of its input and output (subrects), so the slider moves without a rebuild (nrprobe's T9: the same
+// picture as a feature made at that size, nothing outside the subrect touched).
 void ModelSize(const Frame& f, const Settings& s, unsigned* width, unsigned* height)
 {
     *width = f.width;
     *height = f.height;
-    const float percent = std::floor(s.modelScale + 0.5f);
+    const float percent = ModelScaleStep(s.modelScale);
     if (!(percent < 100.0f))
         return;
     auto side = [percent](unsigned size) {

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <new>
 #include <type_traits>
 
@@ -341,7 +342,12 @@ bool Apply(Settings* s, const char* key, const char* value, const char** problem
 
     // Speed.
     if (_stricmp(key, "ModelScale") == 0)
-        return ParseRange(value, 50.0f, 100.0f, &s->modelScale, problem);
+    {
+        if (!ParseRange(value, 33.3f, 100.0f, &s->modelScale, problem))
+            return false;
+        s->modelScale = ModelScaleStep(s->modelScale);
+        return true;
+    }
     *problem = "unknown key";
     return false;
 }
@@ -379,6 +385,23 @@ const char* const kMenuColourText[] = { "auto", "sdr", "hdr" };
 const char* const kMenuThemeText[] = { "dark", "paper" };
 } // namespace
 
+float ModelScaleStep(float percent)
+{
+    if (!(percent < 100.0f)) // and not a number: the whole frame
+        return 100.0f;
+    if (!(percent > kModelScaleThird))
+        return kModelScaleThird;
+    // The nearer of the whole percents either side (but 67) and two thirds, or the third, which stands in for 33.
+    float best = kModelScaleThird;
+    const float below = std::floor(percent);
+    for (const float step : { below, below + 1.0f, kModelScaleTwoThirds })
+    {
+        if (step >= 34.0f && step != 67.0f && std::fabs(step - percent) < std::fabs(best - percent))
+            best = step;
+    }
+    return best;
+}
+
 void SettingsDescribe(const Settings& s, char* out, size_t size)
 {
     size_t length = 0;
@@ -402,7 +425,7 @@ void SettingsDescribe(const Settings& s, char* out, size_t size)
            kMenuColourText[unsigned(s.menuColour) % 3], double(s.menuNits), kMenuThemeText[unsigned(s.menuTheme) % 2]);
     Append(out, size, &length, "; depth DilateMotion %d, SkyTone %.2f, SkyStructure %.2f, ShowSky %d",
            s.dilateMotion ? 1 : 0, double(s.skyTone), double(s.skyStructure), s.showSky ? 1 : 0);
-    Append(out, size, &length, "; speed ModelScale %.0f%%", double(s.modelScale));
+    Append(out, size, &length, "; speed ModelScale %.3g%%", double(s.modelScale));
 }
 
 void SettingsDescribeModel(const ModelSettings& m, char* out, size_t size)

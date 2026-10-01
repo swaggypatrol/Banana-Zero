@@ -174,14 +174,15 @@ renders and upscales exactly as before, and only the model's own copy of the fra
 
 | Control | Range | What it does |
 |---|---|---|
-| **Model input size** | 50% to 100%, default 100% | The model looks at a copy of the frame this big on each side. What it changes is carried back to the full frame along the full frame's own edges, so outlines stay sharp; what thins out is the finest of the model's own detail. 100% is the model on the whole frame, as before. Applies while you drag; each new size restarts the model's memory of earlier frames, so the picture looks a touch rougher for a frame or two |
+| **Model input size** | 33.3% to 100%, default 100% | The model looks at a copy of the frame this big on each side. What it changes is carried back to the full frame along the full frame's own edges, so outlines stay sharp; what thins out is the finest of the model's own detail. 100% is the model on the whole frame, as before. The slider has notches at 33.3%, 50%, 66.7% and 80%: it clicks into one and stays there for a little more mouse travel, so they are easy to hit. Between them it moves in 1% steps. A notch holds on to the grab, so the step just past it is reached by coming back from the other side. Applies while you drag; each new size restarts the model's memory of earlier frames, so the picture looks a touch rougher for a frame or two |
 
 Under the slider: the size the model actually gets, and **NR on the GPU**, the whole pass and the model's share of it in
 milliseconds, measured on the GPU while the menu is open (the median of the last 16 frames).
 
-`nrprobe` timed the model alone on an RTX 5090 at 4K: 7.1 ms at 100%, 4.4 at 75%, 3.8 at 67%, 2.9 at 50%. The slider
-stops at 50% because about 1.7 ms of the model's time does not shrink with the picture: below that, the picture
-would keep thinning for very little time back. Judge the trade with A/B and Split screen.
+`nrprobe` timed the model alone on an RTX 5090 at 4K: 7.1 ms at 100%, 4.4 at 75%, 3.8 at 66.7%, 2.9 at 50%, and 2.4 for
+a 1280x720 picture, which is 33.3%. The slider stops at a third because about 1.7 ms of the model's time does not
+shrink with the picture: below that, the picture would keep thinning for very little time back. Judge the trade with
+A/B and Split screen.
 
 ### Keys and Menu
 
@@ -246,7 +247,7 @@ like to open the back panel.
 | `SkyTone` | 0 to 2 | 1 | Sky local tone |
 | `SkyStructure` | 0 to 2 | 1 | Sky local structure |
 | `ShowSky` | 1 / 0 | 0 | Show what counts as sky; the menu never saves it |
-| `ModelScale` | 50 to 100 | 100 | Model input size |
+| `ModelScale` | 33.3 to 100, read as the nearest of the slider's steps | 100 | Model input size |
 | `StatsLog` | seconds, 0 = off | 0 | file only; a statistics line in the log every N seconds (`tools/bzstats.py` reads them) |
 | `DumpEvery` | seconds, 0 = off | 0 | file only; a frame dump to `%LOCALAPPDATA%\Banana-Zero\dumps` every N seconds, at most 16 (`tools/bzdump.py` turns them into pictures) |
 
@@ -281,6 +282,7 @@ never saved.
 
 | Version | What changed |
 |---|---|
+| v0.1.3 | The release candidate held up in play and is now the current release: [Speed (experimental)](#speed-experimental) and [Depth (experimental)](#depth-experimental) are in. New since the candidate: Model input size goes down to 33.3%, with notches at 33.3%, 50%, 66.7% and 80% and 1% steps between them. Leave both pages as they come and the picture is the same as v0.1.2 |
 | v0.1.3-rc.1 | A release candidate, published as a pre-release: v0.1.2 stays the current release until this one has seen more games. New: [Speed (experimental)](#speed-experimental), the model on a smaller copy of the frame for less GPU time, with the pass's GPU time on the page; [Depth (experimental)](#depth-experimental), motion vectors dilated by depth and the sky's own Local tone and Local structure. New for builders: `nrprobe --subrects`. Leave both pages as they come and the picture is the same as v0.1.2 |
 | v0.1.2 | The knobs are connected now. Style and the five Model knobs were handed to the model only when it was created, but the model reads them every frame, so in v0.1.1 they did nothing. They now act from the next frame, every slider applies while you drag, and turning a knob no longer rebuilds the model. New: `nrprobe --tuning` measures what the knobs do |
 | v0.1.1 | The first public release. The menu and this manual learned English |

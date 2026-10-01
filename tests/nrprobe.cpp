@@ -1682,8 +1682,8 @@ void Tuning8(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
 // sizes its network from the subrects at every evaluation (and ScalingRatio is held at 1), so a smaller subrect should
 // cost less without a new feature.
 //
-// T9: at 100%, 75%, 67% and 50% of the basic run's frame, inside the basic run's textures: whether the model takes
-// the subrect, whether it leaves the Output outside it alone, whether the picture is the one a feature created at
+// T9: at 100%, 75%, 66.7%, 50% and 33.3% of the basic run's frame, inside the basic run's textures: whether the model
+// takes the subrect, whether it leaves the Output outside it alone, whether the picture is the one a feature created at
 // that size makes of the same pixels, and how long an evaluation takes (median, wall time from submit to fence).
 void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& base)
 {
@@ -1700,7 +1700,7 @@ void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, con
         const char* name;
         unsigned num, den;
     };
-    const Size sizes[] = { { "100%", 1, 1 }, { "75%", 3, 4 }, { "67%", 2, 3 }, { "50%", 1, 2 } };
+    const Size sizes[] = { { "100%", 1, 1 }, { "75%", 3, 4 }, { "66.7%", 2, 3 }, { "50%", 1, 2 }, { "33.3%", 1, 3 } };
     double fullMs = 0.0;
     Say("T9 subrects: the feature was created at %ux%u; each size runs %u evaluations from a Reset, the last %u timed",
         w, h, kWarm + kTimed, kTimed);
@@ -1841,7 +1841,7 @@ void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, con
 }
 
 // T10: T5 again with the picture at two thirds of the frame the motion vectors describe, as the games' motion vectors
-// will be with ModelScale at 67%: the motion vectors a texture at 0.58 of the frame in UV units, MVecScale scanned as
+// will be with ModelScale at 66.7%: the motion vectors a texture at 0.58 of the frame in UV units, MVecScale scanned as
 // f times the frame's width. If the model reads the motion against the motion vectors' own size, the games' f = 0.58
 // stays best; against the picture's size, f = 0.67 would be; against the size the feature was created at, f = 1.
 // Run both ways: inside the basic run's feature (a subrect, what dxgi.dll does) and on a feature created at that size.

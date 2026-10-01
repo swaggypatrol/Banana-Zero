@@ -157,8 +157,9 @@ bool ComboBox(const char* key, const char* label, int* v, const char* const* nam
 }
 
 // A slider with notches: `notches` positions from lo to hi, the value snapping to them; when `centred` the middle
-// notch is the neutral value and the fill runs from it. No number on the slider: the value shows while the mouse
-// rests on it or drags, Ctrl+click types one (not snapped), a right-click is the caller's (the default back). `text`
+// notch is the neutral value and the fill runs from it. With `stops` (Stops below) the value moves in its steps
+// instead and the notches are its stops. No number on the slider: the value shows while the mouse rests on it or
+// drags, Ctrl+click types one (not snapped, but for stops), a right-click is the caller's (the default back). `text`
 // stands in for the grab when the value is not set (the model's default). The grab is a rounded rectangle with the
 // frame's own rounding.
 struct SliderState
@@ -175,9 +176,42 @@ bool g_dragEdited = false; // it moved
 float g_typed = 0.0f;      // the number being typed
 bool g_dragStep = false;   // this frame: a slider moved under the mouse (published at once, menu.h MenuDragStepLocked)
 bool g_dragEnded = false;  // this frame: a slider that moved was let go (the drag is logged)
+int g_heldStop = -1;       // the stop holding the dragged slider's grab (Stops), or -1
+
+// A slider that moves in fine steps and has a few stops (ModelScale): `step` gives the step nearest a value, `values`
+// are the stops from the lowest to the highest, drawn as its notches. A stop between the ends holds the grab once the
+// drag gets there, until the mouse is more than `hold` past it, so the grab is easy to leave on a stop and every step
+// can still be had: the one next to a stop on the way to it, the one after it on the way back. The ends need no
+// holding: the mouse beyond them is at them.
+struct Stops
+{
+    float (*step)(float);
+    const float* values;
+    int count;
+    float hold;
+};
+
+// The value a drag gives for `at`, the point under the mouse in the slider's own units.
+float StopsValue(const Stops& stops, float at)
+{
+    if (g_heldStop >= 0)
+    {
+        const float stop = stops.values[g_heldStop];
+        if (std::fabs(at - stop) <= stops.hold)
+            return stop;
+        g_heldStop = -1;
+    }
+    const float value = stops.step(at);
+    for (int k = 1; k + 1 < stops.count; ++k)
+    {
+        if (value == stops.values[k])
+            g_heldStop = k;
+    }
+    return value;
+}
 
 SliderState Notches(const char* key, const char* label, float* v, float lo, float hi, int notches, bool centred,
-                    const char* format, const char* text, bool ghost, float typeLo)
+                    const char* format, const char* text, bool ghost, float typeLo, const Stops* stops = nullptr)
 {
     SliderState state;
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -212,13 +246,14 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
     {
         float t = (io.MousePos.x - x0) / (x1 - x0);
         t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
-        const int k = int(t * float(notches - 1) + 0.5f);
-        const float snapped = lo + step * float(k);
         if (g_dragId != id)
         {
             g_dragId = id;
             g_dragEdited = false;
+            g_heldStop = -1;
         }
+        const float snapped = stops != nullptr ? StopsValue(*stops, lo + (hi - lo) * t)
+                                               : lo + step * float(int(t * float(notches - 1) + 0.5f));
         if (snapped != *v)
         {
             *v = snapped;
@@ -245,9 +280,9 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
     if (style.FrameBorderSize > 0.0f)
         draw->AddRect(min, max, ImGui::GetColorU32(ImGuiCol_Border), rounding, style.FrameBorderSize);
     const float tick = fs >= 30.0f ? 2.0f : 1.0f;
-    for (int k = 0; k < notches; ++k)
+    for (int k = 0; k < (stops != nullptr ? stops->count : notches); ++k)
     {
-        const float x = x0 + (x1 - x0) * float(k) / float(notches - 1);
+        const float x = stops != nullptr ? at(stops->values[k]) : x0 + (x1 - x0) * float(k) / float(notches - 1);
         const bool neutral = centred && k == middle;
         const float tall = neutral ? fs * 0.4f : fs * 0.2f;
         const float wide = neutral ? tick * 2.0f : tick;
@@ -305,6 +340,8 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
                               ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
         {
             *v = g_typed < typeLo ? typeLo : g_typed > hi ? hi : g_typed;
+            if (stops != nullptr)
+                *v = stops->step(*v);
             state.typed = true;
             ImGui::CloseCurrentPopup();
         }
@@ -331,6 +368,17 @@ bool Float(const char* key, const char* label, float* v, float lo, float hi, int
            const char* format)
 {
     const SliderState state = Notches(key, label, v, lo, hi, notches, centred, format, nullptr, false, lo);
+    Dragged(state);
+    if (state.right)
+        *v = fallback;
+    return state.typed || state.right;
+}
+
+// The same for a setting that moves in steps and has stops (Stops).
+bool SteppedFloat(const char* key, const char* label, float* v, const Stops& stops, float fallback, const char* format)
+{
+    const float lo = stops.values[0], hi = stops.values[stops.count - 1];
+    const SliderState state = Notches(key, label, v, lo, hi, stops.count, false, format, nullptr, false, lo, &stops);
     Dragged(state);
     if (state.right)
         *v = fallback;
@@ -780,14 +828,16 @@ void MenuDraw()
         }
 
         // The model on a smaller copy of the frame (ModelScale), after DLSS as always: its time follows its pixels
-        // (nrprobe on the RTX 5090 at 4K: 7.1 ms whole, 4.4 at 75%, 3.8 at 67%, 2.9 at 50%), and its change comes
-        // back to the full frame along the frame's own edges (nr_fit.hlsl). 100% is the model on the whole frame.
+        // (nrprobe on the RTX 5090 at 4K: 7.1 ms whole, 4.4 at 75%, 3.8 at 66.7%, 2.9 at 50%, 2.4 for 1280x720,
+        // a third), and its change comes back to the full frame along the frame's own edges (nr_fit.hlsl). 100% is
+        // the model on the whole frame. The slider moves in 1% steps and holds at the stops 50, 66.7 and 80%.
         const bool speedPage = ImGui::BeginTabItem("Speed (experimental)");
         Record("TabSpeed");
         if (speedPage)
         {
-            commit |= Float("ModelScale", "Model input size", &d.modelScale, 50.0f, 100.0f, 11, false, def.modelScale,
-                            "%.0f%%");
+            static constexpr Stops kSizes = { ModelScaleStep, kModelScaleStops,
+                                              int(sizeof kModelScaleStops / sizeof kModelScaleStops[0]), 2.0f };
+            commit |= SteppedFloat("ModelScale", "Model input size", &d.modelScale, kSizes, def.modelScale, "%.3g%%");
             ImGui::TextDisabled("%s", "Below 100% the model works on a smaller copy of the frame, and what it");
             ImGui::TextDisabled("%s", "changes is carried back to full size along the frame's own edges.");
             if (haveStatus && st.modelWidth != 0)
