@@ -1,7 +1,7 @@
 // The panel: what the menu shows. Runs under the menu's lock, between ImGui::NewFrame and ImGui::Render, and works
-// on the model (menu.cpp). A slider changes the draft while it is dragged and commits when the mouse is released
-// (ImGui's IsItemDeactivatedAfterEdit); a box, a choice, a right-click (back to the default) and "reset all" commit
-// at once.
+// on the model (menu.cpp). A slider publishes every step while it is dragged, so the picture follows the mouse, and
+// the drag is logged once, when the mouse lets go; a typed number, a box, a choice, a right-click (back to the
+// default) and "reset all" commit at once.
 
 #include <windows.h>
 
@@ -163,8 +163,8 @@ bool ComboBox(const char* key, const char* label, int* v, const char* const* nam
 // frame's own rounding.
 struct SliderState
 {
-    bool edited = false;   // the value changed under the mouse this frame
-    bool released = false; // the mouse let go after moving it
+    bool edited = false;   // the value changed under the mouse this frame: a step of the drag
+    bool released = false; // the mouse let go after moving it: the drag is over
     bool typed = false;    // a number was typed and entered
     bool right = false;    // right-clicked
 };
@@ -173,6 +173,8 @@ bool g_cardFroze = false;  // the card froze the frame: unticking the card unfre
 ImGuiID g_dragId = 0;      // the slider under the mouse button
 bool g_dragEdited = false; // it moved
 float g_typed = 0.0f;      // the number being typed
+bool g_dragStep = false;   // this frame: a slider moved under the mouse (published at once, menu.h MenuDragStepLocked)
+bool g_dragEnded = false;  // this frame: a slider that moved was let go (the drag is logged)
 
 SliderState Notches(const char* key, const char* label, float* v, float lo, float hi, int notches, bool centred,
                     const char* format, const char* text, bool ghost, float typeLo)
@@ -316,18 +318,23 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
 
 bool RightClicked() { return ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right); }
 
-// A setting's slider: commits on release or a typed number; a right-click puts the default back and commits.
+// A slider's drag, for the end of the panel: each step is published as it happens, the end is logged.
+void Dragged(const SliderState& state)
+{
+    g_dragStep |= state.edited;
+    g_dragEnded |= state.released;
+}
+
+// A setting's slider: each step of a drag is published at once; a typed number commits, and so does a right-click,
+// which puts the default back.
 bool Float(const char* key, const char* label, float* v, float lo, float hi, int notches, bool centred, float fallback,
            const char* format)
 {
     const SliderState state = Notches(key, label, v, lo, hi, notches, centred, format, nullptr, false, lo);
-    bool commit = state.released || state.typed;
+    Dragged(state);
     if (state.right)
-    {
         *v = fallback;
-        commit = true;
-    }
-    return commit;
+    return state.typed || state.right;
 }
 
 // A model parameter: "model default" until it is touched; a right-click makes it the model's default again. With
@@ -346,26 +353,25 @@ bool TunableFloat(const char* key, const char* label, Tunable<float>* t, float l
         t->set = true;
         t->value = below != nullptr && v < 0.0f ? -1.0f : v;
     }
-    bool commit = state.released || state.typed;
+    Dragged(state);
     if (state.right)
-    {
         t->set = false;
-        commit = true;
-    }
-    return commit;
+    return state.typed || state.right;
 }
 
-// A choice among names; the first name is "model default" for a model parameter.
-bool TunableChoice(const char* key, const char* label, Tunable<unsigned>* t, const char* const* names, int count)
+// A model parameter picked from names: shows `fallback`, the model's own default, until it is picked; a right-click
+// hands it back to the model. A value past the last name shows as the last (the model reads Style 3 and up as 2).
+bool TunableChoice(const char* key, const char* label, Tunable<unsigned>* t, unsigned fallback,
+                   const char* const* names, int count)
 {
-    int v = t->set ? int(t->value) + 1 : 0;
+    int v = int(t->set ? t->value : fallback);
     if (v >= count)
         v = count - 1;
     bool commit = ComboBox(key, label, &v, names, count);
     if (commit)
     {
-        t->set = v != 0;
-        t->value = v > 0 ? unsigned(v - 1) : 0;
+        t->set = true;
+        t->value = unsigned(v);
     }
     if (RightClicked())
     {
@@ -460,20 +466,7 @@ bool KeyBinding(const char* key, int slot, const char* label, unsigned* vk)
     return commit;
 }
 
-ModelSettings ModelFrom(const unsigned char* bytes)
-{
-    ModelSettings m;
-    memcpy(&m, bytes, sizeof m);
-    return m;
-}
-
-// The refusal of a model parameter set: the sliders go back to the last set that worked, once, and the panel says
-// so until the model parameters change again.
-char g_refusalNote[256] = {};
-ModelSettings g_refusalFor;
-bool g_haveRefusalNote = false;
-
-void StatusLines(MenuModel& m, const NrStatusState& st, bool have)
+void StatusLines(const MenuModel& m, const NrStatusState& st, bool have)
 {
     if (!have)
     {
@@ -496,30 +489,8 @@ void StatusLines(MenuModel& m, const NrStatusState& st, bool have)
         ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s", "NR is switched off");
     if (FreezeActive())
         ImGui::TextColored(MenuToneColour(MenuTone::Info), "%s", "Frame frozen");
-
-    // The model's parameters: created, pending, or refused.
-    const ModelSettings created = ModelFrom(st.createdModel);
-    const ModelSettings refused = ModelFrom(st.refusedModel);
-    if (st.refused && m.draft.model == refused)
-    {
-        if (!g_haveRefusalNote || !(g_refusalFor == refused))
-        {
-            char which[160];
-            SettingsDescribeModel(refused, which, sizeof which);
-            snprintf(g_refusalNote, sizeof g_refusalNote, "The model refused%s; back to the last set that worked",
-                     which);
-            g_refusalFor = refused;
-            g_haveRefusalNote = true;
-            m.draft.model = created;
-            MenuCommitLocked("model refused");
-        }
-    }
-    if (g_haveRefusalNote)
-        ImGui::TextColored(MenuToneColour(MenuTone::Warn), "%s", g_refusalNote);
     if (!st.haveFeature)
         ImGui::TextDisabled("%s", "The model is not built yet");
-    else if (!(created == m.draft.model))
-        ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s", "Rebuilding the model...");
 }
 
 void PreviewWindow(MenuModel& m)
@@ -615,6 +586,8 @@ void MenuDraw()
     const bool haveStatus = NrStatus(&st);
     bool commit = false;
     const char* why = "panel";
+    g_dragStep = false;
+    g_dragEnded = false;
 
     ImGui::SetNextWindowPos(ImVec2(fs * 2.0f, fs * 2.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(fs * 36.0f, 0.0f), ImVec2(fs * 36.0f, io.DisplaySize.y * 0.9f));
@@ -676,29 +649,36 @@ void MenuDraw()
             commit |=
                 Float("ColourStrength", "Colour", &d.colourStrength, 0.0f, 1.5f, 25, false, def.colourStrength, "%.2f");
             {
-                const char* const styles[] = { "model default", "Standard", "Natural", "Cinematic" };
-                commit |= TunableChoice("Style", "Style", &mm.style, styles, 4);
+                // Three, as the model has (its default is Standard).
+                const char* const styles[] = { "Standard", "Natural", "Cinematic" };
+                commit |= TunableChoice("Style", "Style", &mm.style, 0, styles, 3);
             }
 
             const bool advanced = ImGui::CollapsingHeader("Advanced (rarely needed)");
             Record("Advanced");
             if (advanced)
             {
-                // The model's other creation parameters: a change rebuilds the feature. No Preset: it picks a set of
+                // The model's other parameters. It reads them at every evaluation, so a change shows on the next frame.
+                // Model intensity blends the model's result with its input inside the model and does nothing above
+                // 1. Skin structure reaches the network only with the auto mask on (with it off, the model passes -1
+                // for both the skin and the other areas), so it is greyed out without. No Preset: it picks a set of
                 // network weights and the model DLL (310.8) embeds exactly one (WEIGHTS_HT; any other number falls
-                // back to it inside the model), so every value is the same model. The ini key stays for a model build
-                // that ships several.
-                ImGui::SeparatorText("Model (rebuilds when you let go)");
-                commit |= TunableFloat("Intensity", "Model intensity", &mm.intensity, 0.0f, 1.5f, 25, 1.0f, "%.2f");
+                // back to it inside the model), so every value is the same model. The ini key stays for a model
+                // build that ships several.
+                ImGui::SeparatorText("Model");
+                commit |= TunableFloat("Intensity", "Model intensity", &mm.intensity, 0.0f, 1.0f, 21, 1.0f, "%.2f");
                 commit |=
                     TunableFloat("LocalStructure", "Local structure", &mm.localStructure, 0.0f, 1.5f, 25, 1.0f, "%.2f");
                 commit |= TunableFloat("LocalTone", "Local tone", &mm.localTone, 0.0f, 1.5f, 25, 1.0f, "%.2f");
-                commit |= TunableFloat("SkinStructure", "Skin structure", &mm.skinStructure, 0.0f, 1.5f, 25, -1.0f,
-                                       "%.2f", "follows local structure");
                 {
-                    const char* const masks[] = { "model default", "Off", "On" };
-                    commit |= TunableChoice("AutoMask", "Auto mask", &mm.autoMask, masks, 3);
+                    const char* const masks[] = { "Off", "On" };
+                    commit |= TunableChoice("AutoMask", "Auto mask", &mm.autoMask, 0, masks, 2);
                 }
+                const bool skin = mm.autoMask.set && mm.autoMask.value != 0;
+                ImGui::BeginDisabled(!skin);
+                commit |= TunableFloat("SkinStructure", skin ? "Skin structure" : "Skin structure (needs Auto mask)",
+                                       &mm.skinStructure, 0.0f, 1.5f, 25, -1.0f, "%.2f", "follows local structure");
+                ImGui::EndDisabled();
 
                 // The HDR encode (M4). InputType is ini-only: auto follows the game's IsHDR flag and both games
                 // are right.
@@ -839,7 +819,11 @@ void MenuDraw()
     ImGui::End();
 
     if (commit)
-        MenuCommitLocked(why);
+        MenuCommitLocked(why); // a step of a drag in the same frame goes with it
+    else if (g_dragStep)
+        MenuDragStepLocked();
+    if (g_dragEnded)
+        MenuDragEndedLocked();
     if (d.preview != Preview::Off)
         PreviewWindow(m);
 }

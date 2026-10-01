@@ -31,7 +31,7 @@ bool MenuModelSync(MenuModel* m, const Settings& current);
 // The draft as the pass should run it.
 Settings MenuModelEffective(const MenuModel& m);
 
-// The panel changed the draft (a slider released, a box ticked) or A/B flipped: publishes the effective snapshot and
+// The panel changed the draft (a slider moved, a box ticked) or A/B flipped: publishes the effective snapshot and
 // remembers it. Returns the snapshot. `now` is LogClock().
 const Settings* MenuModelCommit(MenuModel* m, double now, MenuPublishFn publish);
 

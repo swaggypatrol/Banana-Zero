@@ -10,11 +10,11 @@
 //     parameter set back to the model's default loses its line; a new file gets its header; what was written reads
 //     back the same
 //   - menu_model.cpp: the draft, A/B, when the file is due, a reload behind the menu
-//   - the panel: a slider dragged with the mouse publishes nothing until the mouse is released, then once, with the
-//     value; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
-//     box unfreezes it, unticking the card undoes the freeze it made; a refused model parameter set goes back to the
-//     last that worked; "all defaults"; closing the menu writes the file, and so does a second after a commit while it
-//     is open
+//   - the panel: a slider dragged with the mouse publishes every step at once and logs the drag once, when the mouse
+//     lets go; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
+//     box unfreezes it, unticking the card undoes the freeze it made; skin structure takes no input until the auto
+//     mask is on; "all defaults"; closing the menu writes the file, and so does a second after a commit while it is
+//     open
 
 #include <windows.h>
 
@@ -64,6 +64,7 @@ int g_checks = 0;
 int g_failed = 0;
 wchar_t g_directory[MAX_PATH];
 wchar_t g_ini[MAX_PATH];
+wchar_t g_logPath[MAX_PATH];
 
 void Check(bool ok, const char* format, ...)
 {
@@ -115,6 +116,26 @@ bool FileHas(const char* needle, double seconds)
 }
 
 bool Near(float a, float b, float tolerance) { return std::fabs(a - b) <= tolerance; }
+
+// How many times the menu's log holds `needle` so far (read beside the open log, which shares reading and writing).
+int LogCount(const char* needle)
+{
+    const HANDLE f = CreateFileW(g_logPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        return -1;
+    static char text[65536];
+    DWORD read = 0;
+    const BOOL ok = ReadFile(f, text, sizeof text - 1, &read, nullptr);
+    CloseHandle(f);
+    if (!ok)
+        return -1;
+    text[read] = '\0';
+    int count = 0;
+    for (const char* at = strstr(text, needle); at != nullptr; at = strstr(at + 1, needle))
+        ++count;
+    return count;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -364,7 +385,6 @@ void TestPanel()
     g_fakeStatus.hdr = true;
     g_fakeStatus.linear = true;
     g_fakeStatus.havePreExposure = true;
-    memcpy(g_fakeStatus.createdModel, &start->model, sizeof(ModelSettings));
 
     MenuOnEvaluate(nullptr); // takes the snapshot as the draft
     MenuSetOpen(true);
@@ -379,28 +399,31 @@ void TestPanel()
     Check(Centre("Close", &x, &y), "panel: the close button was drawn");
     Check(Generation() == g0, "panel: drawing publishes nothing");
 
-    // A slider: press a tenth of the way along (the grab sits at 1 of 1.5, away from there), drag to six tenths,
-    // release.
+    // A slider: press a tenth of the way along (the grab sits at 0.7, away from there), drag to six tenths, release.
+    // Each step is published as it happens; letting go publishes nothing more and logs the drag in one line.
     Check(Centre("Intensity", &x, &y, 0.1f), "panel: Intensity rect");
     MoveTo(x, y);
     Button(0, true);
     Frame();
-    Check(Generation() == g0, "panel: pressing publishes nothing");
     {
-        MenuLock();
-        const float shown = MenuModelLocked().draft.model.intensity.value;
-        MenuUnlock();
-        Check(shown < 0.4f, "panel: the draft follows the mouse while pressed (%.2f)", shown);
+        const float shown = SettingsCurrent()->model.intensity.value;
+        Check(Generation() == g0 + 1 && SettingsCurrent()->model.intensity.set && shown < 0.4f,
+              "panel: pressing publishes the value under the mouse at once (%.2f, generation %u)", shown,
+              Generation());
     }
     Centre("Intensity", &x, &y, 0.6f);
     MoveTo(x, y);
     Frame();
-    Check(Generation() == g0, "panel: dragging publishes nothing");
+    Check(Generation() == g0 + 2 && Near(SettingsCurrent()->model.intensity.value, 0.6f, 0.1f),
+          "panel: dragging publishes the new value at once (%.2f)", double(SettingsCurrent()->model.intensity.value));
+    Check(LogCount("menu slider") == 0 && LogCount("menu panel") == 0, "panel: no log line while the slider is dragged");
     Button(0, false);
     Frame();
-    Check(Generation() == g0 + 1, "panel: releasing publishes once (generation %u)", Generation());
+    Check(Generation() == g0 + 2, "panel: letting go publishes nothing more (generation %u)", Generation());
+    Check(LogCount("menu slider: Intensity 0.7 -> ") == 1 && LogCount("menu slider") == 1,
+          "panel: letting go logs the drag once, from where it started");
     const float intensity = SettingsCurrent()->model.intensity.value;
-    Check(SettingsCurrent()->model.intensity.set && Near(intensity, 0.9f, 0.1f),
+    Check(SettingsCurrent()->model.intensity.set && Near(intensity, 0.6f, 0.1f),
           "panel: the published Intensity is where the mouse let go (%.2f)", intensity);
     Check(!FileHas("Intensity = 1", 0.3), "panel: the file is not written within 0.3 s of a commit");
     Sleep(1000);
@@ -413,14 +436,14 @@ void TestPanel()
     // A right-click: the model's default again (not set).
     Check(Click("Intensity", 0.5f, 1), "panel: right-click Intensity");
     Frame();
-    Check(Generation() == g0 + 2 && !SettingsCurrent()->model.intensity.set,
-          "panel: right-click makes it the model's default");
+    const unsigned g1 = Generation();
+    Check(g1 == g0 + 3 && !SettingsCurrent()->model.intensity.set, "panel: right-click makes it the model's default");
 
     // A box commits at once.
     Check(Click("Enabled"), "panel: click Enabled");
-    Check(Generation() == g0 + 3 && !SettingsCurrent()->enabled, "panel: Enabled off published at once");
+    Check(Generation() == g1 + 1 && !SettingsCurrent()->enabled, "panel: Enabled off published at once");
     Check(Click("Enabled"), "panel: click Enabled again");
-    Check(Generation() == g0 + 4 && SettingsCurrent()->enabled, "panel: Enabled on again");
+    Check(Generation() == g1 + 2 && SettingsCurrent()->enabled, "panel: Enabled on again");
 
     // A/B: the pass sees Enabled 0, the draft keeps 1.
     Check(Click("AB"), "panel: click A/B");
@@ -429,11 +452,11 @@ void TestPanel()
         const bool draftEnabled = MenuModelLocked().draft.enabled;
         const bool abOff = MenuModelLocked().abOff;
         MenuUnlock();
-        Check(Generation() == g0 + 5 && !SettingsCurrent()->enabled && draftEnabled && abOff,
+        Check(Generation() == g1 + 3 && !SettingsCurrent()->enabled && draftEnabled && abOff,
               "panel: A/B publishes Enabled 0 and keeps the draft's 1");
     }
     Check(Click("AB"), "panel: click A/B again");
-    Check(Generation() == g0 + 6 && SettingsCurrent()->enabled, "panel: A/B back");
+    Check(Generation() == g1 + 4 && SettingsCurrent()->enabled, "panel: A/B back");
 
     // The card freezes; the freeze box unfreezes and takes the card with it. The card is on the compare page.
     Check(!FreezeWanted(), "panel: not frozen to begin with");
@@ -441,20 +464,20 @@ void TestPanel()
     Check(Click("TabCompare"), "panel: open the compare page");
     Check(!Centre("Intensity", &x, &y), "panel: the tuning page is hidden now");
     Check(Click("Card"), "panel: click the card");
-    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g0 + 7, "panel: the card freezes the frame");
+    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g1 + 5, "panel: the card freezes the frame");
     Check(Click("Freeze"), "panel: click the freeze box");
     Check(!FreezeWanted(), "panel: unfrozen");
-    Check(Generation() == g0 + 8 && !SettingsCurrent()->card, "panel: the card went with the freeze");
+    Check(Generation() == g1 + 6 && !SettingsCurrent()->card, "panel: the card went with the freeze");
     // Unticking the card undoes the freeze it made; a freeze made by hand stays.
     Check(Click("Card"), "panel: click the card again");
-    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g0 + 9, "panel: the card freezes again");
+    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g1 + 7, "panel: the card freezes again");
     Check(Click("Card"), "panel: untick the card");
-    Check(!FreezeWanted() && !SettingsCurrent()->card && Generation() == g0 + 10,
+    Check(!FreezeWanted() && !SettingsCurrent()->card && Generation() == g1 + 8,
           "panel: the card off undoes the freeze it made");
     Check(Click("Freeze") && FreezeWanted(), "panel: freeze by hand");
-    Check(Click("Card") && SettingsCurrent()->card && Generation() == g0 + 11,
+    Check(Click("Card") && SettingsCurrent()->card && Generation() == g1 + 9,
           "panel: the card on a frame frozen by hand");
-    Check(Click("Card") && !SettingsCurrent()->card && Generation() == g0 + 12, "panel: the card off again");
+    Check(Click("Card") && !SettingsCurrent()->card && Generation() == g1 + 10, "panel: the card off again");
     Check(FreezeWanted(), "panel: the freeze made by hand stays");
     Check(Click("Freeze") && !FreezeWanted(), "panel: unfrozen by hand");
     Check(Click("TabTune"), "panel: back to the tuning page");
@@ -472,34 +495,31 @@ void TestPanel()
         Check(d.model.intensity.set && Near(d.model.intensity.value, 0.3f, 1e-6f) && Near(d.whiteEV, 2.0f, 1e-6f),
               "panel: the draft follows the reloaded file");
     }
-    const unsigned g1 = Generation();
+    const unsigned g2 = Generation();
 
-    // A refused model parameter set goes back to the last that worked.
+    // Skin structure reaches the model only with the auto mask on: greyed out, it takes no clicks until then.
+    Check(Centre("SkinStructure", &x, &y), "panel: the skin structure slider was drawn");
+    Check(Click("SkinStructure", 0.8f) && Generation() == g2 && !SettingsCurrent()->model.skinStructure.set,
+          "panel: skin structure takes no click while the auto mask is off");
     {
         MenuLock();
-        ModelSettings created = MenuModelLocked().draft.model;
+        MenuModelLocked().draft.model.autoMask = { true, 1u };
+        MenuCommitLocked("test");
         MenuUnlock();
-        created.intensity = { true, 0.5f };
-        memcpy(g_fakeStatus.createdModel, &created, sizeof created);
-        ModelSettings refused;
-        MenuLock();
-        refused = MenuModelLocked().draft.model; // Intensity 0.3
-        MenuUnlock();
-        memcpy(g_fakeStatus.refusedModel, &refused, sizeof refused);
-        g_fakeStatus.refused = true;
-        Frame();
-        Check(Generation() == g1 + 1 && Near(SettingsCurrent()->model.intensity.value, 0.5f, 1e-6f),
-              "panel: a refusal puts the last working model parameters back and publishes them");
-        Frame();
-        Check(Generation() == g1 + 1, "panel: the refusal is acted on once");
-        g_fakeStatus.refused = false;
     }
+    Check(Generation() == g2 + 1 && SettingsCurrent()->model.autoMask.set, "panel: auto mask on published");
+    Check(Click("SkinStructure", 0.8f), "panel: click skin structure with the auto mask on");
+    Check(Generation() == g2 + 2 && SettingsCurrent()->model.skinStructure.set &&
+              SettingsCurrent()->model.skinStructure.value > 0.9f,
+          "panel: with the auto mask on, a click on skin structure sets it (%.2f)",
+          double(SettingsCurrent()->model.skinStructure.value));
 
     // All defaults, through the confirmation.
     Check(Click("Defaults"), "panel: click all defaults");
     Frame();
     Check(Click("DefaultsYes"), "panel: confirm");
-    Check(Generation() == g1 + 2 && !SettingsCurrent()->model.intensity.set &&
+    Check(Generation() == g2 + 3 && !SettingsCurrent()->model.intensity.set &&
+              !SettingsCurrent()->model.autoMask.set && !SettingsCurrent()->model.skinStructure.set &&
               Near(SettingsCurrent()->whiteEV, 0.0f, 1e-6f),
           "panel: all defaults published");
 
@@ -532,9 +552,8 @@ int main()
     wcscat_s(g_directory, MAX_PATH, L"banana-zero-menutest\\");
     CreateDirectoryW(g_directory, nullptr);
     swprintf_s(g_ini, MAX_PATH, L"%sdlssnr.ini", g_directory);
-    wchar_t logPath[MAX_PATH];
-    swprintf_s(logPath, MAX_PATH, L"%smenutest.log", g_directory);
-    LogOpen(logPath);
+    swprintf_s(g_logPath, MAX_PATH, L"%smenutest.log", g_directory);
+    LogOpen(g_logPath);
     std::printf("menutest: files under %ls\n", g_directory);
 
     TestKeys();
@@ -548,7 +567,7 @@ int main()
         CloseHandle(g_log);
         g_log = INVALID_HANDLE_VALUE;
         char text[16384];
-        if (ReadAll(logPath, text, sizeof text))
+        if (ReadAll(g_logPath, text, sizeof text))
             std::printf("--- the menu's log ---\n%s", text);
     }
     return g_failed;

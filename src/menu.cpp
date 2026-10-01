@@ -88,6 +88,21 @@ void CommitLocked(const char* why)
     Log("menu%s%s: %s", why != nullptr ? " " : "", why != nullptr ? why : "", diff[0] != '\0' ? diff : "no change");
 }
 
+// A slider being dragged: each step is published as it happens and the drag is logged once, when it ends.
+Settings g_dragFrom;     // what was published before the drag's first step
+bool g_dragging = false; // a step was published and the drag has not been logged yet
+
+// Under g_lock. The drag ended (the mouse let go, or the menu closed under it): one line for all its steps.
+void DragEndedLocked()
+{
+    if (!g_dragging)
+        return;
+    g_dragging = false;
+    char diff[512];
+    SettingsDiff(g_dragFrom, g_model.published, diff, sizeof diff);
+    Log("menu slider: %s", diff[0] != '\0' ? diff : "back where it started");
+}
+
 // Under g_lock. `list` is the game's command list when there is one (the overlay learns the device from it).
 void SetOpenLocked(bool open, ID3D12GraphicsCommandList* list)
 {
@@ -96,6 +111,8 @@ void SetOpenLocked(bool open, ID3D12GraphicsCommandList* list)
     if (open && !OverlayOpen(list))
         return; // said why in the log; the hotkeys still work without a menu
     g_model.open = open;
+    if (!open)
+        DragEndedLocked();
     Log("menu: %s", open ? "opened" : "closed");
     if (!open)
     {
@@ -182,6 +199,18 @@ void MenuOnEvaluate(ID3D12GraphicsCommandList* list)
 MenuModel& MenuModelLocked() { return g_model; }
 
 void MenuCommitLocked(const char* why) { CommitLocked(why); }
+
+void MenuDragStepLocked()
+{
+    if (!g_dragging)
+    {
+        g_dragFrom = g_model.published;
+        g_dragging = true;
+    }
+    MenuModelCommit(&g_model, LogClock(), &SettingsPublish);
+}
+
+void MenuDragEndedLocked() { DragEndedLocked(); }
 
 void MenuCloseLocked() { SetOpenLocked(false, nullptr); }
 

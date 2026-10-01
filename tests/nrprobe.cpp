@@ -4,6 +4,7 @@
 //
 //   build\Release\nrprobe.exe [--model <path\nvngx_dlssnr.dll>] [--size WxH] [--evaluates N] [--init N]
 //                             [--capability] [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first]
+//                             [--tuning] [--dumps <folder>]
 //
 // It makes the same calls in the same order as dxgi.dll's NR pass (src/nr_dx12.cpp), one line of output per step,
 // and stops at the first step that fails: device, the driver's core and its Init, the bridge from beside this exe,
@@ -19,6 +20,12 @@
 // has this exe initialise NvAPI before anything else and never unload it, as a game does. The verdict line (PASS or
 // FAIL) is printed before any shutdown; whether the process then exits cleanly is what its exit code shows.
 //
+// --tuning then measures, on the same feature, what the model does with its parameters and its motion vectors
+// (Tuning, below: T0 to T6): that its six parameters act when written at every evaluation and not when written only
+// at creation, the model's defaults, its clamps, which motion-vector scale it wants, and on Witcher 3 frames from
+// dxgi.dll's own dumps (--dumps, else %LOCALAPPDATA%\Banana-Zero\dumps) how each setting moves its colour. The
+// exit code is then also 1 when one of its checks fails.
+//
 // dxgi.dll from the same folder is loaded too (this exe imports dxgi), so its dlssnr.log appears beside it; it sees
 // no SR/RR evaluation here and does nothing.
 
@@ -27,6 +34,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -459,6 +467,8 @@ struct Options
     bool modelShutdown = true;
     bool coreShutdown = true;
     bool nvapiFirst = false;
+    bool tuning = false;
+    std::wstring dumps; // --tuning's T6: where the frame dumps are; empty: %LOCALAPPDATA%\Banana-Zero\dumps
 };
 
 bool ParseOptions(int argc, wchar_t** argv, Options* options)
@@ -489,10 +499,881 @@ bool ParseOptions(int argc, wchar_t** argv, Options* options)
             options->coreShutdown = false;
         else if (arg == L"--nvapi-first")
             options->nvapiFirst = true;
+        else if (arg == L"--tuning")
+            options->tuning = true;
+        else if (arg == L"--dumps" && hasValue)
+            options->dumps = argv[++i];
         else
             return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// --tuning: what the model does with its parameters and its motion vectors, measured on the GPU (Tuning, below).
+
+// Uploads through one staging buffer, kept and grown: each upload is run and waited for before it returns, so the
+// next may reuse the buffer. The texture goes from `before` to COPY_DEST and on to `after`.
+ID3D12Resource* g_staging = nullptr;
+UINT64 g_stagingSize = 0;
+
+bool UploadNow(ID3D12Resource* texture, const void* rows, unsigned rowBytes, unsigned height,
+               D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT64 total = 0;
+    g.device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+    if (total > g_stagingSize)
+    {
+        if (g_staging != nullptr)
+            g_staging->Release();
+        g_staging = MakeBuffer(D3D12_HEAP_TYPE_UPLOAD, total, D3D12_RESOURCE_STATE_GENERIC_READ);
+        g_stagingSize = g_staging != nullptr ? total : 0;
+        if (g_staging == nullptr)
+            return false;
+    }
+    uint8_t* mapped = nullptr;
+    if (FAILED(g_staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
+        return false;
+    for (unsigned y = 0; y < height; ++y)
+        std::memcpy(mapped + footprint.Offset + UINT64(y) * footprint.Footprint.RowPitch,
+                    static_cast<const uint8_t*>(rows) + size_t(y) * rowBytes, rowBytes);
+    g_staging->Unmap(0, nullptr);
+    if (before != D3D12_RESOURCE_STATE_COPY_DEST)
+        Barrier(texture, before, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION from = {};
+    from.pResource = g_staging;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    from.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION to = {};
+    to.pResource = texture;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    Barrier(texture, D3D12_RESOURCE_STATE_COPY_DEST, after);
+    return Submit("upload") >= 0.0;
+}
+
+// A texture made and filled, left in NON_PIXEL_SHADER_RESOURCE; nullptr on failure.
+ID3D12Resource* MakeFilled(DXGI_FORMAT format, unsigned width, unsigned height, const void* rows, unsigned rowBytes)
+{
+    ID3D12Resource* texture =
+        MakeTexture(format, width, height, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (texture != nullptr && !UploadNow(texture, rows, rowBytes, height, D3D12_RESOURCE_STATE_COPY_DEST,
+                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+    {
+        texture->Release();
+        return nullptr;
+    }
+    return texture;
+}
+
+ID3D12Resource* MakeOutput(unsigned width, unsigned height)
+{
+    return MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+// The model's entry points through the bridge, and the core's AllocateParameters (nullptr with --capability).
+struct Model
+{
+    BzPopulate populate = nullptr;
+    BzCreate create = nullptr;
+    BzEvaluate evaluate = nullptr;
+    BzRelease release = nullptr;
+    GetParams allocate = nullptr;
+};
+
+// The six parameters the model reads at every evaluation, each with the type it reads it as; the defaults are the
+// model's own (what it takes for a key that is absent), as dxgi.dll writes them (nr_dx12.cpp, FillTunables).
+struct Tunables
+{
+    float intensity = 1.0f;
+    unsigned style = 0;
+    float localStructure = 1.0f;
+    float localTone = 1.0f;
+    float skin = -1.0f;
+    int autoMask = 0;
+};
+
+void SetTunables(NVSDK_NGX_Parameter* p, const Tunables& t)
+{
+    p->Set("DLSSNR.Intensity", t.intensity);
+    p->Set("DLSSNR.Style", t.style);
+    p->Set("DLSSNR.LocalStructureStrength", t.localStructure);
+    p->Set("DLSSNR.LocalToneStrength", t.localTone);
+    p->Set("DLSSNR.SkinStructureStrength", t.skin);
+    p->Set("DLSSNR.UseAutoMask", t.autoMask);
+}
+
+// What one evaluation is given, the way dxgi.dll gives it (nr_dx12.cpp, FillEvaluate).
+struct Inputs
+{
+    unsigned width = 0, height = 0; // Color and Output
+    ID3D12Resource* colour = nullptr;
+    ID3D12Resource* depth = nullptr;
+    unsigned depthWidth = 0, depthHeight = 0;
+    ID3D12Resource* motion = nullptr;
+    unsigned motionWidth = 0, motionHeight = 0;
+    float mvScaleX = 1.0f, mvScaleY = 1.0f;
+    unsigned depthInverted = 0;
+    ID3D12Resource* output = nullptr;
+};
+
+void SetInputs(NVSDK_NGX_Parameter* p, const Inputs& in, unsigned reset)
+{
+    p->Set("DLSSNR.Color", in.colour);
+    p->Set("DLSSNR.Depth", in.depth);
+    p->Set("DLSSNR.MVec", in.motion);
+    p->Set("DLSSNR.Output", in.output);
+    p->Set("DLSSNR.Enabled", 1u);
+    p->Set("DLSSNR.Width", in.width);
+    p->Set("DLSSNR.Height", in.height);
+    p->Set("DLSSNR.DepthInverted", in.depthInverted);
+    p->Set("DLSSNR.Reset", reset);
+    p->Set("DLSSNR.ColorSubrectBaseX", 0u);
+    p->Set("DLSSNR.ColorSubrectBaseY", 0u);
+    p->Set("DLSSNR.ColorSubrectWidth", in.width);
+    p->Set("DLSSNR.ColorSubrectHeight", in.height);
+    p->Set("DLSSNR.OutputSubrectBaseX", 0u);
+    p->Set("DLSSNR.OutputSubrectBaseY", 0u);
+    p->Set("DLSSNR.OutputSubrectWidth", in.width);
+    p->Set("DLSSNR.OutputSubrectHeight", in.height);
+    p->Set("DLSSNR.DepthSubrectBaseX", 0u);
+    p->Set("DLSSNR.DepthSubrectBaseY", 0u);
+    p->Set("DLSSNR.DepthSubrectWidth", in.depthWidth);
+    p->Set("DLSSNR.DepthSubrectHeight", in.depthHeight);
+    p->Set("DLSSNR.MVecSubrectBaseX", 0u);
+    p->Set("DLSSNR.MVecSubrectBaseY", 0u);
+    p->Set("DLSSNR.MVecSubrectWidth", in.motionWidth);
+    p->Set("DLSSNR.MVecSubrectHeight", in.motionHeight);
+    p->Set("DLSSNR.MVecScaleX", in.mvScaleX);
+    p->Set("DLSSNR.MVecScaleY", in.mvScaleY);
+}
+
+// A feature of its own for a test, from a fresh pair of parameter blocks (left allocated, as dxgi.dll leaves its
+// own). `atCreate`, when given, is written into the creation block as well. nullptr on failure, said why.
+void* CreateOwn(const Model& m, unsigned width, unsigned height, const Tunables* atCreate,
+                NVSDK_NGX_Parameter** evalBlock)
+{
+    NVSDK_NGX_Parameter* create = nullptr;
+    NVSDK_NGX_Parameter* evaluate = nullptr;
+    if (m.allocate == nullptr || m.allocate(&create) != NVSDK_NGX_Result_Success ||
+        m.allocate(&evaluate) != NVSDK_NGX_Result_Success || create == nullptr || evaluate == nullptr)
+    {
+        Say("    no parameter blocks of our own for another feature");
+        return nullptr;
+    }
+    m.populate(create);
+    m.populate(evaluate);
+    create->Set("DLSSNR.Enabled", 1u);
+    create->Set("DLSSNR.Width", width);
+    create->Set("DLSSNR.Height", height);
+    create->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
+    create->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+    if (atCreate != nullptr)
+        SetTunables(create, *atCreate);
+    void* handle = nullptr;
+    const int r = m.create(g.list, 18, create, &handle);
+    const double ms = Submit("create");
+    if (r != NVSDK_NGX_Result_Success || handle == nullptr || ms < 0.0)
+    {
+        Say("    CreateFeature(%ux%u) -> 0x%08X %s", width, height, unsigned(r), ResultName(r));
+        return nullptr;
+    }
+    *evalBlock = evaluate;
+    return handle;
+}
+
+bool EvaluateOnce(const Model& m, void* handle, NVSDK_NGX_Parameter* p, const Inputs& in, unsigned reset)
+{
+    SetInputs(p, in, reset);
+    const int r = m.evaluate(g.list, handle, p, nullptr);
+    const double ms = Submit("evaluate");
+    if (r != NVSDK_NGX_Result_Success || ms < 0.0)
+    {
+        Say("    EvaluateFeature -> 0x%08X %s%s", unsigned(r), ResultName(r), ms < 0.0 ? ", GPU failed" : "");
+        return false;
+    }
+    return true;
+}
+
+// A texture's RGB as floats; RGBA16F textures only.
+bool ReadRgb(ID3D12Resource* texture, D3D12_RESOURCE_STATES state, unsigned width, unsigned height,
+             std::vector<float>* rgb)
+{
+    std::vector<uint8_t> raw;
+    unsigned pitch = 0;
+    if (!Readback(texture, state, &raw, &pitch))
+        return false;
+    rgb->resize(size_t(width) * height * 3);
+    for (unsigned y = 0; y < height; ++y)
+    {
+        const auto* row = reinterpret_cast<const uint16_t*>(raw.data() + size_t(y) * pitch);
+        for (unsigned x = 0; x < width; ++x)
+            for (unsigned c = 0; c < 3; ++c)
+                (*rgb)[(size_t(y) * width + x) * 3 + c] = HalfToFloat(row[x * 4 + c]);
+    }
+    return true;
+}
+
+// `frames` evaluations of the same inputs from a reset, the tunables written before each (none when nullptr), the
+// last output read back.
+bool Run(const Model& m, void* handle, NVSDK_NGX_Parameter* p, const Inputs& in, const Tunables* t, unsigned frames,
+         std::vector<float>* out)
+{
+    for (unsigned i = 0; i < frames; ++i)
+    {
+        if (t != nullptr)
+            SetTunables(p, *t);
+        if (!EvaluateOnce(m, handle, p, in, i == 0 ? 1u : 0u))
+            return false;
+    }
+    return ReadRgb(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, in.width, in.height, out);
+}
+
+// Mean absolute difference over every channel of every pixel; NaN and infinity count as 1.
+double Difference(const std::vector<float>& a, const std::vector<float>& b)
+{
+    if (a.empty() || a.size() != b.size())
+        return 1.0e9;
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        const double d = std::fabs(double(a[i]) - double(b[i]));
+        sum += d == d && d < 65504.0 ? d : 1.0;
+    }
+    return sum / double(a.size());
+}
+
+double SrgbDecode(double e) { return e <= 0.04045 ? e / 12.92 : std::pow((e + 0.055) / 1.055, 2.4); }
+
+// How much bluer (+) or warmer (-) `after` is than `before`, as the mean change of log2(blue / red), over the pixels
+// of rows y0..y1 that are neither near black nor clipped, and over the warm ones among them (red > green > blue,
+// saturated: grass, skin, wood). Both display-encoded RGB, as the model sees and makes them.
+struct Shift
+{
+    double all = 0.0;
+    double warm = 0.0;
+    double warmShare = 0.0;
+};
+
+Shift ColourShift(const std::vector<float>& before, const std::vector<float>& after, unsigned width, unsigned y0,
+                  unsigned y1)
+{
+    double sumAll = 0.0, sumWarm = 0.0;
+    unsigned long long nAll = 0, nWarm = 0;
+    const double eps = 1.0e-3;
+    for (unsigned y = y0; y < y1; ++y)
+    {
+        for (unsigned x = 0; x < width; ++x)
+        {
+            const size_t i = (size_t(y) * width + x) * 3;
+            const double pr = SrgbDecode(before[i]), pg = SrgbDecode(before[i + 1]), pb = SrgbDecode(before[i + 2]);
+            const double orr = SrgbDecode(after[i]), og = SrgbDecode(after[i + 1]), ob = SrgbDecode(after[i + 2]);
+            const double yp = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
+            const double pmax = pr > pg ? (pr > pb ? pr : pb) : (pg > pb ? pg : pb);
+            const double pmin = pr < pg ? (pr < pb ? pr : pb) : (pg < pb ? pg : pb);
+            const double omax = orr > og ? (orr > ob ? orr : ob) : (og > ob ? og : ob);
+            if (!(yp > 0.01) || pmax >= 0.97 || !(omax < 0.97) || !(orr >= 0.0) || !(ob >= 0.0))
+                continue;
+            const double d = std::log2((ob + eps) / (orr + eps)) - std::log2((pb + eps) / (pr + eps));
+            sumAll += d;
+            ++nAll;
+            if (pr > pg && pg > pb && (pmax - pmin) / pmax > 0.15)
+            {
+                sumWarm += d;
+                ++nWarm;
+            }
+        }
+    }
+    Shift s;
+    s.all = nAll != 0 ? sumAll / double(nAll) : 0.0;
+    s.warm = nWarm != 0 ? sumWarm / double(nWarm) : 0.0;
+    s.warmShare = nAll != 0 ? double(nWarm) / double(nAll) : 0.0;
+    return s;
+}
+
+// A frame dump from dxgi.dll (nr_dx12.cpp, DumpHeader; tools in the M4 docs read the same): the whole frame reduced
+// four times, as the model saw it (the proxy) and as it came back (the model's output), display-encoded RGB.
+struct Dump
+{
+    unsigned width = 0, height = 0;
+    std::vector<float> proxy, model;
+};
+
+bool ReadDump(const std::wstring& path, Dump* d)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || f == nullptr)
+        return false;
+    std::vector<uint8_t> data;
+    uint8_t chunk[65536];
+    for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) != 0;)
+        data.insert(data.end(), chunk, chunk + n);
+    fclose(f);
+    auto word = [&](size_t at) {
+        uint32_t v = 0;
+        std::memcpy(&v, data.data() + at, 4);
+        return v;
+    };
+    if (data.size() < 184 || std::memcmp(data.data(), "BZDUMP1", 8) != 0)
+        return false;
+    const uint32_t headerBytes = word(8), blockBytes = word(12);
+    const uint32_t rw = word(36), rh = word(40), cw = word(44), ch = word(48), pictures = word(60);
+    const uint64_t pictureBytes = uint64_t(rw) * rh * 8;
+    if (pictures < 3 || rw == 0 || rh == 0 || uint64_t(headerBytes) + blockBytes > data.size() ||
+        64 + uint64_t(pictures) * (uint64_t(rw) * rh + uint64_t(cw) * ch) * 8 + 4 > blockBytes)
+        return false;
+    const uint8_t* block = data.data() + headerBytes;
+    d->width = rw;
+    d->height = rh;
+    for (int which = 1; which <= 2; ++which)
+    {
+        std::vector<float>& out = which == 1 ? d->proxy : d->model;
+        out.resize(size_t(rw) * rh * 3);
+        const uint8_t* picture = block + 64 + pictureBytes * unsigned(which);
+        for (size_t i = 0; i < size_t(rw) * rh; ++i)
+        {
+            for (unsigned c = 0; c < 3; ++c)
+            {
+                uint16_t half;
+                std::memcpy(&half, picture + i * 8 + c * 2, 2);
+                out[i * 3 + c] = HalfToFloat(half);
+            }
+        }
+    }
+    return true;
+}
+
+// RGB floats as RGBA16F rows, alpha 1.
+std::vector<uint16_t> ToHalfRgba(const std::vector<float>& rgb, size_t from, size_t pixels)
+{
+    std::vector<uint16_t> out(pixels * 4);
+    for (size_t i = 0; i < pixels; ++i)
+    {
+        for (unsigned c = 0; c < 3; ++c)
+            out[i * 4 + c] = FloatToHalf(rgb[(from + i) * 3 + c]);
+        out[i * 4 + 3] = FloatToHalf(1.0f);
+    }
+    return out;
+}
+
+// The moving card for T5: detail at several sizes and in colour, display-encoded values around the middle.
+float Card(int x, int y, unsigned c)
+{
+    const float checker = (((x >> 2) + (y >> 2)) & 1) != 0 ? 0.07f : -0.07f;
+    const float wave = 0.16f * std::sin(float(x) * 0.21f + float(c)) * std::cos(float(y) * 0.17f - float(c));
+    const float ramp = 0.12f * std::sin(float(x) * 0.013f + float(y) * 0.007f + float(c) * 2.1f);
+    return 0.45f + wave + ramp + checker;
+}
+
+uint32_t g_random = 0x9E3779B9u;
+float Noise() // -1 .. 1
+{
+    g_random ^= g_random << 13;
+    g_random ^= g_random >> 17;
+    g_random ^= g_random << 5;
+    return float(g_random) / 2147483648.0f - 1.0f;
+}
+
+int g_mustFail = 0; // --tuning checks that failed
+
+void Expect(bool ok, const char* format, ...)
+{
+    std::fputs(ok ? "  ok    " : "  FAIL  ", stdout);
+    va_list args;
+    va_start(args, format);
+    std::vprintf(format, args);
+    va_end(args);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+    if (!ok)
+        ++g_mustFail;
+}
+
+void Note(const char* format, ...)
+{
+    std::fputs("  info  ", stdout);
+    va_list args;
+    va_start(args, format);
+    std::vprintf(format, args);
+    va_end(args);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+// T5: the card scrolls kSpeed pixels a frame to the right with fresh noise every frame. The motion vectors are a
+// texture at 0.58 of the frame's size (as the games give theirs) holding the motion in UV units, -kSpeed / width,
+// and MVecScale is scanned as f times the frame's size: the games give f = 0.58 (their render size), and if the
+// model reads the motion as MVec x MVecScale / its frame's size, f = 1 is right. With the right scale the model's
+// history lines up with the card and the noise averages out; with another it smears. E is the mean |output - the
+// clean card| over the middle of the frame and the last four frames.
+void Tuning5(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& base)
+{
+    constexpr unsigned kFrames = 16;
+    constexpr int kSpeed = 6;
+    constexpr float kNoise = 0.06f;
+    constexpr unsigned kMargin = 128;
+    const unsigned w = base.width, h = base.height;
+    if (w <= 2 * kMargin || h <= 2 * kMargin)
+    {
+        Note("T5 skipped: the frame is too small");
+        return;
+    }
+    const unsigned mw = unsigned(std::lround(0.58 * w)), mh = unsigned(std::lround(0.58 * h));
+    const uint16_t zero = FloatToHalf(0.0f), one = FloatToHalf(1.0f);
+    std::vector<uint16_t> moving(size_t(mw) * mh * 2, zero), still(size_t(mw) * mh * 2, zero);
+    for (size_t i = 0; i < size_t(mw) * mh; ++i)
+        moving[i * 2] = FloatToHalf(-float(kSpeed) / float(w));
+    ID3D12Resource* motion = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, mw, mh, moving.data(), mw * 4);
+    ID3D12Resource* noMotion = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, mw, mh, still.data(), mw * 4);
+    ID3D12Resource* colour =
+        MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (motion == nullptr || noMotion == nullptr || colour == nullptr)
+    {
+        Note("T5 skipped: could not make its textures");
+        return;
+    }
+    D3D12_RESOURCE_STATES colourState = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    // The card once, wide enough for every shift: column x of frame t is column x - t kSpeed of the card.
+    const unsigned pad = kSpeed * kFrames;
+    const unsigned cw = w + pad;
+    std::vector<float> card(size_t(cw) * h * 3);
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < cw; ++x)
+            for (unsigned c = 0; c < 3; ++c)
+                card[(size_t(y) * cw + x) * 3 + c] = Card(int(x) - int(pad), int(y), c);
+    std::vector<uint16_t> frame(size_t(w) * h * 4);
+    std::vector<float> out;
+    const Tunables defaults;
+
+    // One run: E over the last four frames, or a negative number when something failed.
+    auto run = [&](int speed, bool withMotion, float f, bool resetEach) -> double {
+        g_random = 0x9E3779B9u; // the same noise in every run
+        Inputs in = base;
+        in.colour = colour;
+        in.motion = withMotion ? motion : noMotion;
+        in.motionWidth = mw;
+        in.motionHeight = mh;
+        in.mvScaleX = f * float(w);
+        in.mvScaleY = f * float(h);
+        double sum = 0.0;
+        unsigned counted = 0;
+        for (unsigned t = 0; t < kFrames; ++t)
+        {
+            const unsigned offset = pad - unsigned(speed) * t; // the card's column for x = 0
+            for (unsigned y = 0; y < h; ++y)
+            {
+                const float* row = &card[(size_t(y) * cw + offset) * 3];
+                uint16_t* to = &frame[size_t(y) * w * 4];
+                for (unsigned x = 0; x < w; ++x)
+                {
+                    for (unsigned c = 0; c < 3; ++c)
+                        to[x * 4 + c] = FloatToHalf(row[x * 3 + c] + kNoise * Noise());
+                    to[x * 4 + 3] = one;
+                }
+            }
+            if (!UploadNow(colour, frame.data(), w * 8, h, colourState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+                return -1.0;
+            colourState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            SetTunables(evalBlock, defaults);
+            if (!EvaluateOnce(m, handle, evalBlock, in, t == 0 || resetEach ? 1u : 0u))
+                return -1.0;
+            if (t + 4 < kFrames)
+                continue;
+            if (!ReadRgb(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, w, h, &out))
+                return -1.0;
+            double e = 0.0;
+            size_t n = 0;
+            for (unsigned y = kMargin; y + kMargin < h; ++y)
+            {
+                const float* clean = &card[(size_t(y) * cw + offset) * 3];
+                for (unsigned x = kMargin; x + kMargin < w; ++x)
+                {
+                    for (unsigned c = 0; c < 3; ++c)
+                    {
+                        const double d = std::fabs(double(out[(size_t(y) * w + x) * 3 + c]) - double(clean[x * 3 + c]));
+                        e += d == d ? d : 1.0;
+                        ++n;
+                    }
+                }
+            }
+            sum += e / double(n);
+            ++counted;
+        }
+        return counted != 0 ? sum / double(counted) : -1.0;
+    };
+
+    Say("T5 motion vectors: the card scrolls %d px a frame, noise +-%.2f, motion vectors %ux%u in UV units, %u "
+        "frames a run",
+        kSpeed, double(kNoise), mw, mh, kFrames);
+    const double eReset = run(kSpeed, true, 1.0f, true);
+    const double eStill = run(0, false, 0.0f, false);
+    Note("T5 no history (Reset every frame) E %.5f; the card standing still E %.5f", eReset, eStill);
+    const float factors[] = { -1.0f, 0.0f, 0.58f, 0.79f, 1.0f, 1.25f, 1.72f };
+    double e[7] = {};
+    int best = -1;
+    for (int i = 0; i < 7; ++i)
+    {
+        e[i] = run(kSpeed, true, factors[i], false);
+        Note("T5 MVecScale = %+.2f x frame size: E %.5f%s", double(factors[i]), e[i],
+             i == 2 ? "  (what the games give)" : i == 4 ? "  (the frame's own size)" : "");
+        if (e[i] >= 0.0 && (best < 0 || e[i] < e[best]))
+            best = i;
+    }
+    motion->Release();
+    noMotion->Release();
+    colour->Release();
+    if (eReset < 0.0 || eStill < 0.0 || best < 0)
+    {
+        Note("T5 verdict: runs failed (above)");
+        return;
+    }
+    const double help = eReset - eStill;
+    const double gap = help * 0.1 > 3.0e-4 ? help * 0.1 : 3.0e-4;
+    if (help <= 1.0e-3)
+        Note("T5 verdict: inconclusive, the model's history barely changes its output on this card (%.5f)", help);
+    else if (best == 4 && e[4] + gap < e[2])
+        Note("T5 verdict: the model wants the motion in units of its own frame: at the games' scale it follows only "
+             "0.58 of it (E %.5f against %.5f). Scale MVecScale by frame size / motion-vector size",
+             e[2], e[4]);
+    else if (e[2] <= e[4] + gap)
+        Note("T5 verdict: the games' scale is as good as any (E %.5f, the frame's own size %.5f): leave it", e[2], e[4]);
+    else
+        Note("T5 verdict: the best is f = %+.2f (E %.5f), neither the games' scale nor the frame's size: look closer",
+             double(factors[best]), e[best]);
+}
+
+// T6: Witcher 3 frames as dxgi.dll dumped them (DumpEvery): the proxy, what the model saw in the game, given to a
+// feature of the dump's reduced size, and per setting how much bluer (+) or warmer (-) the model makes the picture,
+// in log2 of blue over red, over the whole frame and over its warm pixels, next to what the model did in the game.
+// Then the bottom half alone: if the sky above it is what cools the ground, the ground alone comes back warmer.
+void Tuning6(const Model& m, const std::wstring& folderGiven)
+{
+    std::wstring folder = folderGiven;
+    if (folder.empty())
+    {
+        wchar_t local[MAX_PATH];
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH)
+        {
+            Note("T6 skipped: no %%LOCALAPPDATA%%");
+            return;
+        }
+        folder = std::wstring(local) + L"\\Banana-Zero\\dumps";
+    }
+    if (m.allocate == nullptr)
+    {
+        Note("T6 skipped: --capability has no parameter blocks of our own for more features");
+        return;
+    }
+    std::vector<std::wstring> files;
+    WIN32_FIND_DATAW found;
+    const HANDLE find = FindFirstFileW((folder + L"\\witcher3-*.bzdump").c_str(), &found);
+    if (find != INVALID_HANDLE_VALUE)
+    {
+        do
+            files.push_back(found.cFileName);
+        while (FindNextFileW(find, &found));
+        FindClose(find);
+    }
+    if (files.empty())
+    {
+        Note("T6 skipped: no Witcher 3 frame dumps in %s", Utf8(folder).c_str());
+        return;
+    }
+    std::sort(files.begin(), files.end());
+    if (files.size() > 8)
+        files.erase(files.begin(), files.end() - 8); // the newest eight: the names carry the time
+
+    struct Case
+    {
+        const char* name;
+        Tunables t;
+    };
+    std::vector<Case> cases;
+    Tunables t;
+    cases.push_back({ "model defaults", t });
+    t = Tunables();
+    t.style = 1;
+    cases.push_back({ "Style 1 (natural)", t });
+    t = Tunables();
+    t.style = 2;
+    cases.push_back({ "Style 2 (cinematic)", t });
+    t = Tunables();
+    t.localTone = 0.0f;
+    cases.push_back({ "LocalTone 0", t });
+    t = Tunables();
+    t.localTone = 0.5f;
+    cases.push_back({ "LocalTone 0.5", t });
+    t = Tunables();
+    t.localStructure = 0.0f;
+    cases.push_back({ "LocalStructure 0", t });
+    t = Tunables();
+    t.intensity = 0.5f;
+    cases.push_back({ "Intensity 0.5", t });
+    t = Tunables();
+    t.autoMask = 1;
+    cases.push_back({ "AutoMask 1", t });
+    constexpr unsigned kFrames = 8;
+
+    // A feature over `rows` rows of the proxy from row `top`, run with each of `count` cases; outputs kept.
+    auto replay = [&](const Dump& d, unsigned top, unsigned rows, size_t count, std::vector<std::vector<float>>* outs) {
+        const unsigned w = d.width;
+        const std::vector<uint16_t> rgba = ToHalfRgba(d.proxy, size_t(top) * w, size_t(w) * rows);
+        const std::vector<float> flat(size_t(w) * rows, 0.5f);
+        const std::vector<uint16_t> still(size_t(w) * rows * 2, FloatToHalf(0.0f));
+        Inputs in;
+        in.width = in.depthWidth = in.motionWidth = w;
+        in.height = in.depthHeight = in.motionHeight = rows;
+        in.mvScaleX = float(w);
+        in.mvScaleY = float(rows);
+        in.colour = MakeFilled(DXGI_FORMAT_R16G16B16A16_FLOAT, w, rows, rgba.data(), w * 8);
+        in.depth = MakeFilled(DXGI_FORMAT_R32_FLOAT, w, rows, flat.data(), w * 4);
+        in.motion = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, w, rows, still.data(), w * 4);
+        in.output = MakeOutput(w, rows);
+        NVSDK_NGX_Parameter* p = nullptr;
+        void* feature = in.colour != nullptr && in.depth != nullptr && in.motion != nullptr && in.output != nullptr
+                            ? CreateOwn(m, w, rows, nullptr, &p)
+                            : nullptr;
+        outs->assign(count, std::vector<float>());
+        bool ok = feature != nullptr;
+        for (size_t i = 0; ok && i < count; ++i)
+            ok = Run(m, feature, p, in, &cases[i].t, kFrames, &(*outs)[i]);
+        if (feature != nullptr)
+            m.release(feature);
+        for (ID3D12Resource* r : { in.colour, in.depth, in.motion, in.output })
+            if (r != nullptr)
+                r->Release();
+        return ok;
+    };
+
+    for (const std::wstring& file : files)
+    {
+        Dump d;
+        const std::string name = Utf8(file);
+        if (!ReadDump(folder + L"\\" + file, &d))
+        {
+            Note("T6 %s: not a frame dump this probe can read", name.c_str());
+            continue;
+        }
+        const unsigned w = d.width, h = d.height, top = h / 2;
+        const Shift game = ColourShift(d.proxy, d.model, w, 0, h);
+        Say("T6 %s, %ux%u: change of log2(blue / red), whole frame | warm pixels (%.0f%% of the frame)", name.c_str(),
+            w, h, 100.0 * game.warmShare);
+        Note("T6   %-34s %+.3f | %+.3f", "in the game (the dump's own output)", game.all, game.warm);
+        std::vector<std::vector<float>> outs;
+        if (!replay(d, 0, h, cases.size(), &outs))
+        {
+            Note("T6   the replay failed (above)");
+            continue;
+        }
+        for (size_t i = 0; i < cases.size(); ++i)
+        {
+            const Shift s = ColourShift(d.proxy, outs[i], w, 0, h);
+            Note("T6   %-34s %+.3f | %+.3f", cases[i].name, s.all, s.warm);
+        }
+        std::vector<std::vector<float>> alone;
+        if (!replay(d, top, h - top, 1, &alone))
+        {
+            Note("T6   the bottom half alone failed (above)");
+            continue;
+        }
+        const std::vector<float> bottom(d.proxy.begin() + std::ptrdiff_t(size_t(top) * w * 3), d.proxy.end());
+        const Shift inFrame = ColourShift(d.proxy, outs[0], w, top, h);
+        const Shift byItself = ColourShift(bottom, alone[0], w, 0, h - top);
+        Note("T6   bottom half, model defaults: in the whole frame %+.3f | %+.3f, alone %+.3f | %+.3f", inFrame.all,
+             inFrame.warm, byItself.all, byItself.warm);
+    }
+}
+
+// The --tuning checks, on the feature the basic run made (`handle`, with its evaluation block `evalBlock`, which has
+// never held a tunable), over the basic run's frame (`in`). Every run starts from Reset and evaluates its frame
+// kFrames times; outputs are compared as the mean absolute difference per channel. "Same" is within four times
+// the difference between two identical runs (at least 1e-5), "differs" at least ten times it (at least 2e-4).
+//   T0  no tunable keys at all = the model's defaults written out (what dxgi.dll writes for an unset key)
+//   T1  each tunable written at evaluation changes the picture
+//   T2  tunables written only into the creation block change nothing (what v0.1.0 and v0.1.1 did)
+//   T3  Style 3 = Style 2, Intensity 1.5 = 1, skin structure without the auto mask = nothing (informational)
+//   T4  depth: another depth, DepthInverted, no depth at all (informational: the model is said to ignore it)
+//   T5  motion vectors: the card scrolls, the scale is scanned; which scale the model wants (informational)
+//   T6  the model's colour on real Witcher 3 frames from dxgi.dll's dumps, per setting (informational)
+void Tuning(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& in,
+            const std::wstring& dumpFolder)
+{
+    constexpr unsigned kFrames = 6;
+    const unsigned w = in.width, h = in.height;
+    Say("tuning: every run starts from Reset and evaluates its frame %u times; numbers are mean |difference| per "
+        "channel",
+        kFrames);
+
+    std::vector<float> absent, base, base2;
+    if (!Run(m, handle, evalBlock, in, nullptr, kFrames, &absent))
+    {
+        Expect(false, "T0 the run without tunable keys");
+        return;
+    }
+    const Tunables defaults;
+    if (!Run(m, handle, evalBlock, in, &defaults, kFrames, &base) ||
+        !Run(m, handle, evalBlock, in, &defaults, kFrames, &base2))
+    {
+        Expect(false, "T0 the runs with the defaults written");
+        return;
+    }
+    const double noise = Difference(base, base2);
+    const double same = noise * 4.0 > 1.0e-5 ? noise * 4.0 : 1.0e-5;
+    const double differs = noise * 10.0 > 2.0e-4 ? noise * 10.0 : 2.0e-4;
+    Say("T0 two identical runs differ by %.6f: same <= %.6f, differs >= %.6f", noise, same, differs);
+    const double absentVsBase = Difference(absent, base);
+    Expect(absentVsBase <= same, "T0 no tunable keys = the model's defaults written out (%.6f)", absentVsBase);
+
+    struct Case
+    {
+        const char* name;
+        Tunables t;
+    };
+    Tunables t;
+    std::vector<Case> cases;
+    t = defaults;
+    t.style = 1;
+    cases.push_back({ "Style 1 (natural)", t });
+    t = defaults;
+    t.style = 2;
+    cases.push_back({ "Style 2 (cinematic)", t });
+    t = defaults;
+    t.localTone = 0.25f;
+    cases.push_back({ "LocalTone 0.25", t });
+    t = defaults;
+    t.localStructure = 0.25f;
+    cases.push_back({ "LocalStructure 0.25", t });
+    t = defaults;
+    t.intensity = 0.5f;
+    cases.push_back({ "Intensity 0.5", t });
+    t = defaults;
+    t.autoMask = 1;
+    cases.push_back({ "AutoMask 1", t });
+    std::vector<double> moved;
+    for (const Case& c : cases)
+    {
+        std::vector<float> out;
+        if (!Run(m, handle, evalBlock, in, &c.t, kFrames, &out))
+        {
+            Expect(false, "T1 %s: the run failed", c.name);
+            moved.push_back(0.0);
+            continue;
+        }
+        moved.push_back(Difference(out, base));
+    }
+    Expect(moved[4] >= differs, "T1 Intensity 0.5 written at evaluation changes the picture (%.6f)", moved[4]);
+    Expect(moved[0] >= differs || moved[1] >= differs || moved[2] >= differs || moved[3] >= differs,
+           "T1 Style or a local strength written at evaluation changes the picture (style 1 %.6f, style 2 %.6f, "
+           "local tone %.6f, local structure %.6f)",
+           moved[0], moved[1], moved[2], moved[3]);
+    for (size_t i = 0; i < cases.size(); ++i)
+        Note("T1 %-22s %.6f %s", cases[i].name, moved[i],
+             moved[i] >= differs ? "changes the picture" : moved[i] <= same ? "no change" : "a small change");
+
+    // T2: the values only in the creation block of a second feature, its evaluation block never given any.
+    Tunables atCreate = defaults;
+    atCreate.intensity = 0.5f;
+    atCreate.style = 2;
+    atCreate.localTone = 0.25f;
+    atCreate.localStructure = 0.25f;
+    atCreate.autoMask = 1;
+    std::vector<float> perFrame, createOnly;
+    NVSDK_NGX_Parameter* evalBlock2 = nullptr;
+    if (!Run(m, handle, evalBlock, in, &atCreate, kFrames, &perFrame))
+        Expect(false, "T2 the run with the values written at evaluation");
+    else if (m.allocate == nullptr)
+        Note("T2 skipped: --capability has no parameter blocks of our own for a second feature");
+    else if (void* second = CreateOwn(m, w, h, &atCreate, &evalBlock2); second == nullptr)
+        Expect(false, "T2 a second feature with the values in its creation block");
+    else
+    {
+        const bool ran = Run(m, second, evalBlock2, in, nullptr, kFrames, &createOnly);
+        const int released = m.release(second);
+        if (!ran)
+            Expect(false, "T2 the second feature's run");
+        else
+        {
+            const double vsAbsent = Difference(createOnly, absent);
+            const double vsPerFrame = Difference(createOnly, perFrame);
+            const double perFrameVsAbsent = Difference(perFrame, absent);
+            Expect(vsAbsent <= same,
+                   "T2 values only in the creation block change nothing: the same as no keys (%.6f; the same values "
+                   "at evaluation move it %.6f)",
+                   vsAbsent, perFrameVsAbsent);
+            Note("T2 creation-only vs the same values at evaluation: %.6f; ReleaseFeature -> 0x%08X", vsPerFrame,
+                 unsigned(released));
+        }
+    }
+
+    // T3: the clamps and the mask, as the model's code reads them.
+    struct Pair
+    {
+        const char* what;
+        Tunables a, b;
+    };
+    std::vector<Pair> pairs;
+    Tunables a = defaults, b = defaults;
+    a.style = 3;
+    b.style = 2;
+    pairs.push_back({ "Style 3 vs Style 2", a, b });
+    a = defaults;
+    a.intensity = 1.5f;
+    pairs.push_back({ "Intensity 1.5 vs 1", a, defaults });
+    a = defaults;
+    a.skin = 0.0f;
+    pairs.push_back({ "SkinStructure 0, auto mask off, vs defaults", a, defaults });
+    a.skin = 1.5f;
+    pairs.push_back({ "SkinStructure 1.5, auto mask off, vs defaults", a, defaults });
+    a = defaults;
+    b = defaults;
+    a.autoMask = b.autoMask = 1;
+    a.skin = 0.0f;
+    pairs.push_back({ "SkinStructure 0 vs -1, auto mask on (no skin in this frame)", a, b });
+    for (const Pair& pair : pairs)
+    {
+        std::vector<float> oa, ob;
+        if (!Run(m, handle, evalBlock, in, &pair.a, kFrames, &oa) || !Run(m, handle, evalBlock, in, &pair.b, kFrames, &ob))
+        {
+            Note("T3 %s: a run failed", pair.what);
+            continue;
+        }
+        const double d = Difference(oa, ob);
+        Note("T3 %-58s %.6f %s", pair.what, d, d <= same ? "the same" : d >= differs ? "differs" : "close");
+    }
+
+    // T4: depth.
+    {
+        std::vector<float> flat(size_t(w) * h, 0.75f);
+        ID3D12Resource* otherDepth = MakeFilled(DXGI_FORMAT_R32_FLOAT, w, h, flat.data(), w * 4);
+        std::vector<float> out;
+        Inputs changed = in;
+        if (otherDepth != nullptr)
+        {
+            changed.depth = otherDepth;
+            if (Run(m, handle, evalBlock, changed, &defaults, kFrames, &out))
+                Note("T4 a flat depth instead of the ramp: %.6f", Difference(out, base));
+        }
+        changed = in;
+        changed.depthInverted = 1;
+        if (Run(m, handle, evalBlock, changed, &defaults, kFrames, &out))
+            Note("T4 DepthInverted 1: %.6f", Difference(out, base));
+        changed = in;
+        changed.depth = nullptr;
+        if (Run(m, handle, evalBlock, changed, &defaults, kFrames, &out))
+            Note("T4 no depth at all: accepted, %.6f", Difference(out, base));
+        else
+            Note("T4 no depth at all: refused (above)");
+        if (otherDepth != nullptr)
+            otherDepth->Release();
+    }
+
+    Tuning5(m, handle, evalBlock, in);
+    Tuning6(m, dumpFolder);
 }
 } // namespace
 
@@ -537,7 +1418,8 @@ int wmain(int argc, wchar_t** argv)
     Options options;
     if (!ParseOptions(argc, argv, &options))
         return Fail("usage: nrprobe [--model <path>] [--size WxH] [--evaluates N] [--init N] [--capability]\n"
-                    "               [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first]");
+                    "               [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first] [--tuning]\n"
+                    "               [--dumps <folder>]");
     if (options.model.empty())
     {
         const wchar_t* const known[] = { L"D:\\Program Files\\Epic Games\\TheWitcher3\\bin\\x64_dx12\\nvngx_dlssnr.dll",
@@ -854,16 +1736,37 @@ int wmain(int argc, wchar_t** argv)
     else
         Say("output: could not be read back");
 
+    if (options.tuning && failures == 0)
+    {
+        Model model;
+        model.populate = bzPopulate;
+        model.create = bzCreate;
+        model.evaluate = bzEvaluate;
+        model.release = bzRelease;
+        model.allocate = own ? allocate : nullptr;
+        Inputs in;
+        in.width = in.depthWidth = in.motionWidth = w;
+        in.height = in.depthHeight = in.motionHeight = h;
+        in.colour = colourTexture;
+        in.depth = depthTexture;
+        in.motion = motionTexture;
+        in.output = outputTexture;
+        Tuning(model, handle, evalBlock, in, options.dumps);
+        Say("tuning: %d of the checks failed", g_mustFail);
+    }
+
     const int released = bzRelease(handle);
     Say("model ReleaseFeature -> 0x%08X %s", unsigned(released), ResultName(released));
     // The verdict is about the model path: creation and evaluation. The teardown after it is dxgi.dll's when a game
     // shuts NGX down (the model's own Shutdown1, then the core's), each step guarded and on its own line; our two
     // parameter blocks stay allocated, as dxgi.dll leaves them (DestroyParameters before the core's Shutdown1 faults
     // inside the core). Whether the process then exits cleanly shows in its exit code.
-    if (failures == 0)
+    if (failures == 0 && g_mustFail == 0)
         Say("PASS");
-    else
+    else if (failures != 0)
         Say("FAIL (%d evaluations failed)", failures);
+    else
+        Say("FAIL (%d tuning checks failed)", g_mustFail);
     if (options.modelShutdown)
     {
         const int down = Guarded(bzShutdown, static_cast<void*>(g.device));
@@ -885,6 +1788,7 @@ int wmain(int argc, wchar_t** argv)
             Say("core Shutdown1 -> 0x%08X %s%s", unsigned(down), ResultName(down),
                 own ? " (our two parameter blocks left allocated, as dxgi.dll does)" : "");
     }
-    Say("exiting: the exit code is %d unless a DLL faults on the way out", failures == 0 ? 0 : 1);
-    return failures == 0 ? 0 : 1;
+    const int exitCode = failures == 0 && g_mustFail == 0 ? 0 : 1;
+    Say("exiting: the exit code is %d unless a DLL faults on the way out", exitCode);
+    return exitCode;
 }

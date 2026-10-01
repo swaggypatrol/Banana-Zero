@@ -37,6 +37,11 @@ MenuModel& MenuModelLocked();
 void MenuCommitLocked(const char* why);
 void MenuCloseLocked();
 
+// A slider dragged with the mouse: each step is published at once, so the picture follows the drag, without a line
+// in the log; when the mouse lets go, one line says what the whole drag changed.
+void MenuDragStepLocked();
+void MenuDragEndedLocked();
+
 // True while the panel waits for a key to bind: the hotkeys do nothing then.
 bool MenuPanelListening();
 

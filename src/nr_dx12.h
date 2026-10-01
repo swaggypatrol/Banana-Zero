@@ -42,7 +42,6 @@ void NrBeforeCoreShutdown();
 void NrCoreGone();
 
 // What the menu shows about the pass (M3): copied out of the render thread's state after each evaluation.
-struct ModelSettings;
 struct NrStatusState
 {
     bool attempted;        // an SR/RR evaluation with textures has reached the pass
@@ -51,14 +50,10 @@ struct NrStatusState
     bool ready;            // the bridge and the model are initialised
     bool haveFeature;      // the model's feature exists
     unsigned creates;      // CreateFeature calls so far (at most 64)
-    unsigned rebuilds;     // features created for new model parameters
     uint64_t frames;       // frames the model delivered
     uint64_t failed;
     uint64_t evaluatesSeen;
-    uint64_t sinceCreate;  // evaluations since the last creation (a rebuild waits until 30)
-    bool refused;          // the model refused `refusedModel`; the feature keeps `createdModel`
-    unsigned char createdModel[64]; // a ModelSettings, as bytes (settings.h is not included here)
-    unsigned char refusedModel[64];
+    uint64_t sinceCreate;  // evaluations since the last creation (a new frame size waits until 30)
     unsigned width, height; // the frame
     unsigned feature;       // 1 SR or 13 RR
     int format;             // the Output's DXGI_FORMAT

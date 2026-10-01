@@ -2,13 +2,13 @@
 
 // Settings: one immutable snapshot, published through an atomic pointer, read once per
 // evaluation without a lock. dlssnr.ini beside the DLL is read at the first Neural Rendering evaluation, and read
-// again whenever it changes (M4). The menu (M3) publishes a new snapshot when a slider is released
+// again whenever it changes (M4). The menu (M3) publishes a new snapshot at every step of a dragged slider
 // and writes the changed keys back to the file (settings_write.h). Keys the file does not name keep their defaults;
-// the model's own parameters are then not written at all, so the model uses its own defaults.
+// for the model's own parameters, that is the model's own default.
 
 #include <cstddef>
 
-// A model parameter as the user may have set it. `set` false: not in the file, not written to the model.
+// A model parameter as the user may have set it. `set` false: not in the file, so the model's own default.
 template <typename T> struct Tunable
 {
     bool set = false;
@@ -62,16 +62,17 @@ enum class MenuColour : unsigned
     Hdr = 2,  // FP16: scRGB at MenuNits; 10-bit: PQ at MenuNits
 };
 
-// The model's creation parameters. Written to the parameter block only when set; a change needs a rebuild.
+// The model's own parameters. The model reads Preset when it creates its feature and the rest at every evaluation
+// (nr_dx12.cpp, FillTunables), so a change shows from the next frame.
 struct ModelSettings
 {
     Tunable<unsigned> preset;      // Preset: DLSSNR.Hint.Render.Preset
-    Tunable<float> intensity;      // Intensity: DLSSNR.Intensity
-    Tunable<unsigned> style;       // Style: DLSSNR.Style, 0 standard, 1 natural, 2 cinematic
+    Tunable<float> intensity;      // Intensity: DLSSNR.Intensity, 0 .. 1 (the model treats more as 1)
+    Tunable<unsigned> style;       // Style: DLSSNR.Style, 0 standard, 1 natural, 2 cinematic (the model reads 3+ as 2)
     Tunable<float> localStructure; // LocalStructure: DLSSNR.LocalStructureStrength
     Tunable<float> localTone;      // LocalTone: DLSSNR.LocalToneStrength
     Tunable<float> skinStructure;  // SkinStructure: DLSSNR.SkinStructureStrength, -1 = follow local structure
-    Tunable<unsigned> autoMask;    // AutoMask: DLSSNR.UseAutoMask, 0 or 1
+    Tunable<unsigned> autoMask;    // AutoMask: DLSSNR.UseAutoMask, 0 or 1; skin structure acts only with it on
 
     bool operator==(const ModelSettings&) const = default;
 };
