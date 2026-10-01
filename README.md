@@ -289,7 +289,7 @@ Run these from the repository root after a build. The exit code is the number of
 | `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back |
 | `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU |
 | `build\Release\nrprobe.exe [--model <path>]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll` |
-| `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along a moving edge, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
+| `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along moving edges and thin bars, whether a control mask sets it per pixel, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
 
 ### Regenerating the export stubs
 

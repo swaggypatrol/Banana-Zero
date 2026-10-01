@@ -20,12 +20,12 @@
 // has this exe initialise NvAPI before anything else and never unload it, as a game does. The verdict line (PASS or
 // FAIL) is printed before any shutdown; whether the process then exits cleanly is what its exit code shows.
 //
-// --tuning then measures, on the same feature, what the model does with its parameters and its motion vectors
-// (Tuning, below: T0 to T7): that its six parameters act when written at every evaluation and not when written only
-// at creation, the model's defaults, its clamps, which motion-vector scale it wants, on Witcher 3 frames from
-// dxgi.dll's own dumps (--dumps, else %LOCALAPPDATA%\Banana-Zero\dumps) how each setting moves its colour, and
-// whether motion vectors dilated by depth help it along a moving edge. The exit code is then also 1 when one of its
-// checks fails.
+// --tuning then measures, on the same feature, what the model does with its parameters, its motion vectors and its
+// control mask (Tuning, below: T0 to T8): that its six parameters act when written at every evaluation and not when
+// written only at creation, the model's defaults, its clamps, which motion-vector scale it wants, on Witcher 3 frames
+// from dxgi.dll's own dumps (--dumps, else %LOCALAPPDATA%\Banana-Zero\dumps) how each setting moves its colour,
+// whether motion vectors dilated by depth help it along moving edges and thin bars, and whether a control mask sets
+// it per pixel. The exit code is then also 1 when one of its checks fails.
 //
 // dxgi.dll from the same folder is loaded too (this exe imports dxgi), so its dlssnr.log appears beside it; it sees
 // no SR/RR evaluation here and does nothing.
@@ -1190,7 +1190,7 @@ void Tuning6(const Model& m, const std::wstring& folderGiven)
     }
 }
 
-// The square T7 moves over the card: its own pattern, finer and brighter, so a smear of either into the other shows.
+// What T7 moves over the card: its own pattern, finer and brighter, so a smear of either into the other shows.
 float Square(int x, int y, unsigned c)
 {
     const float stripes = (((x / 3) + (y / 3)) & 1) != 0 ? 0.08f : -0.08f;
@@ -1199,15 +1199,56 @@ float Square(int x, int y, unsigned c)
     return 0.55f + wave + stripes;
 }
 
-// T7: motion vectors dilated by depth. A square nearer than the card moves kSpeed pixels a frame to the right over
-// it, with fresh noise every frame. Depth and motion vectors come at 0.58 of the frame's size, as the games give
-// them, and a texel takes the square's motion and depth where its centre falls inside the square, so along the
-// square's edges some of its pixels get the card's motion (and the other way round) and the model pulls their
-// history from the wrong place. The DLL has a dilation of its own (each pixel takes the motion of the nearest of five
-// depth taps in a cross) but never hands it the depth (the teardown, and T4), so the probe dilates the same way on
-// the CPU and hands over the result. Runs: the vectors as the games give them; dilated; at the frame's own size, each
-// pixel with its own motion (the best there is); and Reset every frame (no history). E as in T5, over the last four
-// frames: within kBand pixels of the square's edges (on either side), inside the square, on the card away from it.
+// The two things T7 moves: a solid square, and a fence of thin bars across the same square (grass and hair are
+// where motion vectors at 0.58 of the frame's size miss most). E is measured in three regions: the first is where
+// the games' vectors are wrong, so where a dilation can win; the second is where a dilation spreads the mover's
+// motion onto the card, so where it can lose (for the square that happens inside the first region already).
+struct Mover
+{
+    unsigned bar, period; // 0, 0: solid; else bars `bar` pixels wide every `period` pixels
+    const char* first;    // the first two regions, for the verdict
+    const char* second;
+};
+
+struct Regions
+{
+    double e[3] = {};
+};
+
+void Verdict7(const Mover& mover, const Regions& games, const Regions& dilated, const Regions& perPixel)
+{
+    constexpr double kNoticeable = 3.0e-4;
+    const double possible = games.e[0] - perPixel.e[0];
+    const double gain = games.e[0] - dilated.e[0];
+    const double cost = dilated.e[1] - games.e[1];
+    if (gain <= -kNoticeable)
+        Note("T7 verdict: the dilation makes it worse %s: E %.5f -> %.5f (per-pixel vectors %.5f)", mover.first,
+             games.e[0], dilated.e[0], perPixel.e[0]);
+    else if (possible <= kNoticeable && gain <= kNoticeable)
+        Note("T7 verdict: per-pixel vectors barely beat the games' %s (%.5f): nothing for a dilation to win",
+             mover.first, possible);
+    else if (gain >= kNoticeable && gain >= 0.25 * possible && cost >= kNoticeable)
+        Note("T7 verdict: the dilation helps %s (E %.5f -> %.5f) but costs %s (E %.5f -> %.5f)", mover.first,
+             games.e[0], dilated.e[0], mover.second, games.e[1], dilated.e[1]);
+    else if (gain >= kNoticeable && gain >= 0.25 * possible)
+        Note("T7 verdict: the dilation helps %s: E %.5f -> %.5f (%.0f%% of what per-pixel vectors gain)", mover.first,
+             games.e[0], dilated.e[0], possible > 0.0 ? 100.0 * gain / possible : 100.0);
+    else
+        Note("T7 verdict: the dilation makes no clear difference %s (E %.5f -> %.5f; per-pixel vectors %.5f)",
+             mover.first, games.e[0], dilated.e[0], perPixel.e[0]);
+}
+
+// T7: motion vectors dilated by depth. Something nearer than the card moves kSpeed pixels a frame to the right over
+// it, with fresh noise every frame: a solid square, then a fence of thin bars across the same square. Depth and
+// motion vectors come at 0.58 of the frame's size, as the games give them, and a texel takes the mover's motion and
+// depth where its centre falls on the mover, so along its edges some of its pixels get the card's motion (and the
+// other way round) and the model pulls their history from the wrong place; a bar not two texels wide is all edge.
+// The DLL has a dilation of its own (each pixel takes the motion of the nearest of five depth taps in a cross) but
+// never hands it the depth (the teardown, and T4), so the probe dilates the same way on the CPU and hands over the
+// result. Runs per mover: the vectors as the games give them; dilated; at the frame's own size, each pixel with its
+// own motion (the best there is); and Reset every frame (no history). E as in T5, over the last four frames: for the
+// square within kBand pixels of its edges (on either side), inside it, on the card away from it; for the bars on
+// them, between them (and up to kBand pixels outside the fence), on the card away from them.
 void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& base)
 {
     constexpr unsigned kFrames = 16;
@@ -1226,8 +1267,10 @@ void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
     }
     const unsigned rw = unsigned(std::lround(0.58 * w)), rh = unsigned(std::lround(0.58 * h));
     const uint16_t zero = FloatToHalf(0.0f), one = FloatToHalf(1.0f), moving = FloatToHalf(-float(kSpeed) / float(w));
+    const Mover movers[] = { { 0, 0, "along the edges", "inside the square" },
+                             { 2, 12, "on the bars", "between the bars" } };
 
-    // The card and the square's pattern once; the frames are cut from them.
+    // The card and the mover's pattern once; the frames are cut from them.
     std::vector<float> card(size_t(w) * h * 3), square(size_t(kSide) * kSide * 3);
     for (unsigned y = 0; y < h; ++y)
         for (unsigned x = 0; x < w; ++x)
@@ -1237,29 +1280,32 @@ void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
         for (unsigned x = 0; x < kSide; ++x)
             for (unsigned c = 0; c < 3; ++c)
                 square[(size_t(y) * kSide + x) * 3 + c] = Square(int(x), int(y), c);
-    auto clean = [&](unsigned x, unsigned y, unsigned left, unsigned c) {
-        return x >= left && x < left + kSide && y >= top && y < top + kSide
-                   ? square[(size_t(y - top) * kSide + (x - left)) * 3 + c]
-                   : card[(size_t(y) * w + x) * 3 + c];
+    // Whether the point (x, y), in frame pixels, is on the mover when its left edge is at `left`. A pixel is on it
+    // when its centre is, as a texel of the guides is.
+    auto on = [&](const Mover& mover, double x, double y, double left) {
+        if (x < left || x >= left + kSide || y < double(top) || y >= double(top + kSide))
+            return false;
+        return mover.period == 0 || std::fmod(x - left, double(mover.period)) < double(mover.bar);
+    };
+    auto clean = [&](const Mover& mover, unsigned x, unsigned y, unsigned left, unsigned c) {
+        return on(mover, x + 0.5, y + 0.5, left) ? square[(size_t(y - top) * kSide + (x - left)) * 3 + c]
+                                                 : card[(size_t(y) * w + x) * 3 + c];
     };
 
-    // The guides of frame t at width gw x gh: texel (i, j) is the square's when its centre, in frame pixels, is
-    // inside the square. `dilate` then gives each texel the motion of the nearest of itself and its four neighbours.
+    // The guides of frame t at width gw x gh: texel (i, j) is the mover's when its centre, in frame pixels, is on
+    // the mover. `dilate` then gives each texel the motion of the nearest of itself and its four neighbours.
     std::vector<float> depthTexels;
     std::vector<uint16_t> motionTexels, dilated;
-    auto guides = [&](unsigned t, unsigned gw, unsigned gh, bool dilate) {
+    auto guides = [&](const Mover& mover, unsigned t, unsigned gw, unsigned gh, bool dilate) {
         const double left = double(left0 + kSpeed * t);
         depthTexels.assign(size_t(gw) * gh, kFar);
         motionTexels.assign(size_t(gw) * gh * 2, zero);
         for (unsigned j = 0; j < gh; ++j)
         {
             const double cy = (j + 0.5) * double(h) / double(gh);
-            if (cy < double(top) || cy >= double(top + kSide))
-                continue;
             for (unsigned i = 0; i < gw; ++i)
             {
-                const double cx = (i + 0.5) * double(w) / double(gw);
-                if (cx >= left && cx < left + kSide)
+                if (on(mover, (i + 0.5) * double(w) / double(gw), cy, left))
                 {
                     depthTexels[size_t(j) * gw + i] = kNear;
                     motionTexels[(size_t(j) * gw + i) * 2] = moving;
@@ -1289,10 +1335,10 @@ void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
 
     ID3D12Resource* colour =
         MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    guides(0, rw, rh, false);
+    guides(movers[0], 0, rw, rh, false);
     ID3D12Resource* depthLow = MakeFilled(DXGI_FORMAT_R32_FLOAT, rw, rh, depthTexels.data(), rw * 4);
     ID3D12Resource* motionLow = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, rw, rh, motionTexels.data(), rw * 4);
-    guides(0, w, h, false);
+    guides(movers[0], 0, w, h, false);
     ID3D12Resource* depthFull = MakeFilled(DXGI_FORMAT_R32_FLOAT, w, h, depthTexels.data(), w * 4);
     ID3D12Resource* motionFull = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, w, h, motionTexels.data(), w * 4);
     if (colour == nullptr || depthLow == nullptr || motionLow == nullptr || depthFull == nullptr ||
@@ -1311,17 +1357,13 @@ void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
     const Tunables defaults;
 
     // One run: E per region over the last four frames; false when something failed.
-    struct Regions
-    {
-        double edges = 0.0, inside = 0.0, away = 0.0;
-    };
     enum Guides
     {
         kGames,
         kDilated,
         kFull
     };
-    auto run = [&](Guides which, bool resetEach, Regions* e) -> bool {
+    auto run = [&](const Mover& mover, Guides which, bool resetEach, Regions* e) -> bool {
         g_random = 0x9E3779B9u; // the same noise in every run
         const bool full = which == kFull;
         const unsigned gw = full ? w : rw, gh = full ? h : rh;
@@ -1345,11 +1387,11 @@ void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
                 for (unsigned x = 0; x < w; ++x)
                 {
                     for (unsigned c = 0; c < 3; ++c)
-                        to[x * 4 + c] = FloatToHalf(clean(x, y, left, c) + kNoise * Noise());
+                        to[x * 4 + c] = FloatToHalf(clean(mover, x, y, left, c) + kNoise * Noise());
                     to[x * 4 + 3] = one;
                 }
             }
-            guides(t, gw, gh, which == kDilated);
+            guides(mover, t, gw, gh, which == kDilated);
             if (!UploadNow(colour, frame.data(), w * 8, h, colourState, kRead) ||
                 !UploadNow(in.depth, depthTexels.data(), gw * 4, gh, kRead, kRead) ||
                 !UploadNow(in.motion, motionTexels.data(), gw * 4, gh, kRead, kRead))
@@ -1362,90 +1404,269 @@ void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
                 continue;
             if (!ReadRgb(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, w, h, &out))
                 return false;
-            double edges = 0.0, inside = 0.0, away = 0.0;
-            size_t nEdges = 0, nInside = 0, nAway = 0;
+            double region[3] = {};
+            size_t count[3] = {};
             for (unsigned y = kMargin; y + kMargin < h; ++y)
             {
                 const bool rowNear = y + kBand >= top && y < top + kSide + kBand;
                 const bool rowDeep = y >= top + kBand && y + kBand < top + kSide;
                 for (unsigned x = kMargin; x + kMargin < w; ++x)
                 {
-                    const bool nearSquare = rowNear && x + kBand >= left && x < left + kSide + kBand;
-                    const bool deepInside = rowDeep && x >= left + kBand && x + kBand < left + kSide;
+                    const bool nearMover = rowNear && x + kBand >= left && x < left + kSide + kBand;
+                    unsigned r = 2;
+                    if (mover.period == 0)
+                    {
+                        const bool deepInside = rowDeep && x >= left + kBand && x + kBand < left + kSide;
+                        r = deepInside ? 1 : nearMover ? 0 : 2;
+                    }
+                    else
+                        r = on(mover, x + 0.5, y + 0.5, left) ? 0 : nearMover ? 1 : 2;
                     double d = 0.0;
                     for (unsigned c = 0; c < 3; ++c)
                     {
                         const double diff =
-                            std::fabs(double(out[(size_t(y) * w + x) * 3 + c]) - double(clean(x, y, left, c)));
+                            std::fabs(double(out[(size_t(y) * w + x) * 3 + c]) - double(clean(mover, x, y, left, c)));
                         d += diff == diff ? diff : 1.0;
                     }
-                    if (deepInside)
-                    {
-                        inside += d;
-                        nInside += 3;
-                    }
-                    else if (nearSquare)
-                    {
-                        edges += d;
-                        nEdges += 3;
-                    }
-                    else
-                    {
-                        away += d;
-                        nAway += 3;
-                    }
+                    region[r] += d;
+                    count[r] += 3;
                 }
             }
-            sum.edges += edges / double(nEdges);
-            sum.inside += inside / double(nInside);
-            sum.away += away / double(nAway);
+            for (unsigned r = 0; r < 3; ++r)
+                sum.e[r] += count[r] != 0 ? region[r] / double(count[r]) : 0.0;
             ++counted;
         }
-        e->edges = sum.edges / counted;
-        e->inside = sum.inside / counted;
-        e->away = sum.away / counted;
+        for (unsigned r = 0; r < 3; ++r)
+            e->e[r] = sum.e[r] / counted;
         return true;
     };
 
-    Say("T7 depth-dilated motion vectors: a %ux%u square moves %u px a frame over the card, noise +-%.2f, guides "
-        "%ux%u, %u frames a run; E within %u px of its edges | inside it | on the card away from it",
-        kSide, kSide, kSpeed, double(kNoise), rw, rh, kFrames, kBand);
-    Regions reset, games, dilatedE, perPixel;
-    const bool ok = run(kGames, true, &reset) && run(kGames, false, &games) && run(kDilated, false, &dilatedE) &&
-                    run(kFull, false, &perPixel);
+    Say("T7 depth-dilated motion vectors: guides %ux%u, %u frames a run, noise +-%.2f, the mover %u px a frame to the "
+        "right; E over the last four frames",
+        rw, rh, kFrames, double(kNoise), kSpeed);
+    for (const Mover& mover : movers)
+    {
+        if (mover.period == 0)
+            Say("T7 a %ux%u square; E within %u px of its edges | inside it | on the card away from it", kSide, kSide,
+                kBand);
+        else
+            Say("T7 bars %u px wide every %u px across the same square; E on the bars | between them (and up to %u px "
+                "outside) | on the card away from them",
+                mover.bar, mover.period, kBand);
+        Regions reset, games, dilatedE, perPixel;
+        if (!run(mover, kGames, true, &reset) || !run(mover, kGames, false, &games) ||
+            !run(mover, kDilated, false, &dilatedE) || !run(mover, kFull, false, &perPixel))
+        {
+            Note("T7 verdict: runs failed (above)");
+            break;
+        }
+        const struct
+        {
+            const char* name;
+            const Regions& e;
+        } rows[] = { { "no history (Reset every frame)", reset },
+                     { "the games' vectors (0.58 size)", games },
+                     { "the same, dilated by depth", dilatedE },
+                     { "per-pixel vectors (frame size)", perPixel } };
+        for (const auto& row : rows)
+            Note("T7 %-32s E %.5f | %.5f | %.5f", row.name, row.e.e[0], row.e.e[1], row.e.e[2]);
+        Verdict7(mover, games, dilatedE, perPixel);
+    }
     for (ID3D12Resource* r : { colour, depthLow, motionLow, depthFull, motionFull })
         r->Release();
-    if (!ok)
+}
+
+// The control mask (DLSSNR.ControlMask) for the next evaluations: `mask` over its whole `width` x `height`, or none.
+void SetMask(NVSDK_NGX_Parameter* p, ID3D12Resource* mask, unsigned width, unsigned height)
+{
+    p->Set("DLSSNR.ControlMask", mask);
+    p->Set("DLSSNR.ControlMaskSubrectBaseX", 0u);
+    p->Set("DLSSNR.ControlMaskSubrectBaseY", 0u);
+    p->Set("DLSSNR.ControlMaskSubrectWidth", width);
+    p->Set("DLSSNR.ControlMaskSubrectHeight", height);
+}
+
+// One texel of a control mask: .x blend (times Intensity, the final blend between the frame and the model's
+// picture), .y tone (times LocalTone), .z structure (times LocalStructure); .w is unused.
+struct MaskValue
+{
+    float blend, tone, structure;
+};
+
+// T8: the control mask, the one input that sets the model per pixel. By the teardown (its section 10), each pixel's
+// tone and structure strengths are the sliders' times the mask's .y and .z, the final blend is Intensity times .x,
+// the model's own skin mask is off while a mask is given, and the mask is stretched over the frame whatever its size.
+// On the basic run's frame with the defaults: a constant mask against the slider it should equal (and how far that
+// slider moves the picture); whether values above 1 go further than the sliders' 1, and whether the sliders do;
+// how far a change of the mask reaches: the right half at tone 0 and structure 0, each half against the whole frame
+// at its own setting, by distance from the split; a mask at half the frame's size against the full-size one; and
+// that the picture is the same as before once the mask is taken away. Informational.
+void Tuning8(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& in,
+             const std::vector<float>& base, double same, double differs)
+{
+    constexpr unsigned kFrames = 6; // as the other tuning runs
+    constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const unsigned w = in.width, h = in.height, hw = w / 2, hh = h / 2;
+    ID3D12Resource* full =
+        MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* half =
+        MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, hw, hh, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (full == nullptr || half == nullptr || hw < 64)
     {
-        Note("T7 verdict: runs failed (above)");
+        Note("T8 skipped: could not make the mask textures");
+        for (ID3D12Resource* r : { full, half })
+            if (r != nullptr)
+                r->Release();
         return;
     }
-    const struct
+    D3D12_RESOURCE_STATES fullState = D3D12_RESOURCE_STATE_COPY_DEST, halfState = D3D12_RESOURCE_STATE_COPY_DEST;
+    std::vector<uint16_t> texels(size_t(w) * h * 4);
+    const Tunables defaults;
+
+    // One run with the full-size or the half-size mask, `leftOf` left of its texel column `column` and `rest` from
+    // there on.
+    auto run = [&](bool useHalf, unsigned column, MaskValue leftOf, MaskValue rest, const Tunables& t,
+                   std::vector<float>* out) {
+        ID3D12Resource* mask = useHalf ? half : full;
+        D3D12_RESOURCE_STATES& state = useHalf ? halfState : fullState;
+        const unsigned mw = useHalf ? hw : w, mh = useHalf ? hh : h;
+        const uint16_t a[4] = { FloatToHalf(leftOf.blend), FloatToHalf(leftOf.tone), FloatToHalf(leftOf.structure),
+                                FloatToHalf(1.0f) };
+        const uint16_t b[4] = { FloatToHalf(rest.blend), FloatToHalf(rest.tone), FloatToHalf(rest.structure),
+                                FloatToHalf(1.0f) };
+        for (unsigned y = 0; y < mh; ++y)
+            for (unsigned x = 0; x < mw; ++x)
+                std::memcpy(&texels[(size_t(y) * mw + x) * 4], x < column ? a : b, sizeof a);
+        if (!UploadNow(mask, texels.data(), mw * 8, mh, state, kRead))
+            return false;
+        state = kRead;
+        SetMask(evalBlock, mask, mw, mh);
+        const bool ran = Run(m, handle, evalBlock, in, &t, kFrames, out);
+        SetMask(evalBlock, nullptr, 0, 0);
+        return ran;
+    };
+    auto constant = [&](MaskValue v, const Tunables& t, std::vector<float>* out) {
+        return run(false, 0, v, v, t, out);
+    };
+    auto label = [&](double d) { return d <= same ? "the same" : d >= differs ? "differs" : "close"; };
+
+    Say("T8 control mask: a constant mask against the slider it should equal (mask vs slider | the slider vs the "
+        "defaults)");
+    const MaskValue neutral = { 1.0f, 1.0f, 1.0f };
+    std::vector<float> neutralOut, masked, slider;
+    if (!constant(neutral, defaults, &neutralOut))
     {
-        const char* name;
-        const Regions& e;
-    } rows[] = { { "no history (Reset every frame)", reset },
-                 { "the games' vectors (0.58 size)", games },
-                 { "the same, dilated by depth", dilatedE },
-                 { "per-pixel vectors (frame size)", perPixel } };
-    for (const auto& row : rows)
-        Note("T7 %-32s E %.5f | %.5f | %.5f", row.name, row.e.edges, row.e.inside, row.e.away);
-    const double possible = games.edges - perPixel.edges;
-    const double gain = games.edges - dilatedE.edges;
-    const double noticeable = 3.0e-4;
-    if (possible <= noticeable && gain <= noticeable)
-        Note("T7 verdict: along the edges per-pixel vectors barely beat the games' (%.5f): nothing for a dilation to "
-             "win here",
-             possible);
-    else if (gain >= noticeable && gain >= 0.25 * possible)
-        Note("T7 verdict: the dilation helps along the edges: E %.5f -> %.5f (%.0f%% of what per-pixel vectors gain)",
-             games.edges, dilatedE.edges, possible > 0.0 ? 100.0 * gain / possible : 100.0);
-    else if (gain <= -noticeable)
-        Note("T7 verdict: the dilation makes the edges worse: E %.5f -> %.5f", games.edges, dilatedE.edges);
+        Note("T8 skipped: the run with a neutral mask failed (above)");
+        for (ID3D12Resource* r : { full, half })
+            r->Release();
+        return;
+    }
+    const double neutralVsNone = Difference(neutralOut, base);
+    Note("T8 %-40s %.6f %s", "(1, 1, 1) vs no mask", neutralVsNone, label(neutralVsNone));
+    struct Case
+    {
+        const char* what;
+        MaskValue mask;
+        Tunables t;
+    };
+    std::vector<Case> cases;
+    Tunables t = defaults;
+    t.localTone = 0.0f;
+    cases.push_back({ "(1, 0, 1) vs LocalTone 0", { 1.0f, 0.0f, 1.0f }, t });
+    t = defaults;
+    t.localStructure = 0.5f;
+    cases.push_back({ "(1, 1, 0.5) vs LocalStructure 0.5", { 1.0f, 1.0f, 0.5f }, t });
+    t = defaults;
+    t.intensity = 0.5f;
+    cases.push_back({ "(0.5, 1, 1) vs Intensity 0.5", { 0.5f, 1.0f, 1.0f }, t });
+    for (const Case& c : cases)
+    {
+        if (!constant(c.mask, defaults, &masked) || !Run(m, handle, evalBlock, in, &c.t, kFrames, &slider))
+        {
+            Note("T8 %s: a run failed (above)", c.what);
+            continue;
+        }
+        const double d = Difference(masked, slider);
+        Note("T8 %-40s %.6f %s | %.6f", c.what, d, label(d), Difference(slider, base));
+    }
+    std::vector<float> beyond;
+    t = defaults;
+    t.localTone = 2.0f;
+    t.localStructure = 2.0f;
+    if (constant({ 1.0f, 2.0f, 2.0f }, defaults, &beyond) && Run(m, handle, evalBlock, in, &t, kFrames, &slider))
+        Note("T8 above 1: the mask's (1, 2, 2) vs (1, 1, 1) %.6f %s; LocalTone and LocalStructure 2 vs 1 %.6f %s; the "
+             "two %.6f %s",
+             Difference(beyond, neutralOut), label(Difference(beyond, neutralOut)), Difference(slider, base),
+             label(Difference(slider, base)), Difference(beyond, slider), label(Difference(beyond, slider)));
+
+    // The split: how far into the left half the right half's setting reaches, and the other way round. Each half is
+    // compared with a mask of its own value over the whole frame.
+    constexpr unsigned kBands = 4;
+    const unsigned bandEdge[kBands + 1] = { 0, 8, 32, 128, 1u << 30 };
+    const MaskValue flatValue = { 1.0f, 0.0f, 0.0f };
+    std::vector<float> split, flat, splitHalf;
+    if (!run(false, w / 2, neutral, flatValue, defaults, &split) || !constant(flatValue, defaults, &flat))
+        Note("T8 the split: a run failed (above)");
     else
-        Note("T7 verdict: the dilation makes no clear difference along the edges (E %.5f -> %.5f; per-pixel vectors "
-             "%.5f)",
-             games.edges, dilatedE.edges, perPixel.edges);
+    {
+        const double signal = Difference(neutralOut, flat);
+        Say("T8 split: the right half at tone 0 and structure 0 (which moves the whole frame %.6f); each half against "
+            "the whole frame at its own setting, by distance from the split: 0-8 | 8-32 | 32-128 | 128+ px",
+            signal);
+        double off[2][kBands] = {};
+        for (unsigned side = 0; side < 2; ++side)
+        {
+            const std::vector<float>& own = side == 0 ? neutralOut : flat;
+            for (unsigned band = 0; band < kBands; ++band)
+            {
+                double sum = 0.0;
+                size_t n = 0;
+                for (unsigned y = 0; y < h; ++y)
+                {
+                    for (unsigned x = 0; x < w; ++x)
+                    {
+                        const unsigned distance =
+                            side == 0 ? (x < w / 2 ? w / 2 - 1 - x : ~0u) : (x >= w / 2 ? x - w / 2 : ~0u);
+                        if (distance < bandEdge[band] || distance >= bandEdge[band + 1])
+                            continue;
+                        for (unsigned c = 0; c < 3; ++c)
+                        {
+                            const size_t i = (size_t(y) * w + x) * 3 + c;
+                            sum += std::fabs(double(split[i]) - double(own[i]));
+                        }
+                        n += 3;
+                    }
+                }
+                off[side][band] = n != 0 ? sum / double(n) : 0.0;
+            }
+            Note("T8 %-36s %.6f | %.6f | %.6f | %.6f",
+                 side == 0 ? "left, against (1, 1, 1) everywhere" : "right, against (1, 0, 0) everywhere", off[side][0],
+                 off[side][1], off[side][2], off[side][3]);
+        }
+        if (run(true, hw / 2, neutral, flatValue, defaults, &splitHalf))
+            Note("T8 the same split in a mask at half the size: %.6f from the full-size one %s",
+                 Difference(splitHalf, split), label(Difference(splitHalf, split)));
+        const double reach = std::max(std::max(off[0][2], off[0][3]), std::max(off[1][2], off[1][3]));
+        if (signal < differs)
+            Note("T8 verdict: tone 0 and structure 0 hardly move this frame (%.6f), so the split shows nothing",
+                 signal);
+        else if (reach <= 0.1 * signal)
+            Note("T8 verdict: the mask acts locally: from 32 px off the split each half is within %.0f%% of what the "
+                 "setting moves",
+                 100.0 * reach / signal);
+        else
+            Note("T8 verdict: the mask reaches far: 32 to 128 px off the split the halves are off their own settings "
+                 "by %.0f%% and %.0f%% of what the setting moves, beyond 128 px by %.0f%% and %.0f%%",
+                 100.0 * off[0][2] / signal, 100.0 * off[1][2] / signal, 100.0 * off[0][3] / signal,
+                 100.0 * off[1][3] / signal);
+    }
+
+    std::vector<float> after;
+    if (Run(m, handle, evalBlock, in, &defaults, kFrames, &after))
+        Note("T8 the mask taken away again: %.6f from before %s", Difference(after, base),
+             label(Difference(after, base)));
+    for (ID3D12Resource* r : { full, half })
+        r->Release();
 }
 
 // The --tuning checks, on the feature the basic run made (`handle`, with its evaluation block `evalBlock`, which has
@@ -1459,7 +1680,10 @@ void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
 //   T4  depth: another depth, DepthInverted, no depth at all (informational: the model is said to ignore it)
 //   T5  motion vectors: the card scrolls, the scale is scanned; which scale the model wants (informational)
 //   T6  the model's colour on real Witcher 3 frames from dxgi.dll's dumps, per setting (informational)
-//   T7  motion vectors dilated by depth along a moving edge, against the games' own and per-pixel ones (informational)
+//   T7  motion vectors dilated by depth, against the games' own and per-pixel ones, along the edges of a moving
+//       square and on moving thin bars (informational)
+//   T8  the control mask: constant masks against the sliders, values above 1, how far a split mask's halves reach
+//       into each other, a mask at half size (informational)
 void Tuning(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& in,
             const std::wstring& dumpFolder)
 {
@@ -1635,6 +1859,7 @@ void Tuning(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const 
     Tuning5(m, handle, evalBlock, in);
     Tuning6(m, dumpFolder);
     Tuning7(m, handle, evalBlock, in);
+    Tuning8(m, handle, evalBlock, in, base, same, differs);
 }
 } // namespace
 
