@@ -779,6 +779,31 @@ void MenuDraw()
             ImGui::EndTabItem();
         }
 
+        // The model on a smaller copy of the frame (ModelScale), after DLSS as always: its time follows its pixels
+        // (nrprobe on the RTX 5090 at 4K: 7.1 ms whole, 4.4 at 75%, 3.8 at 67%, 2.9 at 50%), and its change comes
+        // back to the full frame along the frame's own edges (nr_fit.hlsl). 100% is the model on the whole frame.
+        const bool speedPage = ImGui::BeginTabItem("Speed (experimental)");
+        Record("TabSpeed");
+        if (speedPage)
+        {
+            commit |= Float("ModelScale", "Model input size", &d.modelScale, 50.0f, 100.0f, 11, false, def.modelScale,
+                            "%.0f%%");
+            ImGui::TextDisabled("%s", "Below 100% the model works on a smaller copy of the frame, and what it");
+            ImGui::TextDisabled("%s", "changes is carried back to full size along the frame's own edges.");
+            if (haveStatus && st.modelWidth != 0)
+            {
+                if (st.modelWidth == st.width && st.modelHeight == st.height)
+                    ImGui::Text("Model input: the whole %ux%u frame", st.width, st.height);
+                else
+                    ImGui::Text("Model input: %ux%u of %ux%u", st.modelWidth, st.modelHeight, st.width, st.height);
+            }
+            if (haveStatus && st.haveTiming)
+                ImGui::Text("NR on the GPU: %.2f ms, of which the model %.2f ms", double(st.gpuMs), double(st.modelMs));
+            else
+                ImGui::TextDisabled("%s", "NR on the GPU: no measurement yet");
+            ImGui::EndTabItem();
+        }
+
         // The keys.
         const bool keys = ImGui::BeginTabItem("Keys");
         Record("TabKeys");

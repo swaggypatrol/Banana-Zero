@@ -338,6 +338,10 @@ bool Apply(Settings* s, const char* key, const char* value, const char** problem
         return ParseRange(value, 0.0f, 2.0f, &s->skyStructure, problem);
     if (_stricmp(key, "ShowSky") == 0)
         return ParseBool(value, &s->showSky);
+
+    // Speed.
+    if (_stricmp(key, "ModelScale") == 0)
+        return ParseRange(value, 50.0f, 100.0f, &s->modelScale, problem);
     *problem = "unknown key";
     return false;
 }
@@ -398,6 +402,7 @@ void SettingsDescribe(const Settings& s, char* out, size_t size)
            kMenuColourText[unsigned(s.menuColour) % 3], double(s.menuNits), kMenuThemeText[unsigned(s.menuTheme) % 2]);
     Append(out, size, &length, "; depth DilateMotion %d, SkyTone %.2f, SkyStructure %.2f, ShowSky %d",
            s.dilateMotion ? 1 : 0, double(s.skyTone), double(s.skyStructure), s.showSky ? 1 : 0);
+    Append(out, size, &length, "; speed ModelScale %.0f%%", double(s.modelScale));
 }
 
 void SettingsDescribeModel(const ModelSettings& m, char* out, size_t size)
