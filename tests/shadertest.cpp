@@ -1134,8 +1134,8 @@ void CheckOutput(const Scene& s, const std::vector<uint8_t>& output, const Expec
             {
                 ++changed;
                 const float slack = spread * std::max({ std::fabs(e.r), std::fabs(e.g), std::fabs(e.b) });
-                auto within = [&](int c, float g, float w)
-                { return Close(*s.format, c, g, w) || std::fabs(g - w) <= slack; };
+                auto within = [&](int c, float value, float wanted)
+                { return Close(*s.format, c, value, wanted) || std::fabs(value - wanted) <= slack; };
                 ok = within(0, o.r, e.r) && within(1, o.g, e.g) && within(2, o.b, e.b) &&
                      (s.format->bytes == 4 && s.format->linear ? true : o.a == e.a);
             }
