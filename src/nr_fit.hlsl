@@ -43,15 +43,23 @@ void CSMain(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint gi :
     const int2 last = int2(g.modelWidth, g.modelHeight) - 1;
     const int2 origin = int2(group.xy) * FIT_TILE - 2; // the model texel sIn[0] holds
 
-    // The inputs: each texel's guide and the model's change there, the edge texels repeated beyond the picture.
+    // The inputs: each texel's guide and the model's change there, the edge texels repeated beyond the picture. Where
+    // the model returned a texel exactly as it got it, the change is exactly 0, as in the full-size composite, and not
+    // whatever rounding leaves of the formulas: the GPU need not round o / yo - p / yp to 0 for o equal to p.
     for (uint i = gi; i < FIT_IN * FIT_IN; i += FIT_TILE * FIT_TILE)
     {
         const int2 q = clamp(origin + int2(i % FIT_IN, i / FIT_IN), 0, last);
         const float3 pe = gProxy.Load(int3(q, 0)).rgb;
+        const float3 me = gModel.Load(int3(q, 0)).rgb;
         const float3 p = ProxyLinear(pe);
-        const float3 o = ModelLinear(gModel.Load(int3(q, 0)).rgb, pe);
-        const float3 chroma = ModelChroma(p, o);
-        sIn[i] = float4(Guide(p), ModelGain(p, o, linearHdr), chroma.r, chroma.b);
+        float4 input = float4(Guide(p), 0.0, 0.0, 0.0);
+        if (any(me != pe))
+        {
+            const float3 o = ModelLinear(me, pe);
+            const float3 chroma = ModelChroma(p, o);
+            input.yzw = float3(ModelGain(p, o, linearHdr), chroma.r, chroma.b);
+        }
+        sIn[i] = input;
     }
     GroupMemoryBarrierWithGroupSync();
 
