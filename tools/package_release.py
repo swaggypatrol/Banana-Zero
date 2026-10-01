@@ -11,6 +11,8 @@
         Checks dist/<tag>/: the zip holds exactly the files the list names, with those hashes, and both DLLs carry
         the stamp. The release workflow (.github/workflows/release.yml) runs this before it publishes.
 
+A tag is vX.Y.Z, or vX.Y.Z-rc.N for a release candidate, which the release workflow publishes as a pre-release.
+
 Both print a Markdown table of the files (name, bytes, SHA-256) on stdout; the release notes carry it. Text files go
 into the zip with CRLF line endings, plus a UTF-8 byte order mark when they are not plain ASCII, so that Notepad on
 any Windows shows them right, and every entry carries the tag commit's time, so the same files make the same zip.
@@ -39,7 +41,7 @@ CONTENTS = {
     "THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",
 }
 
-TAG_PATTERN = re.compile(r"^v\d+\.\d+\.\d+$")
+TAG_PATTERN = re.compile(r"^v\d+\.\d+\.\d+(-rc\.\d+)?$")
 
 
 class Failed(Exception):
@@ -199,8 +201,8 @@ def main(argv):
     if verifying:
         args = args[1:]
     if len(args) not in (1, 2) or (verifying and len(args) != 1) or not TAG_PATTERN.match(args[0]):
-        print("usage: package_release.py <tag vX.Y.Z> [<build dir>]\n"
-              "       package_release.py --verify <tag vX.Y.Z>", file=sys.stderr)
+        print("usage: package_release.py <tag vX.Y.Z or vX.Y.Z-rc.N> [<build dir>]\n"
+              "       package_release.py --verify <tag vX.Y.Z or vX.Y.Z-rc.N>", file=sys.stderr)
         return 1
     tag = args[0]
     try:

@@ -5,7 +5,8 @@
 # dist/<tag>/ (made by tools/package_release.py). This checks exactly that, checks the package again
 # (tools/package_release.py --verify) and publishes the release <tag> with the zip and SHA256SUMS.txt. The release
 # notes are the tag's own message followed by the package's file table. The push starts it; running it by hand on the
-# branch release/<tag> (Actions > release > Run workflow) does the same, as a retry.
+# branch release/<tag> (Actions > release > Run workflow) does the same, as a retry. A release candidate, tagged
+# vX.Y.Z-rc.N, is published as a pre-release, so the latest release stays the one before it.
 name: release
 
 on:
@@ -28,8 +29,8 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#release/}"
-          if [[ "$GITHUB_REF_NAME" != release/* || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::run this on a branch release/vX.Y.Z, not $GITHUB_REF_NAME"; exit 1
+          if [[ "$GITHUB_REF_NAME" != release/* || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::run this on a branch release/vX.Y.Z or release/vX.Y.Z-rc.N, not $GITHUB_REF_NAME"; exit 1
           fi
           if [ "$(git cat-file -t "refs/tags/$tag" 2>/dev/null)" != tag ]; then
             echo "::error::the annotated tag $tag is not in the repository"; exit 1
@@ -55,5 +56,9 @@ jobs:
           set -euo pipefail
           notes="$RUNNER_TEMP/notes.md"
           { git tag -l --format='%(contents)' "$TAG"; printf '\n## Files\n\n'; cat "$RUNNER_TEMP/files.md"; } > "$notes"
+          candidate=()
+          if [[ "$TAG" == *-rc.* ]]; then
+            candidate=(--prerelease --latest=false)
+          fi
           gh release create "$TAG" "dist/$TAG/Banana-Zero-$TAG.zip" "dist/$TAG/SHA256SUMS.txt" \
-            --verify-tag --title "Banana-Zero $TAG" --notes-file "$notes"
+            --verify-tag --title "Banana-Zero $TAG" --notes-file "$notes" "${candidate[@]}"

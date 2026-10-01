@@ -281,6 +281,7 @@ never saved.
 
 | Version | What changed |
 |---|---|
+| v0.1.3-rc.1 | A release candidate, published as a pre-release: v0.1.2 stays the current release until this one has seen more games. New: [Speed (experimental)](#speed-experimental), the model on a smaller copy of the frame for less GPU time, with the pass's GPU time on the page; [Depth (experimental)](#depth-experimental), motion vectors dilated by depth and the sky's own Local tone and Local structure. New for builders: `nrprobe --subrects`. Leave both pages as they come and the picture is the same as v0.1.2 |
 | v0.1.2 | The knobs are connected now. Style and the five Model knobs were handed to the model only when it was created, but the model reads them every frame, so in v0.1.1 they did nothing. They now act from the next frame, every slider applies while you drag, and turning a knob no longer rebuilds the model. New: `nrprobe --tuning` measures what the knobs do |
 | v0.1.1 | The first public release. The menu and this manual learned English |
 
@@ -335,6 +336,7 @@ Run these from the repository root after a build. The exit code is the number of
 | `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU |
 | `build\Release\nrprobe.exe [--model <path>]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll` |
 | `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along moving edges and thin bars, whether a control mask sets it per pixel, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
+| `build\Release\nrprobe.exe --subrects` | the same | Runs the model on smaller pictures inside a feature made for the full one, as Model input size does: that the result matches a feature made at the smaller size, that nothing outside the smaller picture is written, how long each size takes, and which motion-vector scale it wants then |
 
 ### Regenerating the export stubs
 
@@ -351,7 +353,8 @@ Every build compares the new `dxgi.dll` with the local `System32\dxgi.dll` and w
 
 1. On a Windows PC, in a fresh clone, create an annotated tag on `main` whose message is the release notes:
    `git tag -a vX.Y.Z -F notes.txt`. Git drops every line that starts with `#` from a tag message, so no Markdown
-   headings.
+   headings. A release candidate is tagged `vX.Y.Z-rc.N` and goes through the same steps; it is published as a
+   pre-release, and the latest release stays the one before it.
 2. Check out the tag, build, and run every test above.
 3. `python tools\package_release.py vX.Y.Z` checks the tree is exactly at the tag and both DLLs are stamped with it,
    then writes `dist\vX.Y.Z\Banana-Zero-vX.Y.Z.zip` and `SHA256SUMS.txt`.
