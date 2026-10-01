@@ -61,6 +61,9 @@ Like any good sub, placement matters.
    running. That is the power LED. Enjoy the power LED.
 
 **Upgrading:** replace both DLLs together (they check that they come from the same build). Keep `dlssnr.ini`.
+Coming from v0.1.1 or older? Style and the Model sliders never reached the model there, so whatever you set them to
+did nothing. From v0.1.2 they work, and those old settings take effect. If the picture looks different after the
+upgrade, right-click Style and the Model sliders to hand them back to the model.
 
 **Uninstalling:** delete `dxgi.dll`, `banana.nvngx.dll`, `dlssnr.ini`, `dlssnr.log` and `dlssnr.prev.log` from the
 game folder, and optionally `%LOCALAPPDATA%\Banana-Zero`. Banana-Zero never modifies a single file of the game.
@@ -229,9 +232,17 @@ The file accepts wider ranges than the menu's sliders. Freeze, the calibration c
 - **It costs frame time.** An earlier build measured 7.0 to 7.7 ms per frame for the whole NR pass on an RTX 5090 at
   4K output, 97% of it inside the model. This build runs the same model; its frame time has not been measured
   separately.
-- **The model's knobs are undocumented.** Everything under "Model" is inferred from parameter names.
+- **The model's knobs are undocumented.** `nrprobe --tuning` measured that they act and what their defaults are; what
+  each one does to the picture is our best guess from its name.
 - Night scenes in Witcher 3, the pause menus and photo modes have not been tested specifically.
 - The menu keeps keyboard and mouse from the game, but not a gamepad.
+
+## Version history
+
+| Version | What changed |
+|---|---|
+| v0.1.2 | The knobs are connected now. Style and the five Model knobs were handed to the model only when it was created, but the model reads them every frame, so in v0.1.1 they did nothing. They now act from the next frame, every slider applies while you drag, and turning a knob no longer rebuilds the model. New: `nrprobe --tuning` measures what the knobs do |
+| v0.1.1 | The first public release. The menu and this manual learned English |
 
 ## How it works
 
@@ -294,7 +305,8 @@ Every build compares the new `dxgi.dll` with the local `System32\dxgi.dll` and w
 ### Releasing
 
 1. On a Windows PC, in a fresh clone, create an annotated tag on `main` whose message is the release notes:
-   `git tag -a vX.Y.Z -F notes.txt`.
+   `git tag -a vX.Y.Z -F notes.txt`. Git drops every line that starts with `#` from a tag message, so no Markdown
+   headings.
 2. Check out the tag, build, and run every test above.
 3. `python tools\package_release.py vX.Y.Z` checks the tree is exactly at the tag and both DLLs are stamped with it,
    then writes `dist\vX.Y.Z\Banana-Zero-vX.Y.Z.zip` and `SHA256SUMS.txt`.
@@ -326,7 +338,8 @@ Banana-Zero was built by one enthusiast and a lot of patience. Things we would l
 - **More games.** Try any DX12 game with DLSS on an RTX 50 card and open an issue with the game, your folder and both
   log files, whether it worked or not.
 - **Vulkan support.** The obvious next step. The NGX calls look the same; the plumbing does not.
-- **Tuning.** What do Style, Local structure, Local tone and friends really do? Screenshots with A/B pairs are gold.
+- **Tuning.** Since v0.1.2 the model's knobs actually do something. What, exactly? Style, Local structure, Local tone
+  and friends are undocumented, so screenshots with A/B pairs are gold.
 - **HDR know-how.** The white point and shoulder defaults come from two playtests in two games. `StatsLog` and
   `DumpEvery` plus the two Python tools give you the numbers to argue with.
 - **Frame time.** A proper measurement of this build, and ideas to make the non-model part cheaper without touching
