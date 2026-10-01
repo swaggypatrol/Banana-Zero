@@ -9,13 +9,15 @@
 //   - settings_write.cpp: a file with comments, unknown keys and StatsLog keeps every line it should; a model
 //     parameter set back to the model's default loses its line; a new file gets its header; what was written reads
 //     back the same; the sky's stripes are never written
+//   - settings.cpp: ModelScale's steps (a third, whole percent, two thirds), and the file's value read as the nearest
 //   - menu_model.cpp: the draft, A/B, when the file is due, a reload behind the menu
 //   - the panel: a slider dragged with the mouse publishes every step at once and logs the drag once, when the mouse
 //     lets go; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
 //     box unfreezes it, unticking the card undoes the freeze it made; skin structure takes no input until the auto
 //     mask is on; "all defaults"; the depth page: a sky slider away from 1 greys out the auto mask until it is back,
 //     the stripes and the dilation commit at once; the speed page: the model's input size publishes at once, a
-//     right-click puts 100% back, the pass's model size and GPU time are drawn; closing the menu writes the file,
+//     right-click puts 100% back, a drag across and back moves in its steps, holds at its stops and finds every
+//     step one way or the other, the pass's model size and GPU time are drawn; closing the menu writes the file,
 //     and so does a second after a commit while it is open
 
 #include <windows.h>
@@ -25,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 #include "freeze.h"
 #include "imgui.h"
@@ -249,7 +252,7 @@ void TestWrite()
     full.skyTone = 0.5f;
     full.skyStructure = 1.25f;
     full.showSky = true;
-    full.modelScale = 67.0f;
+    full.modelScale = kModelScaleTwoThirds;
     unsigned long error = 0;
     Check(SettingsWriteIni(g_ini, full, &error), "write: SettingsWriteIni (error %lu)", error);
     loaded = SettingsLoad(g_ini);
@@ -265,9 +268,59 @@ void TestWrite()
     Check(loaded->dilateMotion == full.dilateMotion && Near(loaded->skyTone, full.skyTone, 1e-6f) &&
               Near(loaded->skyStructure, full.skyStructure, 1e-6f),
           "write: the depth page's keys read back the same");
-    Check(Near(loaded->modelScale, full.modelScale, 1e-6f), "write: the speed page's key reads back the same");
+    Check(loaded->modelScale == full.modelScale, "write: the speed page's key reads back the same (%.4g%%)",
+          double(loaded->modelScale));
     Check(!loaded->showSky && !FileHas("ShowSky", 0.0), "write: the sky's stripes are never written");
     Check(loaded->enabled && Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog still 2, Enabled back to 1");
+}
+
+// ModelScale's steps: a third, each whole percent from 34, two thirds in place of 67; anything else goes to the
+// nearest, the file's value too.
+void TestModelScaleSteps()
+{
+    struct Case
+    {
+        float in, out;
+    };
+    const Case cases[] = { { 0.0f, kModelScaleThird },
+                           { 33.3f, kModelScaleThird },
+                           { 33.6f, kModelScaleThird },
+                           { 33.7f, 34.0f },
+                           { 49.6f, 50.0f },
+                           { 66.3f, 66.0f },
+                           { 66.4f, kModelScaleTwoThirds },
+                           { 67.0f, kModelScaleTwoThirds },
+                           { 67.3f, kModelScaleTwoThirds },
+                           { 67.4f, 68.0f },
+                           { 99.4f, 99.0f },
+                           { 99.6f, 100.0f },
+                           { 150.0f, 100.0f },
+                           { std::nanf(""), 100.0f } };
+    int wrong = 0;
+    for (const Case& c : cases)
+    {
+        const float got = ModelScaleStep(c.in);
+        if (got != c.out)
+        {
+            Check(false, "steps: %g goes to %g, not %g", double(c.in), double(got), double(c.out));
+            ++wrong;
+        }
+    }
+    Check(wrong == 0, "steps: values go to the nearest step");
+    for (const float stop : kModelScaleStops)
+        Check(ModelScaleStep(stop) == stop, "steps: the stop %.4g%% is a step", double(stop));
+
+    WriteAll(g_ini, "ModelScale = 42.4\r\n");
+    Check(SettingsLoad(g_ini)->modelScale == 42.0f, "steps: ModelScale = 42.4 in the file reads as 42");
+    WriteAll(g_ini, "ModelScale = 67\r\n");
+    Check(SettingsLoad(g_ini)->modelScale == kModelScaleTwoThirds, "steps: 67 reads as two thirds");
+    WriteAll(g_ini, "ModelScale = 33.3\r\n");
+    Check(SettingsLoad(g_ini)->modelScale == kModelScaleThird && LogCount("(ModelScale = 33.3)") == 0,
+          "steps: 33.3 reads as a third, and the log has nothing to say about it");
+    WriteAll(g_ini, "ModelScale = 20\r\n");
+    Check(SettingsLoad(g_ini)->modelScale == kModelScaleThird &&
+              LogCount("out of range, clamped (ModelScale = 20)") == 1,
+          "steps: 20 reads as a third, and the log says it was out of range");
 }
 
 // A stand-in for SettingsPublish that counts.
@@ -574,8 +627,99 @@ void TestPanel()
           double(SettingsCurrent()->modelScale), Generation());
     Check(Click("ModelScale", 0.5f, 1) && Generation() == g4 + 2 && SettingsCurrent()->modelScale == 100.0f,
           "panel: a right-click puts the model's input size back to 100%%");
-    Check(Click("ModelScale", 0.5f) && Generation() == g4 + 3 && Near(SettingsCurrent()->modelScale, 75.0f, 5.0f),
-          "panel: a click halfway along makes it about 75%% (%.0f%%)", double(SettingsCurrent()->modelScale));
+    {
+        const bool clicked = Click("ModelScale", 0.5f);
+        const float size = SettingsCurrent()->modelScale;
+        Check(clicked && Generation() == g4 + 3 && size == kModelScaleTwoThirds,
+              "panel: a click halfway along is two thirds (%.4g%%)", double(size));
+    }
+
+    // A drag from the left end to the right and back, a quarter of a pixel at a time. Each value is a step and comes
+    // in order; a stop between the ends holds the grab well past where the next step would begin, so the step after
+    // it comes up only on the way back, the one before it only on the way there; every step comes up one way or the
+    // other.
+    {
+        struct Seen
+        {
+            float value;
+            int there, back; // quarter pixels shown, each way
+        };
+        Seen seen[80] = {};
+        int count = 0;
+        bool stepsOnly = true, inOrder = true;
+        float last = 0.0f;
+        auto note = [&](bool there)
+        {
+            const float value = SettingsCurrent()->modelScale;
+            stepsOnly &= ModelScaleStep(value) == value;
+            inOrder &= there ? value >= last : value <= last;
+            last = value;
+            int i = 0;
+            while (i < count && seen[i].value != value)
+                ++i;
+            if (i == count && count < 80)
+                seen[count++] = { value, 0, 0 };
+            if (i < count)
+                ++(there ? seen[i].there : seen[i].back);
+        };
+        auto shown = [&](float value, bool there)
+        {
+            for (int i = 0; i < count; ++i)
+            {
+                if (seen[i].value == value)
+                    return there ? seen[i].there : seen[i].back;
+            }
+            return 0;
+        };
+        const int logged = LogCount("menu slider: ModelScale");
+        float left = 0.0f, right = 0.0f;
+        Check(Centre("ModelScale", &left, &y, 0.0f) && Centre("ModelScale", &right, &y, 1.0f),
+              "panel: the model's input size slider's ends");
+        MoveTo(left, y);
+        Button(0, true);
+        last = SettingsCurrent()->modelScale;
+        Check(last == kModelScaleThird, "panel: pressed at its left end, the size is a third (%.4g%%)", double(last));
+        for (float at = left; at <= right; at += 0.25f)
+        {
+            MoveTo(at, y);
+            note(true);
+        }
+        Check(last == 100.0f, "panel: dragged to the right end, the size is 100%% (%.4g%%)", double(last));
+        for (float at = right; at >= left; at -= 0.25f)
+        {
+            MoveTo(at, y);
+            note(false);
+        }
+        Button(0, false);
+        Check(stepsOnly && inOrder, "panel: the drag gives only steps, in order (%d values)", count);
+        int missing = 0;
+        for (float step = 34.0f; step <= 100.0f; step += 1.0f)
+        {
+            const float value = step == 67.0f ? kModelScaleTwoThirds : step;
+            missing += shown(value, true) + shown(value, false) == 0 ? 1 : 0;
+        }
+        missing += shown(kModelScaleThird, true) + shown(kModelScaleThird, false) == 0 ? 1 : 0;
+        Check(missing == 0 && count == 68, "panel: every step came up one way or the other (%d missing, %d values)",
+              missing, count);
+        // A plain step's share of the drag, the mean of ten (ImGui takes the mouse to whole pixels, so one alone may
+        // be a pixel more or less), against the stops': a stop holds over about two and a half steps.
+        float plainThere = 0.0f, plainBack = 0.0f;
+        for (float step = 35.0f; step < 45.0f; step += 1.0f)
+        {
+            plainThere += float(shown(step, true)) / 10.0f;
+            plainBack += float(shown(step, false)) / 10.0f;
+        }
+        for (const float stop : { 50.0f, kModelScaleTwoThirds, 80.0f })
+        {
+            Check(float(shown(stop, true)) >= 1.75f * plainThere && float(shown(stop, false)) >= 1.75f * plainBack,
+                  "panel: the stop %.4g%% holds the grab (%d and %d quarter pixels, a plain step %.1f and %.1f)",
+                  double(stop), shown(stop, true), shown(stop, false), double(plainThere), double(plainBack));
+        }
+        Check(shown(49.0f, true) > 0 && shown(49.0f, false) == 0 && shown(51.0f, true) == 0 && shown(51.0f, false) > 0,
+              "panel: 49%% comes up on the way to the stop at 50%%, 51%% on the way back");
+        Check(SettingsCurrent()->modelScale == kModelScaleThird && LogCount("menu slider: ModelScale") == logged + 1,
+              "panel: let go at the left end, a third, the drag logged once");
+    }
     g_fakeStatus.haveTiming = false;
     Frame();
     Check(Click("TabTune"), "panel: back to the tuning page");
@@ -595,7 +739,7 @@ void TestPanel()
     Check(FileHas("StatsLog = 0", 0.0), "panel: StatsLog still there");
     Check(FileHas("DilateMotion = 1", 0.0) && !FileHas("SkyStructure", 0.0) && !FileHas("ShowSky", 0.0),
           "panel: DilateMotion written; a sky slider back at 1 and the stripes not");
-    Check(FileHas("ModelScale = ", 0.0), "panel: ModelScale written");
+    Check(FileHas("ModelScale = 33.33", 0.0), "panel: ModelScale written");
 
     ImGui::DestroyContext();
 }
@@ -618,6 +762,7 @@ int main()
 
     TestKeys();
     TestWrite();
+    TestModelScaleSteps();
     TestModel();
     TestPanel();
 

@@ -128,8 +128,17 @@ struct Settings
 
     // Speed: the menu's other experimental page.
     float modelScale = 100.0f; // ModelScale: the model works on a copy of the frame this many percent of its size
-                               // on each side, its change brought back to the full frame: 50 .. 100; 100 = as before
+                               // on each side, its change brought back to the full frame: 33.3 .. 100 in the steps
+                               // ModelScaleStep gives; 100 = as before
 };
+
+// ModelScale's sizes, in percent: a third, then each whole percent from 34 to 100, with two thirds in place of 67. The
+// menu's slider moves in these steps and holds at the stops, its notches; a typed number and the file's value go to
+// the nearest step.
+constexpr float kModelScaleThird = 100.0f / 3.0f;
+constexpr float kModelScaleTwoThirds = 200.0f / 3.0f;
+constexpr float kModelScaleStops[] = { kModelScaleThird, 50.0f, kModelScaleTwoThirds, 80.0f, 100.0f };
+float ModelScaleStep(float percent);
 
 // Reads the file (absent is fine: defaults), publishes the snapshot and logs what it read. Returns the snapshot.
 const Settings* SettingsLoad(const wchar_t* iniPath);
