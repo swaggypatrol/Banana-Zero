@@ -52,7 +52,7 @@ const char* const kMenuColourText[] = { "auto", "sdr", "hdr" };
 const char* const kMenuThemeText[] = { "dark", "paper" };
 
 // The keys in the order new lines are added. `wanted` is set for a key whose line should exist: a value away from
-// the default, or a model parameter that is set. Room for the 33 keys MakePlan adds and a few more: nothing checks.
+// the default, or a model parameter that is set. Room for the 34 keys MakePlan adds and a few more: nothing checks.
 constexpr unsigned kMaxKeys = 40;
 struct Plan
 {
@@ -146,6 +146,7 @@ Plan MakePlan(const Settings& s)
     // The sky's stripes are not stored either, like the card.
     AddBool(&plan, "ShowSky", s.showSky, d.showSky);
     plan.wanted[plan.count - 1] = false;
+    AddFloat(&plan, "ModelScale", s.modelScale, d.modelScale);
     return plan;
 }
 

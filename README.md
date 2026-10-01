@@ -166,6 +166,23 @@ depth. Indoors, unless a window shows the sky, there is none and the sky sliders
 counts as sky tells you. The model looks at the picture as a whole, so what the sky gets moves the rest of the
 picture too, by about a fifth as much.
 
+### Speed (experimental)
+
+The model costs about 7 ms a frame at 4K on an RTX 5090, nearly all of it inside the model, and its time follows the
+number of pixels it looks at. This page trades some of its effect for some of that time. DLSS is not touched: the game
+renders and upscales exactly as before, and only the model's own copy of the frame gets smaller.
+
+| Control | Range | What it does |
+|---|---|---|
+| **Model input size** | 50% to 100%, default 100% | The model looks at a copy of the frame this big on each side. What it changes is carried back to the full frame along the full frame's own edges, so outlines stay sharp; what thins out is the finest of the model's own detail. 100% is the model on the whole frame, as before. Applies while you drag; each new size restarts the model's memory of earlier frames, so the picture looks a touch rougher for a frame or two |
+
+Under the slider: the size the model actually gets, and **NR on the GPU**, the whole pass and the model's share of it in
+milliseconds, measured on the GPU while the menu is open (the median of the last 16 frames).
+
+`nrprobe` timed the model alone on an RTX 5090 at 4K: 7.1 ms at 100%, 4.4 at 75%, 3.8 at 67%, 2.9 at 50%. The slider
+stops at 50% because about 1.7 ms of the model's time does not shrink with the picture: below that, the picture
+would keep thinning for very little time back. Judge the trade with A/B and Split screen.
+
 ### Keys and Menu
 
 | Control | Default | What it does |
@@ -229,6 +246,7 @@ like to open the back panel.
 | `SkyTone` | 0 to 2 | 1 | Sky local tone |
 | `SkyStructure` | 0 to 2 | 1 | Sky local structure |
 | `ShowSky` | 1 / 0 | 0 | Show what counts as sky; the menu never saves it |
+| `ModelScale` | 50 to 100 | 100 | Model input size |
 | `StatsLog` | seconds, 0 = off | 0 | file only; a statistics line in the log every N seconds (`tools/bzstats.py` reads them) |
 | `DumpEvery` | seconds, 0 = off | 0 | file only; a frame dump to `%LOCALAPPDATA%\Banana-Zero\dumps` every N seconds, at most 16 (`tools/bzdump.py` turns them into pictures) |
 
@@ -251,9 +269,9 @@ never saved.
 
 - **DirectX 12 only.** Vulkan is the next milestone. DX11 is not planned.
 - **Tested in exactly two games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are untested.
-- **It costs frame time.** An earlier build measured 7.0 to 7.7 ms per frame for the whole NR pass on an RTX 5090 at
-  4K output, 97% of it inside the model. This build runs the same model; its frame time has not been measured
-  separately.
+- **It costs frame time.** About 7 ms per frame for the whole NR pass on an RTX 5090 at 4K output, nearly all of it
+  inside the model. The Speed page shows what it costs on your machine, and its Model input size trades some of the
+  effect for time.
 - **The model's knobs are undocumented.** `nrprobe --tuning` measured that they act and what their defaults are; what
   each one does to the picture is our best guess from its name.
 - Night scenes in Witcher 3, the pause menus and photo modes have not been tested specifically.
@@ -277,6 +295,11 @@ never saved.
   model 1:1 at display size (no upscaling, it does not replace DLSS), and composites the result back.
 - The composite takes only the model's *ratio* of change per pixel and applies it to the untouched HDR frame, capped
   by Max gain. That is why the model cannot make the whole picture blow out or go dark.
+- With Model input size below 100% the model gets a smaller copy instead, each of its pixels the average of the frame
+  pixels it covers. Its change comes back to full size through a guided filter: fitted in small windows against the
+  brightness of the model's input, applied to the brightness of each full-size pixel, and never more than the model
+  itself changed at the four nearest of its pixels. The model is not rebuilt for this; each frame it is simply handed
+  a smaller part of its input and output.
 - The model only uses what the game already gives DLSS: colour, depth and motion vectors. No per-game patching.
 - **Why the bridge DLL?** The model only accepts callers whose file name contains `nvngx.dll`, and the driver's NGX
   runtime refuses to load the model itself because of its signature. So `dxgi.dll` calls it through

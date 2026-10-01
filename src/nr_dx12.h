@@ -62,10 +62,16 @@ struct NrStatusState
     bool havePreExposure;
     bool exposureTexture;
     double lastEvaluateAt;  // LogClock() of the last evaluation that reached the pass
+    unsigned modelWidth, modelHeight; // the model's picture (ModelScale): the frame's size, or smaller; 0 until the
+                                      // model's first evaluation
+    bool haveTiming;        // gpuMs and modelMs hold a measurement (only while NrStatus keeps being called)
+    float gpuMs;            // the whole pass on the GPU, encode to composite: the median of the last 16 frames
+    float modelMs;          // of which the model itself
 };
 
 // Copies the latest state out; false (and zeroes) while nothing has reached the pass yet. Any thread; waits at most
-// for the render thread's copy in.
+// for the render thread's copy in. While these calls keep coming (the menu is open), the pass also times itself on
+// the GPU, for haveTiming; half a second after they stop it no longer does.
 bool NrStatus(NrStatusState* out);
 
 // "NR 1200 frames, 3 skipped, 0 failed" or the reason it is off, for the reporter's line and the totals at exit.

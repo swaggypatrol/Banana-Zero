@@ -2,9 +2,10 @@
 // and the frame dump in M4.
 //
 // Shape of a frame (all on the game's command list, right after its DLSS evaluation):
-//   1. Output UAV -> NPSR; the scene meter        5. model output UAV -> NPSR.
-//      (linear HDR only).                         6. Output NPSR -> UAV; composite: the model's change -> Output,
-//   2. encode: Output -> proxy (RGBA16F).            in place, plus the badge and the calibration card.
+//   1. Output UAV -> NPSR; the scene meter        5. model output UAV -> NPSR; with ModelScale below 100%, the fit
+//      (linear HDR only).                            (nr_fit.hlsl): the model's change as local functions of a guide.
+//   2. encode: Output -> proxy (RGBA16F), at the  6. Output NPSR -> UAV; composite: the model's change -> Output,
+//      frame's size or (ModelScale) smaller.         in place, plus the badge and the calibration card.
 //   3. proxy UAV -> NPSR; typeless guides cloned. 7. every resource back to the state it arrived in.
 //   4. the model: Color = proxy, Depth/MVec = the
 //      game's (or a typed clone of the subrect),
@@ -13,6 +14,9 @@
 // beside 6; both are copied into readback buffers that the CPU looks at a few frames later, once the frame numbers
 // written at both ends show the copy has landed (no fence, no wait). While the menu shows the preview, the
 // preview picture is rendered after 6 and the statistics run whenever the last copy has landed.
+//
+// While the menu is open, timestamps around the pass and around the model are resolved into a readback ring the
+// same way, for its GPU time; a slot is read when it comes round again, kRing frames later.
 //
 // Nothing else reads back, waits or allocates per frame; the descriptors come from a ring, the constants are root
 // constants. One lock guards the whole state and is only ever tried, never waited for, on the evaluate path: a
@@ -31,6 +35,7 @@
 #include "freeze.h"
 #include "log.h"
 #include "ngx_hook.h"
+#include "nr_fit_shader.h"
 #include "nr_frame.h"
 #include "nr_shader.h"
 #include "nr_shared.h"
@@ -43,8 +48,12 @@ namespace
 constexpr int kFeatureNR = 18;
 constexpr unsigned kRing = 8;                 // frames whose descriptors are kept apart; also how long retired
                                               // handles and textures are parked before release
-constexpr unsigned kTable = 6;                // one descriptor table: t0-t3, u0-u1 (nr_shared.h)
-constexpr unsigned kTablesPerFrame = 7;       // encode, composite, dump, preview, meter, dilate, sky
+constexpr unsigned kSrvs = 7;                 // one descriptor table: t0-t6, then u0-u2 (nr_shared.h)
+constexpr unsigned kUav0 = kSrvs;
+constexpr unsigned kUav1 = kSrvs + 1;
+constexpr unsigned kUav2 = kSrvs + 2;
+constexpr unsigned kTable = kSrvs + 3;
+constexpr unsigned kTablesPerFrame = 8;       // encode, composite, dump, preview, meter, dilate, sky, fit
 constexpr unsigned kDescriptorsPerFrame = kTable * kTablesPerFrame;
 constexpr uint64_t kEvaluatesBetweenCreates = 30; // the driver's feature slots
 constexpr unsigned kMaxCreates = 64;
@@ -61,6 +70,11 @@ constexpr uint64_t kDumpGiveUp = 240;
 constexpr unsigned kMaxDumps = 16;            // per process: each is about 25 MB at 4K
 constexpr unsigned kPreviewWidth = 768;       // the preview picture's width to aim for: a fifth of a 4K frame
 constexpr double kPreviewHold = 0.5;          // seconds the preview is kept after the menu last asked for it
+constexpr unsigned kTimestamps = 4;           // per frame: the pass begins, the model begins, the model ends, the
+                                              // pass ends
+constexpr unsigned kTimingSamples = 16;       // the menu is shown the median of the last this many frames
+constexpr double kTimingHold = 0.5;           // seconds the pass is timed after the menu last asked
+constexpr uint64_t kModelSizeSettle = 60;     // frames a new model size holds before it is logged (ModelScale)
 static_assert(kNrPreviewBins == NR_HIST_BINS && kNrPreviewEvMin == NR_HIST_EV_MIN &&
                   kNrPreviewBinsPerEv == NR_HIST_PER_EV,
               "the menu is handed the statistics' own histogram (nr_shared.h)");
@@ -480,6 +494,8 @@ struct FrameInfo
     unsigned feature = 0;
     unsigned width = 0;
     unsigned height = 0;
+    unsigned modelWidth = 0; // the model's picture (ModelScale)
+    unsigned modelHeight = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     unsigned flags = 0; // NrConstants.flags
     bool havePreExposure = false;
@@ -549,6 +565,8 @@ struct Nr
 
     // Set by the menu (NrPreview): LogClock() of its last call.
     std::atomic<double> previewAskedAt { -1.0e9 };
+    // Set by the menu (NrStatus): LogClock() of its last call. The pass is timed on the GPU while it keeps asking.
+    std::atomic<double> timingAskedAt { -1.0e9 };
 
     // The rest is under g_lock.
     bool settingsLoaded = false;
@@ -564,6 +582,7 @@ struct Nr
     ID3D12RootSignature* rootSignature = nullptr;
     ID3D12PipelineState* pipeline = nullptr;      // nr.hlsl
     ID3D12PipelineState* statsPipeline = nullptr; // nr_stats.hlsl
+    ID3D12PipelineState* fitPipeline = nullptr;   // nr_fit.hlsl
     ID3D12DescriptorHeap* heap = nullptr;
     UINT descriptorSize = 0;
     const char* initAttempt = nullptr; // which Init_Ext attempt the model accepted
@@ -591,6 +610,35 @@ struct Nr
     Texture depthClone;
     Texture motionClone;
     Parked parked[kMaxParked];
+
+    // ModelScale: the model's picture as last evaluated (the frame's size, or smaller; 0 before the feature's first
+    // evaluation), since which frame, and the size last logged. The fit's three textures (nr_fit.hlsl), at the
+    // frame's size so that the slider can move without making them again: made the first frame the model works on a
+    // smaller copy, kept until the frame's size changes. They rest in the UAV state.
+    unsigned modelWidth = 0;
+    unsigned modelHeight = 0;
+    uint64_t modelSizeFrame = 0;
+    unsigned loggedModelWidth = 0;
+    unsigned loggedModelHeight = 0;
+    Texture slope;
+    Texture value;
+    Texture raw;
+    bool fitFailed = false;
+
+    // The pass's GPU time, for the menu: timestamps around the pass and around the model, resolved into a readback
+    // ring. Made the first time the menu asks.
+    ID3D12QueryHeap* queries = nullptr;
+    Buffer timingReadback;      // kRing slots of kTimestamps ticks
+    bool timed[kRing] = {};     // the slot was given a frame's timestamps that have not been looked at
+    uint64_t lastTick = 0;      // the end of the last frame measured: a slot holding older ticks was not written yet
+    double ticksPerMs = 0.0;
+    bool timingFailed = false;
+    float passSamples[kTimingSamples] = {};
+    float modelSamples[kTimingSamples] = {};
+    unsigned samples = 0;       // how many of them hold a measurement
+    unsigned nextSample = 0;
+    float passMs = 0.0f;        // their medians
+    float modelMs = 0.0f;
 
     // What the game's depth adds (DilateMotion, the sky sliders): made the first frame each is wanted and again when
     // the guides change size or format, kept otherwise. Both rest in the UAV state.
@@ -881,7 +929,8 @@ bool MakePipelineState(const void* bytecode, size_t size, ID3D12PipelineState** 
     return true;
 }
 
-// One root signature for both shaders: the constants (b0), then one table of four SRVs and two UAVs (nr_shared.h).
+// One root signature for the three shaders: the constants (b0), then one table of seven SRVs and three UAVs
+// (nr_shared.h).
 bool MakePipeline()
 {
     const HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
@@ -895,11 +944,11 @@ bool MakePipeline()
 
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 4;
+    ranges[0].NumDescriptors = kSrvs;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 2;
-    ranges[1].OffsetInDescriptorsFromTableStart = 4;
+    ranges[1].NumDescriptors = kTable - kSrvs;
+    ranges[1].OffsetInDescriptorsFromTableStart = kSrvs;
     D3D12_ROOT_PARAMETER parameters[2] = {};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = NR_CONSTANTS_DWORDS;
@@ -934,7 +983,8 @@ bool MakePipeline()
         return false;
     }
     if (!MakePipelineState(nr_cso, sizeof nr_cso, &g_nr.pipeline, "nr.hlsl") ||
-        !MakePipelineState(nr_stats_cso, sizeof nr_stats_cso, &g_nr.statsPipeline, "nr_stats.hlsl"))
+        !MakePipelineState(nr_stats_cso, sizeof nr_stats_cso, &g_nr.statsPipeline, "nr_stats.hlsl") ||
+        !MakePipelineState(nr_fit_cso, sizeof nr_fit_cso, &g_nr.fitPipeline, "nr_fit.hlsl"))
         return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC heap = {};
@@ -1149,6 +1199,18 @@ void Park(void* handle, ID3D12Resource* const* resources, unsigned count)
     slot->releaseAt = g_nr.frame + kRing;
 }
 
+// The fit's textures, when the frame's size changes.
+void DropFit()
+{
+    if (g_nr.slope.resource == nullptr && g_nr.value.resource == nullptr && g_nr.raw.resource == nullptr)
+        return;
+    ID3D12Resource* const resources[3] = { g_nr.slope.resource, g_nr.value.resource, g_nr.raw.resource };
+    Park(nullptr, resources, 3);
+    g_nr.slope = {};
+    g_nr.value = {};
+    g_nr.raw = {};
+}
+
 // The live feature and its textures, for a new frame size.
 void ParkCurrent()
 {
@@ -1160,6 +1222,9 @@ void ParkCurrent()
     g_nr.modelOutput = {};
     g_nr.depthClone = {};
     g_nr.motionClone = {};
+    g_nr.modelWidth = 0;
+    g_nr.modelHeight = 0;
+    DropFit();
 }
 
 void ReleaseParked()
@@ -1566,6 +1631,193 @@ void CollectDump()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// ModelScale: the model on a smaller copy of the frame.
+
+// The model's picture for this frame: the frame itself at 100%; below, that share of each side (in whole percent),
+// rounded to whole 8x8 tiles and at least 64 pixels. The feature stays at the frame's size and is handed this much of
+// its input and output (subrects), so the slider moves without a rebuild (nrprobe's T9: the same picture as a
+// feature made at that size, nothing outside the subrect touched).
+void ModelSize(const Frame& f, const Settings& s, unsigned* width, unsigned* height)
+{
+    *width = f.width;
+    *height = f.height;
+    const float percent = std::floor(s.modelScale + 0.5f);
+    if (!(percent < 100.0f))
+        return;
+    auto side = [percent](unsigned size) {
+        const unsigned scaled = unsigned(float(size) * percent / 800.0f + 0.5f) * 8;
+        return Min(scaled > 64 ? scaled : 64, size);
+    };
+    *width = side(f.width);
+    *height = side(f.height);
+}
+
+// The fit's three textures for this frame size: made the first time the model works on a smaller copy, at the
+// frame's own size, kept until that changes (ParkCurrent). Ones that cannot be made are not tried again, and the model
+// then works on the whole frame.
+bool EnsureFit(const Frame& f)
+{
+    if (g_nr.slope.resource != nullptr)
+        return true;
+    if (g_nr.fitFailed)
+        return false;
+    const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (MakeTexture(&g_nr.slope, DXGI_FORMAT_R16G16B16A16_FLOAT, f.width, f.height, uav,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "fit slope") &&
+        MakeTexture(&g_nr.value, DXGI_FORMAT_R16G16B16A16_FLOAT, f.width, f.height, uav,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "fit value") &&
+        MakeTexture(&g_nr.raw, DXGI_FORMAT_R16G16B16A16_FLOAT, f.width, f.height, uav,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "fit change"))
+        return true;
+    DropFit();
+    g_nr.fitFailed = true;
+    Log("NR: ModelScale has no textures for its fit; the model works on the whole frame");
+    return false;
+}
+
+// A new model size restarts the model's history, which would otherwise blend pictures of two sizes. The size is
+// logged once it has held for kModelSizeSettle frames, so that a dragged slider leaves one line rather than one a
+// step; a frame at 100% only once a smaller size has been logged.
+void NoteModelSize(const Frame& f, unsigned width, unsigned height, uint64_t frameIndex)
+{
+    if (width != g_nr.modelWidth || height != g_nr.modelHeight)
+    {
+        if (g_nr.modelWidth != 0)
+            g_nr.resetNext = true;
+        g_nr.modelWidth = width;
+        g_nr.modelHeight = height;
+        g_nr.modelSizeFrame = frameIndex;
+        return;
+    }
+    if (frameIndex != g_nr.modelSizeFrame + kModelSizeSettle ||
+        (width == g_nr.loggedModelWidth && height == g_nr.loggedModelHeight))
+        return;
+    const bool whole = width == f.width && height == f.height;
+    if (whole && g_nr.loggedModelWidth == 0)
+        return;
+    g_nr.loggedModelWidth = width;
+    g_nr.loggedModelHeight = height;
+    if (whole)
+        Log("NR: ModelScale 100%%: the model works on the whole %ux%u frame", f.width, f.height);
+    else
+        Log("NR: ModelScale: the model works on %ux%u of the %ux%u frame (%.0f%% of its pixels)", width, height,
+            f.width, f.height, 100.0 * double(width) * double(height) / (double(f.width) * double(f.height)));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The pass's GPU time for the menu (NrStatus): timestamps where the pass begins, around the model and where the
+// pass ends, resolved into a readback slot that is looked at when the ring comes round to it again, kRing frames
+// later, long after the GPU has run the frame. Only while the menu keeps asking.
+
+bool TimingWanted() { return LogClock() - g_nr.timingAskedAt.load(std::memory_order_relaxed) < kTimingHold; }
+
+// The query heap and the readback ring, and the ticks' frequency: the queue's, so a queue of the list's own type,
+// made only to ask. Once; should any of it fail, there is no GPU time to show.
+bool EnsureTiming(ID3D12GraphicsCommandList* list)
+{
+    if (g_nr.queries != nullptr)
+        return true;
+    if (g_nr.timingFailed)
+        return false;
+    g_nr.timingFailed = true; // until everything below is in place
+    const D3D12_COMMAND_LIST_TYPE type = list->GetType();
+    UINT64 frequency = 0;
+    if (type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE)
+    {
+        D3D12_COMMAND_QUEUE_DESC desc = {};
+        desc.Type = type;
+        ID3D12CommandQueue* queue = nullptr;
+        if (SUCCEEDED(g_nr.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))))
+        {
+            if (FAILED(queue->GetTimestampFrequency(&frequency)))
+                frequency = 0;
+            queue->Release();
+        }
+    }
+    if (frequency == 0)
+    {
+        Log("NR: no timestamp frequency for the game's command list (type %d); the menu shows no GPU time", int(type));
+        return false;
+    }
+    D3D12_QUERY_HEAP_DESC heap = {};
+    heap.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heap.Count = kRing * kTimestamps;
+    const HRESULT hr = g_nr.device->CreateQueryHeap(&heap, IID_PPV_ARGS(&g_nr.queries));
+    if (FAILED(hr))
+    {
+        g_nr.queries = nullptr;
+        Log("NR: CreateQueryHeap failed 0x%08lX; the menu shows no GPU time", static_cast<unsigned long>(hr));
+        return false;
+    }
+    if (!MakeBuffer(&g_nr.timingReadback, D3D12_HEAP_TYPE_READBACK, uint64_t(kRing) * kTimestamps * 8,
+                    "timing readback"))
+    {
+        g_nr.queries->Release();
+        g_nr.queries = nullptr;
+        return false;
+    }
+    g_nr.ticksPerMs = double(frequency) / 1000.0;
+    g_nr.timingFailed = false;
+    return true;
+}
+
+float Median(const float* values, unsigned count)
+{
+    float sorted[kTimingSamples];
+    for (unsigned i = 0; i < count; ++i)
+    {
+        unsigned j = i;
+        for (; j > 0 && sorted[j - 1] > values[i]; --j)
+            sorted[j] = sorted[j - 1];
+        sorted[j] = values[i];
+    }
+    return count != 0 ? sorted[count / 2] : 0.0f;
+}
+
+// The timestamps a frame kRing back left in `slot`, into the medians the menu is shown. The ticks only ever grow, so
+// a slot whose first is not past the last frame measured has not been written yet (or is torn), and is passed over.
+void CollectTiming(unsigned slot)
+{
+    if (!g_nr.timed[slot])
+        return;
+    g_nr.timed[slot] = false;
+    uint64_t t[kTimestamps];
+    memcpy(t, g_nr.timingReadback.mapped + uint64_t(slot) * kTimestamps * 8, sizeof t);
+    if (t[0] <= g_nr.lastTick || t[1] < t[0] || t[2] < t[1] || t[3] < t[2])
+        return;
+    const double pass = double(t[3] - t[0]) / g_nr.ticksPerMs;
+    if (pass > 1000.0)
+        return;
+    g_nr.lastTick = t[3];
+    g_nr.passSamples[g_nr.nextSample] = float(pass);
+    g_nr.modelSamples[g_nr.nextSample] = float(double(t[2] - t[1]) / g_nr.ticksPerMs);
+    g_nr.nextSample = (g_nr.nextSample + 1) % kTimingSamples;
+    if (g_nr.samples < kTimingSamples)
+        ++g_nr.samples;
+    g_nr.passMs = Median(g_nr.passSamples, g_nr.samples);
+    g_nr.modelMs = Median(g_nr.modelSamples, g_nr.samples);
+}
+
+// The menu stopped asking: what was measured goes, so that it starts afresh next time.
+void StopTiming()
+{
+    if (g_nr.samples == 0 && g_nr.nextSample == 0)
+    {
+        bool any = false;
+        for (bool t : g_nr.timed)
+            any |= t;
+        if (!any)
+            return;
+    }
+    for (bool& t : g_nr.timed)
+        t = false;
+    g_nr.samples = 0;
+    g_nr.nextSample = 0;
+    g_nr.passMs = 0.0f;
+    g_nr.modelMs = 0.0f;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // The frame.
 
 void Transition(D3D12_RESOURCE_BARRIER* barrier, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
@@ -1631,6 +1883,24 @@ void WriteBufferUav(unsigned slot, const Buffer* buffer)
                                            CpuHandle(slot));
 }
 
+// One slot of a descriptor table: a texture and the format to view it with; null where the pass reads nothing.
+struct View
+{
+    ID3D12Resource* resource;
+    DXGI_FORMAT format;
+};
+
+// A table of nr.hlsl or nr_stats.hlsl (nr_shared.h): the seven SRVs, the texture in u0, the buffer in u1, nothing in
+// u2.
+void WriteTable(unsigned table, const View (&srvs)[kSrvs], View target, const Buffer* buffer)
+{
+    for (unsigned i = 0; i < kSrvs; ++i)
+        WriteSrv(table + i, srvs[i].resource, srvs[i].format);
+    WriteTextureUav(table + kUav0, target.resource, target.format);
+    WriteBufferUav(table + kUav1, buffer);
+    WriteTextureUav(table + kUav2, nullptr, DXGI_FORMAT_UNKNOWN);
+}
+
 void Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline, unsigned table,
               const NrConstants& constants, unsigned groupsX, unsigned groupsY)
 {
@@ -1689,28 +1959,30 @@ void Clone(ID3D12GraphicsCommandList* list, ID3D12Resource* source, unsigned bas
     list->ResourceBarrier(2, barriers);
 }
 
-// The evaluation keys. Every value every frame: a shared block would otherwise keep stale ones.
-void FillEvaluate(NVSDK_NGX_Parameter* p, const Frame& f, ID3D12Resource* depth, unsigned depthBaseX,
-                  unsigned depthBaseY, ID3D12Resource* motion, unsigned motionBaseX, unsigned motionBaseY,
-                  unsigned reset)
+// The evaluation keys. Every value every frame: a shared block would otherwise keep stale ones. The model's picture
+// is `modelWidth` x `modelHeight` at the top left of the proxy and of its output (ModelScale; the frame's size at
+// 100%); the depth and the motion vectors are the game's whatever its size, MVecScale included (nrprobe's T10).
+void FillEvaluate(NVSDK_NGX_Parameter* p, const Frame& f, unsigned modelWidth, unsigned modelHeight,
+                  ID3D12Resource* depth, unsigned depthBaseX, unsigned depthBaseY, ID3D12Resource* motion,
+                  unsigned motionBaseX, unsigned motionBaseY, unsigned reset)
 {
     p->Set("DLSSNR.Color", g_nr.proxy.resource);
     p->Set("DLSSNR.Depth", depth);
     p->Set("DLSSNR.MVec", motion);
     p->Set("DLSSNR.Output", g_nr.modelOutput.resource);
     p->Set("DLSSNR.Enabled", 1u);
-    p->Set("DLSSNR.Width", f.width);
-    p->Set("DLSSNR.Height", f.height);
+    p->Set("DLSSNR.Width", modelWidth);
+    p->Set("DLSSNR.Height", modelHeight);
     p->Set("DLSSNR.DepthInverted", f.depthInverted ? 1u : 0u);
     p->Set("DLSSNR.Reset", reset);
     p->Set("DLSSNR.ColorSubrectBaseX", 0u);
     p->Set("DLSSNR.ColorSubrectBaseY", 0u);
-    p->Set("DLSSNR.ColorSubrectWidth", f.width);
-    p->Set("DLSSNR.ColorSubrectHeight", f.height);
+    p->Set("DLSSNR.ColorSubrectWidth", modelWidth);
+    p->Set("DLSSNR.ColorSubrectHeight", modelHeight);
     p->Set("DLSSNR.OutputSubrectBaseX", 0u);
     p->Set("DLSSNR.OutputSubrectBaseY", 0u);
-    p->Set("DLSSNR.OutputSubrectWidth", f.width);
-    p->Set("DLSSNR.OutputSubrectHeight", f.height);
+    p->Set("DLSSNR.OutputSubrectWidth", modelWidth);
+    p->Set("DLSSNR.OutputSubrectHeight", modelHeight);
     p->Set("DLSSNR.DepthSubrectBaseX", depthBaseX);
     p->Set("DLSSNR.DepthSubrectBaseY", depthBaseY);
     p->Set("DLSSNR.DepthSubrectWidth", f.guideWidth);
@@ -1775,12 +2047,19 @@ WhiteSource Source(const Frame& f, const Settings& s, bool meter)
 }
 
 // The constants all passes of a frame share (the passes then set mode, part and the picture size): the encode's
-// white point and shoulder, the composite's strengths, and where the calibration card goes.
-NrConstants FrameConstants(const Frame& f, const Settings& s, WhiteSource source, uint64_t frameIndex)
+// white point and shoulder, the composite's strengths, where the calibration card goes, and the model's picture.
+NrConstants FrameConstants(const Frame& f, const Settings& s, WhiteSource source, uint64_t frameIndex,
+                           unsigned modelWidth, unsigned modelHeight)
 {
     NrConstants c = {};
     c.width = f.width;
     c.height = f.height;
+    c.modelWidth = modelWidth;
+    c.modelHeight = modelHeight;
+    c.stepX = float(f.width) / float(modelWidth);
+    c.stepY = float(f.height) / float(modelHeight);
+    if (modelWidth != f.width || modelHeight != f.height)
+        c.flags |= NR_FLAG_SCALED;
     c.baseX = f.baseX;
     c.baseY = f.baseY;
     c.frame = uint32_t(frameIndex + 1);
@@ -1849,6 +2128,8 @@ FrameInfo Info(const Frame& f, const Settings& s, WhiteSource source, const NrCo
     info.feature = feature;
     info.width = f.width;
     info.height = f.height;
+    info.modelWidth = c.modelWidth;
+    info.modelHeight = c.modelHeight;
     info.format = f.outputDesc.Format;
     info.flags = c.flags;
     info.havePreExposure = f.havePreExposure;
@@ -1888,13 +2169,38 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const unsigned meterTable = base + 4 * kTable;
     const unsigned dilateTable = base + 5 * kTable;
     const unsigned skyTable = base + 6 * kTable;
+    const unsigned fitTable = base + 7 * kTable;
     const DXGI_FORMAT outputView = ViewFormat(f.outputDesc.Format);
+
+    // The GPU time while the menu asks: this frame's timestamps go where the frame kRing back left its own, which are
+    // looked at first.
+    const unsigned timingSlot = unsigned(frameIndex % kRing);
+    const bool timing = TimingWanted() && EnsureTiming(list);
+    if (timing)
+    {
+        CollectTiming(timingSlot);
+        list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps);
+    }
+    else
+        StopTiming();
+
+    // ModelScale: the model's picture this frame, and a new history when its size changes.
+    unsigned modelWidth = f.width, modelHeight = f.height;
+    ModelSize(f, s, &modelWidth, &modelHeight);
+    bool scaled = modelWidth != f.width || modelHeight != f.height;
+    if (scaled && !EnsureFit(f))
+    {
+        modelWidth = f.width;
+        modelHeight = f.height;
+        scaled = false;
+    }
+    NoteModelSize(f, modelWidth, modelHeight, frameIndex);
 
     // The scene meter runs on every linear HDR frame, whichever white point is in use, so that one switched to it
     // finds it settled already.
     const bool meter = LinearHdr(f, s) && EnsureMeter();
     const WhiteSource source = Source(f, s, meter);
-    NrConstants constants = FrameConstants(f, s, source, frameIndex);
+    NrConstants constants = FrameConstants(f, s, source, frameIndex, modelWidth, modelHeight);
     ID3D12Resource* exposure = nullptr;
     DXGI_FORMAT exposureView = DXGI_FORMAT_UNKNOWN;
     if (source == WhiteSource::Scene)
@@ -1947,70 +2253,57 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const bool showSky = (constants.flags & NR_FLAG_SHOW_SKY) != 0;
 
     // The descriptor tables (nr_shared.h has which pass reads which slot).
-    WriteSrv(encodeTable + 0, f.output, outputView);
-    WriteSrv(encodeTable + 1, nullptr, DXGI_FORMAT_UNKNOWN);
-    WriteSrv(encodeTable + 2, nullptr, DXGI_FORMAT_UNKNOWN);
-    WriteSrv(encodeTable + 3, exposure, exposureView);
-    WriteTextureUav(encodeTable + 4, g_nr.proxy.resource, g_nr.proxy.format);
-    WriteBufferUav(encodeTable + 5, stats ? &g_nr.stats : nullptr);
-    WriteSrv(compositeTable + 0, showSky ? f.depth : nullptr, depthView);
-    WriteSrv(compositeTable + 1, g_nr.modelOutput.resource, g_nr.modelOutput.format);
-    WriteSrv(compositeTable + 2, g_nr.proxy.resource, g_nr.proxy.format);
-    WriteSrv(compositeTable + 3, exposure, exposureView);
-    WriteTextureUav(compositeTable + 4, f.output, outputView);
-    WriteBufferUav(compositeTable + 5, stats ? &g_nr.stats : nullptr);
+    const View none = { nullptr, DXGI_FORMAT_UNKNOWN };
+    const View frameView = { f.output, outputView };
+    const View exposureV = { exposure, exposureView };
+    const View proxyV = { g_nr.proxy.resource, g_nr.proxy.format };
+    const View modelV = { g_nr.modelOutput.resource, g_nr.modelOutput.format };
+    const View depthV = { f.depth, depthView };
+    const Buffer* const statsBuffer = stats ? &g_nr.stats : nullptr;
+    WriteTable(encodeTable, { frameView, none, none, exposureV, none, none, none }, proxyV, statsBuffer);
+    if (scaled)
+    {
+        const View slopeV = { g_nr.slope.resource, g_nr.slope.format };
+        const View valueV = { g_nr.value.resource, g_nr.value.format };
+        const View rawV = { g_nr.raw.resource, g_nr.raw.format };
+        WriteTable(compositeTable, { showSky ? depthV : none, modelV, proxyV, exposureV, slopeV, valueV, rawV },
+                   frameView, statsBuffer);
+        // The fit's u1 is a texture, not the buffer.
+        for (unsigned i = 0; i < kSrvs; ++i)
+        {
+            const View v = i == 1 ? modelV : i == 2 ? proxyV : none;
+            WriteSrv(fitTable + i, v.resource, v.format);
+        }
+        WriteTextureUav(fitTable + kUav0, g_nr.slope.resource, g_nr.slope.format);
+        WriteTextureUav(fitTable + kUav1, g_nr.value.resource, g_nr.value.format);
+        WriteTextureUav(fitTable + kUav2, g_nr.raw.resource, g_nr.raw.format);
+    }
+    else
+        WriteTable(compositeTable, { showSky ? depthV : none, modelV, proxyV, exposureV, none, none, none }, frameView,
+                   statsBuffer);
     if (dumpDue)
-    {
-        WriteSrv(dumpTable + 0, f.output, outputView);
-        WriteSrv(dumpTable + 1, g_nr.modelOutput.resource, g_nr.modelOutput.format);
-        WriteSrv(dumpTable + 2, g_nr.proxy.resource, g_nr.proxy.format);
-        WriteSrv(dumpTable + 3, exposure, exposureView);
-        WriteTextureUav(dumpTable + 4, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteBufferUav(dumpTable + 5, &g_nr.dump);
-    }
+        WriteTable(dumpTable, { frameView, modelV, proxyV, exposureV, none, none, none }, none, &g_nr.dump);
     if (preview)
-    {
-        WriteSrv(previewTable + 0, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteSrv(previewTable + 1, g_nr.modelOutput.resource, g_nr.modelOutput.format);
-        WriteSrv(previewTable + 2, g_nr.proxy.resource, g_nr.proxy.format);
-        WriteSrv(previewTable + 3, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteTextureUav(previewTable + 4, g_nr.preview.resource, g_nr.preview.format);
-        WriteBufferUav(previewTable + 5, nullptr);
-    }
+        WriteTable(previewTable, { none, modelV, proxyV, none, none, none, none },
+                   { g_nr.preview.resource, g_nr.preview.format }, nullptr);
     if (meter)
-    {
-        WriteSrv(meterTable + 0, f.output, outputView);
-        WriteSrv(meterTable + 1, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteSrv(meterTable + 2, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteSrv(meterTable + 3, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteTextureUav(meterTable + 4, g_nr.scene.resource, DXGI_FORMAT_R32_FLOAT);
-        WriteBufferUav(meterTable + 5, &g_nr.meter);
-    }
+        WriteTable(meterTable, { frameView, none, none, none, none, none, none },
+                   { g_nr.scene.resource, DXGI_FORMAT_R32_FLOAT }, &g_nr.meter);
     if (dilate)
-    {
-        WriteSrv(dilateTable + 0, f.depth, depthView);
-        WriteSrv(dilateTable + 1, f.motion, motionView);
-        WriteSrv(dilateTable + 2, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteSrv(dilateTable + 3, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteTextureUav(dilateTable + 4, g_nr.dilated.resource, g_nr.dilated.format);
-        WriteBufferUav(dilateTable + 5, nullptr);
-    }
+        WriteTable(dilateTable, { depthV, { f.motion, motionView }, none, none, none, none, none },
+                   { g_nr.dilated.resource, g_nr.dilated.format }, nullptr);
     if (sky)
-    {
-        WriteSrv(skyTable + 0, f.depth, depthView);
-        WriteSrv(skyTable + 1, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteSrv(skyTable + 2, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteSrv(skyTable + 3, nullptr, DXGI_FORMAT_UNKNOWN);
-        WriteTextureUav(skyTable + 4, g_nr.mask.resource, g_nr.mask.format);
-        WriteBufferUav(skyTable + 5, nullptr);
-    }
+        WriteTable(skyTable, { depthV, none, none, none, none, none, none }, { g_nr.mask.resource, g_nr.mask.format },
+                   nullptr);
     const unsigned groupsX = Groups(f.width, 8);
     const unsigned groupsY = Groups(f.height, 8);
+    const unsigned modelX = Groups(modelWidth, 8); // the encode at the model's size, and the fit (8x8 texels a group)
+    const unsigned modelY = Groups(modelHeight, 8);
     const unsigned statsX = Groups(f.width, 32); // nr_stats.hlsl: 16x16 threads, 2x2 pixels each
     const unsigned statsY = Groups(f.height, 32);
 
     // 1-2: the scene meter, the encode, and the frame's statistics.
-    D3D12_RESOURCE_BARRIER barriers[8];
+    D3D12_RESOURCE_BARRIER barriers[12];
     unsigned count = 0;
     Transition(&barriers[count++], f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2053,7 +2346,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         list->ResourceBarrier(1, barriers);
     }
     constants.mode = NR_MODE_ENCODE;
-    Dispatch(list, g_nr.pipeline, encodeTable, constants, groupsX, groupsY);
+    Dispatch(list, g_nr.pipeline, encodeTable, constants, modelX, modelY);
     if (stats)
     {
         constants.mode = NR_STATS_INPUT;
@@ -2115,14 +2408,20 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     // 4: the model.
     const unsigned reset = g_nr.resetNext || f.reset != 0 ? 1u : 0u;
     g_nr.resetNext = false;
-    FillEvaluate(g_nr.evalParams, f, depth, depthBaseX, depthBaseY, motion, motionBaseX, motionBaseY, reset);
+    FillEvaluate(g_nr.evalParams, f, modelWidth, modelHeight, depth, depthBaseX, depthBaseY, motion, motionBaseX,
+                 motionBaseY, reset);
     FillMask(g_nr.evalParams, sky ? &g_nr.mask : nullptr);
     FillTunables(g_nr.evalParams, s.model);
+    if (timing)
+        list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 1);
     const int result = g_nr.bridge.evaluate(list, g_nr.handle, g_nr.evalParams, nullptr);
+    if (timing)
+        list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 2);
     const bool delivered = result == NVSDK_NGX_Result_Success;
     const bool dump = dumpDue && delivered;
+    const bool fit = scaled && delivered;
 
-    // 5: the model's output.
+    // 5: the model's output, and with ModelScale the fit over it.
     count = 0;
     Transition(&barriers[count++], g_nr.modelOutput.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2130,15 +2429,29 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         Transition(&barriers[count++], g_nr.dump.resource, D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->ResourceBarrier(count, barriers);
+    if (fit)
+    {
+        Dispatch(list, g_nr.fitPipeline, fitTable, constants, modelX, modelY);
+        Transition(&barriers[0], g_nr.slope.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Transition(&barriers[1], g_nr.value.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Transition(&barriers[2], g_nr.raw.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(3, barriers);
+    }
 
-    // 6: the composite, only if the model delivered. The statistics of its change and the dump's first half read
-    // the Output before it, while it is still in NPSR.
+    // 6: the composite, only if the model delivered. The statistics of its change (over the model's picture) and the
+    // dump's first half read the Output before it, while it is still in NPSR.
     if (delivered)
     {
         if (stats)
         {
-            constants.mode = NR_STATS_GAIN;
-            Dispatch(list, g_nr.statsPipeline, compositeTable, constants, statsX, statsY);
+            NrConstants c = constants;
+            c.mode = NR_STATS_GAIN;
+            c.width = modelWidth;
+            c.height = modelHeight;
+            Dispatch(list, g_nr.statsPipeline, compositeTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
         }
         if (dump)
             DumpPasses(list, dumpTable, constants, NR_MODE_DUMP_BEFORE, layout);
@@ -2246,7 +2559,23 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     if (sky)
         Transition(&barriers[count++], g_nr.mask.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (fit)
+    {
+        Transition(&barriers[count++], g_nr.slope.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(&barriers[count++], g_nr.value.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(&barriers[count++], g_nr.raw.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     list->ResourceBarrier(count, barriers);
+    if (timing)
+    {
+        list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 3);
+        list->ResolveQueryData(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps, kTimestamps,
+                               g_nr.timingReadback.resource, uint64_t(timingSlot) * kTimestamps * 8);
+        g_nr.timed[timingSlot] = true;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2368,6 +2697,8 @@ void LogSample(const Sample& sample)
     else
         add("; the model did not deliver this frame");
     add("; settings #%u", info.generation);
+    if ((info.flags & NR_FLAG_SCALED) != 0)
+        add("; ModelScale: model input %ux%u", info.modelWidth, info.modelHeight);
     Log("%s", line);
 }
 
@@ -2594,6 +2925,11 @@ void PublishStatus()
     g_status.sinceCreate = g_nr.evaluatesSeen - g_nr.createdAt;
     g_status.linear = g_nr.haveEncodeKey && (g_nr.encodeKey.inputType == InputType::LinearHdr ||
                                              (g_nr.encodeKey.inputType == InputType::Auto && g_status.hdr));
+    g_status.modelWidth = g_nr.modelWidth;
+    g_status.modelHeight = g_nr.modelHeight;
+    g_status.haveTiming = g_nr.samples != 0;
+    g_status.gpuMs = g_nr.passMs;
+    g_status.modelMs = g_nr.modelMs;
     ReleaseSRWLockExclusive(&g_statusLock);
 }
 
@@ -2752,8 +3088,9 @@ unsigned ReleaseEverything()
         }
         p = {};
     }
-    Texture* const textures[] = { &g_nr.proxy,   &g_nr.modelOutput, &g_nr.depthClone, &g_nr.motionClone,
-                                  &g_nr.preview, &g_nr.scene,       &g_nr.dilated,    &g_nr.mask };
+    Texture* const textures[] = { &g_nr.proxy, &g_nr.modelOutput, &g_nr.depthClone, &g_nr.motionClone, &g_nr.preview,
+                                  &g_nr.scene, &g_nr.dilated,     &g_nr.mask,       &g_nr.slope,       &g_nr.value,
+                                  &g_nr.raw };
     for (Texture* t : textures)
     {
         if (t->resource != nullptr)
@@ -2768,13 +3105,14 @@ unsigned ReleaseEverything()
     return released;
 }
 
-// The meter's, the statistics' and the dump's buffers. A dump the background thread is writing out keeps its
-// buffers: they are left allocated for the rest of the process rather than pulled from under it.
+// The meter's, the statistics', the timing's and the dump's buffers. A dump the background thread is writing out
+// keeps its buffers: they are left allocated for the rest of the process rather than pulled from under it.
 void ReleaseBuffers()
 {
     DropBuffer(&g_nr.meter);
     DropBuffer(&g_nr.stats);
     DropBuffer(&g_nr.statsReadback);
+    DropBuffer(&g_nr.timingReadback);
     g_nr.statsPending = false;
     int state = kDumpReady;
     g_nr.dumpState.compare_exchange_strong(state, kDumpIdle);
@@ -2813,8 +3151,10 @@ void NrBeforeCoreShutdown()
     if (!g_nr.off.load(std::memory_order_relaxed))
         Off("the game shut the NGX core down");
     ReleaseBuffers();
+    Drop(&g_nr.queries);
     Drop(&g_nr.pipeline);
     Drop(&g_nr.statsPipeline);
+    Drop(&g_nr.fitPipeline);
     Drop(&g_nr.rootSignature);
     Drop(&g_nr.heap);
     Drop(&g_nr.device);
@@ -2855,6 +3195,7 @@ size_t NrDescribe(char* out, size_t size)
 
 bool NrStatus(NrStatusState* out)
 {
+    g_nr.timingAskedAt.store(LogClock(), std::memory_order_relaxed);
     AcquireSRWLockShared(&g_statusLock);
     *out = g_status;
     ReleaseSRWLockShared(&g_statusLock);

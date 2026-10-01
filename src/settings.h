@@ -125,6 +125,10 @@ struct Settings
     float skyTone = 1.0f;      // SkyTone: Local tone on the sky, as a factor on LocalTone: 0 .. 2; 1 = as elsewhere
     float skyStructure = 1.0f; // SkyStructure: the same for Local structure
     bool showSky = false;      // ShowSky: stripes over what counts as sky (the menu will not store it)
+
+    // Speed: the menu's other experimental page.
+    float modelScale = 100.0f; // ModelScale: the model works on a copy of the frame this many percent of its size
+                               // on each side, its change brought back to the full frame: 50 .. 100; 100 = as before
 };
 
 // Reads the file (absent is fine: defaults), publishes the snapshot and logs what it read. Returns the snapshot.

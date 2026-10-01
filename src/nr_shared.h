@@ -1,30 +1,36 @@
 #pragma once
 
-// What the Neural Rendering shaders (nr.hlsl, nr_stats.hlsl) and the C++ side (nr_dx12.cpp) share, defined once so
-// the two cannot drift: HLSL includes this file from beside it, C++ includes it directly. The constants go to the
-// shaders as root constants (SetComputeRoot32BitConstants), so there is no constant buffer and no ring of them.
+// What the Neural Rendering shaders (nr.hlsl, nr_stats.hlsl, nr_fit.hlsl) and the C++ side (nr_dx12.cpp) share,
+// defined once so the two cannot drift: HLSL includes this file from beside it, C++ includes it directly. The
+// constants go to the shaders as root constants (SetComputeRoot32BitConstants), so there is no constant buffer and no
+// ring of them.
 //
-// Every dispatch sees the same descriptor table: t0-t3, then u0-u1. Which pass uses which slot:
+// Every dispatch sees the same descriptor table: t0-t6, then u0-u2. Which pass uses which slot:
 //
-//   pass              t0 frame   t1 model out  t2 proxy   t3 exposure   u0             u1 buffer
-//   meter             read       -             -          -             -              meter
-//   meter resolve     -          -             -          -             scene exposure meter
-//   encode            read       -             -          read          proxy          -
-//   composite         (depth)    read          read       read          game Output    -
-//   preview           -          read          read       -             preview        -
-//   dump (before)     read       read          read       read          -              dump
-//   dump (after)      read       -             -          -             -              dump
-//   stats clear       -          -             -          -             -              stats
-//   stats input       read       -             -          read          -              stats
-//   stats gain        -          read          read       -             -              stats
-//   dilate            depth      motion        -          -             dilated motion -
-//   sky               depth      -             -          -             control mask   -
+//   pass              t0 frame   t1 model out  t2 proxy   t3 exposure   t4-t6 fit   u0             u1 buffer   u2
+//   meter             read       -             -          -             -           -              meter       -
+//   meter resolve     -          -             -          -             -           scene exposure meter       -
+//   encode            read       -             -          read          -           proxy          -           -
+//   fit               -          read          read       -             -           slope          value       raw
+//   composite         (depth)    read          read       read          (read)      game Output    -           -
+//   preview           -          read          read       -             -           preview        -           -
+//   dump (before)     read       read          read       read          -           -              dump        -
+//   dump (after)      read       -             -          -             -           -              dump        -
+//   stats clear       -          -             -          -             -           -              stats       -
+//   stats input       read       -             -          read          -           -              stats       -
+//   stats gain        -          read          read       -             -           -              stats       -
+//   dilate            depth      motion        -          -             -           dilated motion -           -
+//   sky               depth      -             -          -             -           control mask   -           -
 //
 // "frame" is the game's Output, read through a shader resource view while it is in the NPSR state; the composite
 // reads and writes it through u0 instead, in place. "exposure" is the game's exposure texture, or with the scene
 // white point our own 1x1 texture that the meter's resolve pass writes. "depth" is the game's depth texture, read
 // through a view of its depth plane alone, "motion" its motion vectors, both in the NPSR state the game hands them
 // over in; the composite reads the depth only to stripe the sky (NR_FLAG_SHOW_SKY).
+//
+// The fit runs only when the model works on a smaller copy of the frame (NR_FLAG_SCALED, ModelScale below 100%):
+// nr_fit.hlsl writes three textures over the model's picture through u0-u2 (u1 is a texture there, not the buffer),
+// and the composite then reads them through t4-t6 (slope, value, raw) instead of the proxy and the model's output.
 
 #ifdef __cplusplus
 #include <cstdint>
@@ -62,6 +68,8 @@
 #define NR_FLAG_SCENE_RESET 0x40    // the scene white point jumps to this frame's instead of easing towards it
 #define NR_FLAG_DEPTH_INVERTED 0x80 // the game's depth is inverted (DLSS's DepthInverted): 1 nearest, 0 the far end
 #define NR_FLAG_SHOW_SKY 0x100      // the composite stripes what counts as sky (Show sky); t0 holds the depth
+#define NR_FLAG_SCALED 0x200        // the model works on a smaller copy of the frame (ModelScale): modelWidth x
+                                    // modelHeight at the top left of the proxy and of the model's output
 
 struct NrConstants
 {
@@ -105,10 +113,18 @@ struct NrConstants
     NR_UINT motionBaseY;
     NR_FLOAT skyTone;      // SkyTone: the control mask's .y on the sky, a factor on LocalTone
     NR_FLOAT skyStructure; // SkyStructure: its .z, a factor on LocalStructure
+
+    // ModelScale (NR_FLAG_SCALED): the size of the model's picture, and how many frame pixels one of its texels spans
+    // along each axis (width / modelWidth, height / modelHeight), worked out once on the CPU so that every pass
+    // maps between the two the same way. Without the flag: the frame's size, and 1.
+    NR_UINT modelWidth;
+    NR_UINT modelHeight;
+    NR_FLOAT stepX;
+    NR_FLOAT stepY;
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(NrConstants) == 128, "NrConstants is passed as root constants: 4-byte scalars, 16-byte multiple");
+static_assert(sizeof(NrConstants) == 144, "NrConstants is passed as root constants: 4-byte scalars, 16-byte multiple");
 #define NR_CONSTANTS_DWORDS (uint32_t(sizeof(NrConstants) / 4))
 #endif
 

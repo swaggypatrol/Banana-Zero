@@ -14,8 +14,9 @@
 //     lets go; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
 //     box unfreezes it, unticking the card undoes the freeze it made; skin structure takes no input until the auto
 //     mask is on; "all defaults"; the depth page: a sky slider away from 1 greys out the auto mask until it is back,
-//     the stripes and the dilation commit at once; closing the menu writes the file, and so does a second after a
-//     commit while it is open
+//     the stripes and the dilation commit at once; the speed page: the model's input size publishes at once, a
+//     right-click puts 100% back, the pass's model size and GPU time are drawn; closing the menu writes the file,
+//     and so does a second after a commit while it is open
 
 #include <windows.h>
 
@@ -248,6 +249,7 @@ void TestWrite()
     full.skyTone = 0.5f;
     full.skyStructure = 1.25f;
     full.showSky = true;
+    full.modelScale = 67.0f;
     unsigned long error = 0;
     Check(SettingsWriteIni(g_ini, full, &error), "write: SettingsWriteIni (error %lu)", error);
     loaded = SettingsLoad(g_ini);
@@ -263,6 +265,7 @@ void TestWrite()
     Check(loaded->dilateMotion == full.dilateMotion && Near(loaded->skyTone, full.skyTone, 1e-6f) &&
               Near(loaded->skyStructure, full.skyStructure, 1e-6f),
           "write: the depth page's keys read back the same");
+    Check(Near(loaded->modelScale, full.modelScale, 1e-6f), "write: the speed page's key reads back the same");
     Check(!loaded->showSky && !FileHas("ShowSky", 0.0), "write: the sky's stripes are never written");
     Check(loaded->enabled && Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog still 2, Enabled back to 1");
 }
@@ -554,6 +557,29 @@ void TestPanel()
           "panel: dilate by depth on, published at once");
     Check(Click("TabTune"), "panel: back to the tuning page");
 
+    // The speed page: the model's input size is a slider like the others, under it the size the pass gives the model
+    // and its time on the GPU, as the pass reports them.
+    const unsigned g4 = Generation();
+    g_fakeStatus.modelWidth = 2560;
+    g_fakeStatus.modelHeight = 1440;
+    g_fakeStatus.haveTiming = true;
+    g_fakeStatus.gpuMs = 4.1f;
+    g_fakeStatus.modelMs = 3.8f;
+    Check(!Centre("ModelScale", &x, &y), "panel: the model's input size waits on the speed page");
+    Check(Click("TabSpeed"), "panel: open the speed page");
+    Check(!Centre("DetailStrength", &x, &y), "panel: the tuning page is hidden now");
+    Check(Click("ModelScale", 0.1f), "panel: click the model's input size near its left end");
+    Check(Generation() == g4 + 1 && SettingsCurrent()->modelScale < 60.0f,
+          "panel: the click publishes the size under the mouse at once (%.0f%%, generation %u)",
+          double(SettingsCurrent()->modelScale), Generation());
+    Check(Click("ModelScale", 0.5f, 1) && Generation() == g4 + 2 && SettingsCurrent()->modelScale == 100.0f,
+          "panel: a right-click puts the model's input size back to 100%%");
+    Check(Click("ModelScale", 0.5f) && Generation() == g4 + 3 && Near(SettingsCurrent()->modelScale, 75.0f, 5.0f),
+          "panel: a click halfway along makes it about 75%% (%.0f%%)", double(SettingsCurrent()->modelScale));
+    g_fakeStatus.haveTiming = false;
+    Frame();
+    Check(Click("TabTune"), "panel: back to the tuning page");
+
     // Closing writes the file at once.
     {
         MenuLock();
@@ -569,6 +595,7 @@ void TestPanel()
     Check(FileHas("StatsLog = 0", 0.0), "panel: StatsLog still there");
     Check(FileHas("DilateMotion = 1", 0.0) && !FileHas("SkyStructure", 0.0) && !FileHas("ShowSky", 0.0),
           "panel: DilateMotion written; a sky slider back at 1 and the stripes not");
+    Check(FileHas("ModelScale = ", 0.0), "panel: ModelScale written");
 
     ImGui::DestroyContext();
 }

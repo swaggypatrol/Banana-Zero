@@ -3,12 +3,17 @@
 // screen's divider and the sky's stripes), the preview
 // picture, the frame dump, and what the game's depth adds to the model's inputs (motion vectors dilated by it, the
 // control mask that sets the sky apart). One shader; g.mode picks the pass. The statistics are in nr_stats.hlsl, the
-// formulas both use in nr_common.hlsli.
+// fit that brings a smaller model's change back to the frame's size (ModelScale) in nr_fit.hlsl, the formulas they
+// share in nr_common.hlsli.
 //
-// Precompiled: the build turns this file into nr_shader.h (array nr_cso). Commit the regenerated header with it.
+// Precompiled: the build turns this file into nr_shader.h (array nr_cso).
 
 #include "nr_common.hlsli"
 
+Texture2D<float4> gSlope : register(t4); // ModelScale: the fit's three textures (nr_fit.hlsl), the model's picture
+                                         // at their top left
+Texture2D<float4> gValue : register(t5);
+Texture2D<float4> gRaw : register(t6);
 RWTexture2D<float4> gTarget : register(u0); // encode: the proxy. composite: the game's Output. preview: the picture
 RWByteAddressBuffer gDump : register(u1);   // the frame dump
 
@@ -116,20 +121,107 @@ uint2 DepthTexel(uint2 p, uint2 size)
 
 // ---------------------------------------------------------------------------------------------------------------
 // The composite: the model's brightness change as a gain on the frame, its colour change added at the frame's
-// luminance. `frame` is the game's value, in its own units; the result is in the same units.
+// luminance. `frame` is the game's value, in its own units; the result is in the same units. `change` is the
+// brightness change in EV before DetailStrength and MaxGainEV (ModelGain), `chroma` the colour change (ModelChroma).
+
+float3 ApplyChange(float3 frame, float change, float3 chroma, bool linearHdr)
+{
+    const float gain = clamp(change * g.detail, -g.maxGain, g.maxGain);
+    const float3 c = linearHdr ? frame : SrgbDecode(saturate(frame));
+    const float3 scaled = c * exp2(gain);
+    float3 result = scaled + (g.detail * g.colour * dot(max(scaled, 0.0), kLuma)) * chroma;
+    // A colour change may not push a channel below zero, or further below than the frame itself had it; nothing may
+    // go above what the Output can store, unless the frame was already there.
+    result = clamp(result, min(scaled, 0.0), max(c, kMaxOutput));
+    return linearHdr ? result : SrgbEncode(saturate(result));
+}
 
 float3 Composite(float3 frame, float3 proxyEncoded, float3 modelEncoded, bool linearHdr)
 {
     const float3 p = ProxyLinear(proxyEncoded);
     const float3 o = ModelLinear(modelEncoded, proxyEncoded);
-    const float gain = clamp(ModelGain(p, o, linearHdr) * g.detail, -g.maxGain, g.maxGain);
-    const float3 c = linearHdr ? frame : SrgbDecode(saturate(frame));
-    const float3 scaled = c * exp2(gain);
-    float3 result = scaled + (g.detail * g.colour * dot(max(scaled, 0.0), kLuma)) * ModelChroma(p, o);
-    // A colour change may not push a channel below zero, or further below than the frame itself had it; nothing may
-    // go above what the Output can store, unless the frame was already there.
-    result = clamp(result, min(scaled, 0.0), max(c, kMaxOutput));
-    return linearHdr ? result : SrgbEncode(saturate(result));
+    return ApplyChange(frame, ModelGain(p, o, linearHdr), ModelChroma(p, o), linearHdr);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// ModelScale (NR_FLAG_SCALED): the model works on a smaller copy of the frame, modelWidth x modelHeight at the top left
+// of the proxy and of its output; each of its texels spans stepX x stepY frame pixels.
+
+// The light the model's input holds for a frame value, before sRGB (what ProxyLinear gives back): the white point and
+// the shoulder for linear HDR, the decoded value for a display-encoded frame. `frame` has the card in it already.
+float3 ProxyLight(float3 frame, float white, bool linearHdr)
+{
+    return linearHdr ? min(EncodeLinear(frame, white, g.shoulder), 1.0) : SrgbDecode(saturate(Clean(frame)));
+}
+
+// The model's input at texel q: the mean of that light over the frame pixels the texel spans, each weighted by how
+// much of it the texel covers, sRGB-encoded as the full-size encode stores it.
+float3 EncodeScaled(uint2 q, bool linearHdr)
+{
+    const float2 step = float2(g.stepX, g.stepY);
+    const float2 frameSize = float2(g.width, g.height);
+    const float2 lo = float2(q) * step;
+    const float2 hi = min(lo + step, frameSize);
+    const uint2 first = uint2(lo);
+    const uint2 end = min(uint2(ceil(hi)), uint2(g.width, g.height));
+    const float white = linearHdr ? WhitePoint() : 1.0;
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float weight = 0.0;
+    [loop] for (uint y = first.y; y < end.y; ++y)
+    {
+        const float wy = min(hi.y, float(y) + 1.0) - max(lo.y, float(y));
+        [loop] for (uint x = first.x; x < end.x; ++x)
+        {
+            const float w = wy * (min(hi.x, float(x) + 1.0) - max(lo.x, float(x)));
+            if (w <= 0.0)
+                continue;
+            const uint2 pixel = uint2(x, y);
+            float3 frame = gFrame.Load(int3(pixel + uint2(g.baseX, g.baseY), 0)).rgb;
+            if (linearHdr && InCard(pixel))
+                frame = Card(pixel) * white;
+            sum += w * ProxyLight(frame, white, linearHdr);
+            weight += w;
+        }
+    }
+    return SrgbEncode(weight > 0.0 ? min(sum / weight, 1.0) : float3(0.0, 0.0, 0.0));
+}
+
+// The model texel frame pixel q falls in; q itself while the model works at the frame's size.
+uint2 ModelTexel(uint2 q)
+{
+    if (!Scaled())
+        return q;
+    return min(uint2((float2(q) + 0.5) / float2(g.stepX, g.stepY)), uint2(g.modelWidth, g.modelHeight) - 1);
+}
+
+// The model's change at frame pixel id, whose own guide is `guide`: the fits (nr_fit.hlsl) of the four model texels
+// around the pixel's centre, blended bilinearly and applied to that guide, then held within the least and the most the
+// model itself changed at those four, so that no edge the frame has and the model's picture lacks can make more of a
+// change than the model made. False when the model changed nothing at any of the four: the pixel stays as it was.
+bool ScaledChange(uint2 id, float guide, out float change, out float3 chroma)
+{
+    const float2 last = float2(g.modelWidth, g.modelHeight) - 1.0;
+    const float2 u = clamp((float2(id) + 0.5) / float2(g.stepX, g.stepY) - 0.5, 0.0, last);
+    const uint2 q0 = uint2(u);
+    const uint2 q1 = min(q0 + 1, uint2(last));
+    const float2 f = u - float2(q0);
+    const uint2 taps[4] = { q0, uint2(q1.x, q0.y), uint2(q0.x, q1.y), q1 };
+    const float weights[4] = { (1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y };
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float3 low = float3(1.0e30, 1.0e30, 1.0e30), high = float3(-1.0e30, -1.0e30, -1.0e30);
+    [unroll] for (uint i = 0; i < 4; ++i)
+    {
+        const float3 slope = gSlope.Load(int3(taps[i], 0)).xyz;
+        const float4 value = gValue.Load(int3(taps[i], 0));
+        const float3 raw = gRaw.Load(int3(taps[i], 0)).xyz;
+        sum += weights[i] * (slope * (guide - value.w) + value.xyz);
+        low = min(low, raw);
+        high = max(high, raw);
+    }
+    const float3 held = clamp(sum, low, high);
+    change = held.x;
+    chroma = ChromaFromRedBlue(held.y, held.z);
+    return any(low != 0.0) || any(high != 0.0);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -192,12 +284,28 @@ float4 DumpRead(Texture2D<float4> source, uint2 id, uint2 base)
     return sum / float(NR_DUMP_SCALE * NR_DUMP_SCALE);
 }
 
-// The proxy for the dump, its alpha replaced by the zebra class (the largest in the square for the reduced picture).
+// The same for the model's output, which may be smaller than the frame (ModelScale): each frame pixel reads the
+// model texel it falls in.
+float4 DumpReadModel(uint2 id)
+{
+    if (g.part != 0)
+        return gModel.Load(int3(ModelTexel(id + CropOrigin()), 0));
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    [loop] for (uint y = 0; y < NR_DUMP_SCALE; ++y)
+    {
+        [loop] for (uint x = 0; x < NR_DUMP_SCALE; ++x)
+            sum += gModel.Load(int3(ModelTexel(id * NR_DUMP_SCALE + uint2(x, y)), 0));
+    }
+    return sum / float(NR_DUMP_SCALE * NR_DUMP_SCALE);
+}
+
+// The proxy for the dump, its alpha replaced by the zebra class (the largest in the square for the reduced picture),
+// read like the model's output.
 float4 DumpProxy(uint2 id, bool linearHdr)
 {
     if (g.part != 0)
     {
-        const float3 e = gProxy.Load(int3(id + CropOrigin(), 0)).rgb;
+        const float3 e = gProxy.Load(int3(ModelTexel(id + CropOrigin()), 0)).rgb;
         return float4(e, float(ZebraClass(e, linearHdr)));
     }
     float3 sum = float3(0.0, 0.0, 0.0);
@@ -206,7 +314,7 @@ float4 DumpProxy(uint2 id, bool linearHdr)
     {
         [loop] for (uint x = 0; x < NR_DUMP_SCALE; ++x)
         {
-            const float3 e = gProxy.Load(int3(id * NR_DUMP_SCALE + uint2(x, y), 0)).rgb;
+            const float3 e = gProxy.Load(int3(ModelTexel(id * NR_DUMP_SCALE + uint2(x, y)), 0)).rgb;
             sum += e;
             zebra = max(zebra, ZebraClass(e, linearHdr));
         }
@@ -266,7 +374,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         {
             DumpStore(0, id.xy, DumpRead(gFrame, id.xy, base));
             DumpStore(1, id.xy, DumpProxy(id.xy, linearHdr));
-            DumpStore(2, id.xy, DumpRead(gModel, id.xy, uint2(0, 0)));
+            DumpStore(2, id.xy, DumpReadModel(id.xy));
             if (g.part == 0 && all(id.xy == 0))
             {
                 const float exposure = (g.flags & NR_FLAG_EXPOSURE) != 0 ? gExposure.Load(int3(0, 0, 0)).x : 0.0;
@@ -293,7 +401,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         {
             [loop] for (uint x = 0; x < g.scale; ++x)
             {
-                const uint2 q = min(id.xy * g.scale + uint2(x, y), uint2(g.width - 1, g.height - 1));
+                const uint2 q = ModelTexel(min(id.xy * g.scale + uint2(x, y), uint2(g.width - 1, g.height - 1)));
                 const float3 e = saturate(showOutput ? gModel.Load(int3(q, 0)).rgb : gProxy.Load(int3(q, 0)).rgb);
                 sum += e;
                 if (zebra)
@@ -304,6 +412,15 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         if (marked != 0 && ((id.x + id.y) / 4) % 2 == 0)
             colour = marked == 2 ? float3(1.0, 0.15, 0.15) : float3(0.95, 0.3, 0.95);
         gTarget[id.xy] = float4(colour, 1.0);
+        return;
+    }
+
+    if (g.mode == NR_MODE_ENCODE && Scaled())
+    {
+        // The dispatch covers the model's picture.
+        if (id.x >= g.modelWidth || id.y >= g.modelHeight)
+            return;
+        gTarget[id.xy] = float4(EncodeScaled(id.xy, linearHdr), 1.0);
         return;
     }
 
@@ -348,15 +465,28 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         return;
     }
     // DetailStrength 0 leaves the pixel exactly as DLSS made it (it is not even written), and so do a model output
-    // identical to its input and a frame value that is not a number already.
+    // identical to its input (around the pixel, with ModelScale) and a frame value that is not a number already.
     if (!left && g.detail != 0.0 && all(isfinite(frame.rgb)))
     {
-        const float3 proxyEncoded = gProxy.Load(int3(id.xy, 0)).rgb;
-        const float3 modelEncoded = gModel.Load(int3(id.xy, 0)).rgb;
-        if (any(modelEncoded != proxyEncoded))
+        if (Scaled())
         {
-            result.rgb = Composite(frame.rgb, proxyEncoded, modelEncoded, linearHdr);
-            write = true;
+            float change;
+            float3 chroma;
+            if (ScaledChange(id.xy, Guide(ProxyLight(frame.rgb, white, linearHdr)), change, chroma))
+            {
+                result.rgb = ApplyChange(frame.rgb, change, chroma, linearHdr);
+                write = true;
+            }
+        }
+        else
+        {
+            const float3 proxyEncoded = gProxy.Load(int3(id.xy, 0)).rgb;
+            const float3 modelEncoded = gModel.Load(int3(id.xy, 0)).rgb;
+            if (any(modelEncoded != proxyEncoded))
+            {
+                result.rgb = Composite(frame.rgb, proxyEncoded, modelEncoded, linearHdr);
+                write = true;
+            }
         }
     }
 

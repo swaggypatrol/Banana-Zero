@@ -1,5 +1,6 @@
-// What nr.hlsl and nr_stats.hlsl both compute: the white point, the encode's shoulder and its inverse, sRGB, and the
-// brightness change the composite applies. One copy, so that the statistics measure exactly what the passes do.
+// What nr.hlsl, nr_stats.hlsl and nr_fit.hlsl all compute: the white point, the encode's shoulder and its inverse,
+// sRGB, the brightness and colour change the composite applies, and the guide that brings that change back to the
+// frame's size. One copy, so that the statistics and the fit measure exactly what the passes do.
 
 #include "nr_shared.h"
 
@@ -123,3 +124,13 @@ float3 ModelChroma(float3 p, float3 o)
     const float yo = dot(o, kLuma);
     return yp > kChromaFloor && yo > kChromaFloor ? o / yo - p / yp : float3(0.0, 0.0, 0.0);
 }
+
+// Both chromaticities have luminance 1, so the colour change has none: its red and blue say what its green is. The fit
+// (nr_fit.hlsl) carries those two, and the composite takes green from them.
+float3 ChromaFromRedBlue(float r, float b) { return float3(r, -(kLuma.r * r + kLuma.b * b) / kLuma.g, b); }
+
+// ModelScale (NR_FLAG_SCALED): the model works on a smaller copy of the frame, and the fit and the composite bring its
+// change back to the frame's size along a guide: the log2 luminance of the model's input in linear light, with the
+// gain's floor, so that an edge is a step in it as large as the eye sees it, in the darks as in the lights.
+bool Scaled() { return (g.flags & NR_FLAG_SCALED) != 0; }
+float Guide(float3 p) { return log2(dot(p, kLuma) + kGainFloor); }
