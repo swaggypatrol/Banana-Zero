@@ -4,7 +4,7 @@
 //
 //   build\Release\nrprobe.exe [--model <path\nvngx_dlssnr.dll>] [--size WxH] [--evaluates N] [--init N]
 //                             [--capability] [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first]
-//                             [--tuning] [--dumps <folder>]
+//                             [--tuning] [--dumps <folder>] [--subrects]
 //
 // It makes the same calls in the same order as dxgi.dll's NR pass (src/nr_dx12.cpp), one line of output per step,
 // and stops at the first step that fails: device, the driver's core and its Init, the bridge from beside this exe,
@@ -26,6 +26,11 @@
 // from dxgi.dll's own dumps (--dumps, else %LOCALAPPDATA%\Banana-Zero\dumps) how each setting moves its colour,
 // whether motion vectors dilated by depth help it along moving edges and thin bars, and whether a control mask sets
 // it per pixel. The exit code is then also 1 when one of its checks fails.
+//
+// --subrects measures what a smaller model input needs (Subrects9 and Subrects10, below: T9 and T10): whether the
+// model runs on smaller Color and Output subrects inside the feature the basic run made, what that costs, whether
+// its picture is a feature's of that size, and which motion-vector scale it wants when its picture is smaller than
+// the frame the motion vectors describe.
 //
 // dxgi.dll from the same folder is loaded too (this exe imports dxgi), so its dlssnr.log appears beside it; it sees
 // no SR/RR evaluation here and does nothing.
@@ -469,6 +474,7 @@ struct Options
     bool coreShutdown = true;
     bool nvapiFirst = false;
     bool tuning = false;
+    bool subrects = false;
     std::wstring dumps; // --tuning's T6: where the frame dumps are; empty: %LOCALAPPDATA%\Banana-Zero\dumps
 };
 
@@ -502,6 +508,8 @@ bool ParseOptions(int argc, wchar_t** argv, Options* options)
             options->nvapiFirst = true;
         else if (arg == L"--tuning")
             options->tuning = true;
+        else if (arg == L"--subrects")
+            options->subrects = true;
         else if (arg == L"--dumps" && hasValue)
             options->dumps = argv[++i];
         else
@@ -1669,6 +1677,322 @@ void Tuning8(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
         r->Release();
 }
 
+// --subrects: the model at a smaller input than the feature was created for, as dxgi.dll runs it when ModelScale is
+// below 100%: the Color and Output subrects shrink, the feature and its textures stay. The teardown says the model
+// sizes its network from the subrects at every evaluation (and ScalingRatio is held at 1), so a smaller subrect should
+// cost less without a new feature.
+//
+// T9: at 100%, 75%, 67% and 50% of the basic run's frame, inside the basic run's textures: whether the model takes
+// the subrect, whether it leaves the Output outside it alone, whether the picture is the one a feature created at
+// that size makes of the same pixels, and how long an evaluation takes (median, wall time from submit to fence).
+void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& base)
+{
+    constexpr unsigned kWarm = 5;
+    constexpr unsigned kTimed = 30;
+    const unsigned w = base.width, h = base.height;
+    const uint16_t sentinel[4] = { FloatToHalf(0.25f), FloatToHalf(0.5f), FloatToHalf(0.75f), FloatToHalf(1.0f) };
+    std::vector<uint16_t> fill(size_t(w) * h * 4);
+    for (size_t i = 0; i < size_t(w) * h; ++i)
+        std::memcpy(&fill[i * 4], sentinel, sizeof sentinel);
+    const Tunables defaults;
+    struct Size
+    {
+        const char* name;
+        unsigned num, den;
+    };
+    const Size sizes[] = { { "100%", 1, 1 }, { "75%", 3, 4 }, { "67%", 2, 3 }, { "50%", 1, 2 } };
+    double fullMs = 0.0;
+    Say("T9 subrects: the feature was created at %ux%u; each size runs %u evaluations from a Reset, the last %u timed",
+        w, h, kWarm + kTimed, kTimed);
+    for (const Size& size : sizes)
+    {
+        const unsigned sw = (w * size.num + size.den / 2) / size.den, sh = (h * size.num + size.den / 2) / size.den;
+        if (!UploadNow(base.output, fill.data(), w * 8, h, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        {
+            Note("T9 %s: could not fill the Output", size.name);
+            continue;
+        }
+        Inputs in = base;
+        in.width = sw;
+        in.height = sh;
+        std::vector<double> times;
+        double firstMs = 0.0; // the evaluation right after the change of size
+        bool ok = true;
+        for (unsigned i = 0; i < kWarm + kTimed && ok; ++i)
+        {
+            SetTunables(evalBlock, defaults);
+            SetInputs(evalBlock, in, i == 0 ? 1u : 0u);
+            const int r = m.evaluate(g.list, handle, evalBlock, nullptr);
+            const double ms = Submit("evaluate");
+            if (r != NVSDK_NGX_Result_Success || ms < 0.0)
+            {
+                Note("T9 %s (%ux%u in %ux%u): EvaluateFeature -> 0x%08X %s%s", size.name, sw, sh, w, h, unsigned(r),
+                     ResultName(r), ms < 0.0 ? ", GPU failed" : "");
+                ok = false;
+            }
+            else if (i == 0)
+                firstMs = ms;
+            else if (i >= kWarm)
+                times.push_back(ms);
+        }
+        if (!ok)
+            continue;
+        std::sort(times.begin(), times.end());
+        const double median = times[times.size() / 2];
+        if (size.num == size.den)
+            fullMs = median;
+
+        // The Output outside the subrect, and the picture inside it.
+        std::vector<uint8_t> raw;
+        unsigned pitch = 0;
+        unsigned long long outside = 0;
+        std::vector<float> inside(size_t(sw) * sh * 3);
+        if (Readback(base.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &raw, &pitch))
+        {
+            for (unsigned y = 0; y < h; ++y)
+            {
+                const auto* row = reinterpret_cast<const uint16_t*>(raw.data() + size_t(y) * pitch);
+                for (unsigned x = 0; x < w; ++x)
+                {
+                    if (x < sw && y < sh)
+                    {
+                        for (unsigned c = 0; c < 3; ++c)
+                            inside[(size_t(y) * sw + x) * 3 + c] = HalfToFloat(row[x * 4 + c]);
+                    }
+                    else if (std::memcmp(&row[x * 4], sentinel, sizeof sentinel) != 0)
+                        ++outside;
+                }
+            }
+        }
+        else
+        {
+            Note("T9 %s: could not read the Output back", size.name);
+            continue;
+        }
+
+        // The same pixels given to a feature created at the subrect's size.
+        double ownMs = 0.0, diff = -1.0;
+        if (size.num != size.den)
+        {
+            NVSDK_NGX_Parameter* ownBlock = nullptr;
+            void* own = CreateOwn(m, sw, sh, nullptr, &ownBlock);
+            ID3D12Resource* colour = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, sw, sh, D3D12_RESOURCE_FLAG_NONE,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12Resource* output = MakeOutput(sw, sh);
+            if (own != nullptr && colour != nullptr && output != nullptr)
+            {
+                Barrier(base.colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION from = {};
+                from.pResource = base.colour;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                D3D12_TEXTURE_COPY_LOCATION to = from;
+                to.pResource = colour;
+                const D3D12_BOX box = { 0, 0, 0, sw, sh, 1 };
+                g.list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+                Barrier(base.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(colour, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Inputs mine = in;
+                mine.colour = colour;
+                mine.output = output;
+                std::vector<double> ownTimes;
+                bool ownOk = Submit("copy") >= 0.0;
+                for (unsigned i = 0; i < kWarm + kTimed && ownOk; ++i)
+                {
+                    SetTunables(ownBlock, defaults);
+                    SetInputs(ownBlock, mine, i == 0 ? 1u : 0u);
+                    const int r = m.evaluate(g.list, own, ownBlock, nullptr);
+                    const double ms = Submit("evaluate");
+                    ownOk = r == NVSDK_NGX_Result_Success && ms >= 0.0;
+                    if (ownOk && i >= kWarm)
+                        ownTimes.push_back(ms);
+                }
+                std::vector<float> ownPicture;
+                if (ownOk && ReadRgb(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, sw, sh, &ownPicture))
+                {
+                    std::sort(ownTimes.begin(), ownTimes.end());
+                    ownMs = ownTimes[ownTimes.size() / 2];
+                    diff = Difference(inside, ownPicture);
+                }
+                else
+                    Note("T9 %s: the feature created at %ux%u did not run", size.name, sw, sh);
+            }
+            else
+                Note("T9 %s: no feature or textures at %ux%u to compare with", size.name, sw, sh);
+            if (own != nullptr)
+                m.release(own);
+            if (colour != nullptr)
+                colour->Release();
+            if (output != nullptr)
+                output->Release();
+        }
+        if (size.num == size.den)
+            Note("T9 %s (%ux%u): median %.2f ms, the first after the change %.2f ms", size.name, sw, sh, median,
+                 firstMs);
+        else
+            Note("T9 %s (%ux%u in %ux%u): accepted; median %.2f ms (%.0f%% of 100%%), the first after the change "
+                 "%.2f ms, a feature created at this size %.2f ms; %llu pixels outside the subrect changed; picture "
+                 "against that feature's: %.6f",
+                 size.name, sw, sh, w, h, median, fullMs > 0.0 ? 100.0 * median / fullMs : 0.0, firstMs, ownMs,
+                 outside, diff);
+    }
+    // The feature goes back to its whole frame for whatever runs next.
+    SetInputs(evalBlock, base, 1u);
+}
+
+// T10: T5 again with the picture at two thirds of the frame the motion vectors describe, as the games' motion vectors
+// will be with ModelScale at 67%: the motion vectors a texture at 0.58 of the frame in UV units, MVecScale scanned as
+// f times the frame's width. If the model reads the motion against the motion vectors' own size, the games' f = 0.58
+// stays best; against the picture's size, f = 0.67 would be; against the size the feature was created at, f = 1.
+// Run both ways: inside the basic run's feature (a subrect, what dxgi.dll does) and on a feature created at that size.
+void Subrects10(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& base)
+{
+    constexpr unsigned kFrames = 16;
+    constexpr int kSpeed = 4; // pixels of the picture per frame: 6 of the frame
+    constexpr float kNoise = 0.06f;
+    const unsigned W = base.width, H = base.height;
+    const unsigned w = (W * 2 + 1) / 3, h = (H * 2 + 1) / 3;
+    const unsigned margin = w / 12;
+    if (w <= 2 * margin + 64 || h <= 2 * margin + 64)
+    {
+        Note("T10 skipped: the frame is too small");
+        return;
+    }
+    const unsigned mw = unsigned(std::lround(0.58 * W)), mh = unsigned(std::lround(0.58 * H));
+    std::vector<uint16_t> moving(size_t(mw) * mh * 2, FloatToHalf(0.0f));
+    for (size_t i = 0; i < size_t(mw) * mh; ++i)
+        moving[i * 2] = FloatToHalf(-float(kSpeed) / float(w));
+    ID3D12Resource* motion = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, mw, mh, moving.data(), mw * 4);
+    ID3D12Resource* bigColour = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, W, H, D3D12_RESOURCE_FLAG_NONE,
+                                            D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* smallColour = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, D3D12_RESOURCE_FLAG_NONE,
+                                              D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* smallOutput = MakeOutput(w, h);
+    NVSDK_NGX_Parameter* ownBlock = nullptr;
+    void* own = CreateOwn(m, w, h, nullptr, &ownBlock);
+    if (motion == nullptr || bigColour == nullptr || smallColour == nullptr || smallOutput == nullptr || own == nullptr)
+    {
+        Note("T10 skipped: could not make its textures or its feature at %ux%u", w, h);
+        for (ID3D12Resource* r : { motion, bigColour, smallColour, smallOutput })
+            if (r != nullptr)
+                r->Release();
+        if (own != nullptr)
+            m.release(own);
+        return;
+    }
+    D3D12_RESOURCE_STATES bigState = D3D12_RESOURCE_STATE_COPY_DEST, smallState = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    const unsigned pad = kSpeed * kFrames;
+    const unsigned cw = W + pad;
+    std::vector<float> card(size_t(cw) * H * 3);
+    for (unsigned y = 0; y < H; ++y)
+        for (unsigned x = 0; x < cw; ++x)
+            for (unsigned c = 0; c < 3; ++c)
+                card[(size_t(y) * cw + x) * 3 + c] = Card(int(x) - int(pad), int(y), c);
+    const Tunables defaults;
+
+    // One run: E over the last four frames, or a negative number when something failed. `inside`: the basic run's
+    // feature with a subrect; else the feature created at the picture's size.
+    auto run = [&](bool inside, float f, bool resetEach) -> double {
+        g_random = 0x9E3779B9u;
+        const unsigned tw = inside ? W : w, th = inside ? H : h; // the textures
+        ID3D12Resource* colour = inside ? bigColour : smallColour;
+        D3D12_RESOURCE_STATES& state = inside ? bigState : smallState;
+        Inputs in = base;
+        in.width = w;
+        in.height = h;
+        in.colour = colour;
+        in.output = inside ? base.output : smallOutput;
+        in.motion = motion;
+        in.motionWidth = mw;
+        in.motionHeight = mh;
+        in.mvScaleX = f * float(W);
+        in.mvScaleY = f * float(H);
+        void* feature = inside ? handle : own;
+        NVSDK_NGX_Parameter* block = inside ? evalBlock : ownBlock;
+        std::vector<uint16_t> frame(size_t(tw) * th * 4, FloatToHalf(0.0f));
+        std::vector<float> out;
+        double sum = 0.0;
+        unsigned counted = 0;
+        for (unsigned t = 0; t < kFrames; ++t)
+        {
+            const unsigned offset = pad - unsigned(kSpeed) * t;
+            for (unsigned y = 0; y < h; ++y)
+            {
+                const float* row = &card[(size_t(y) * cw + offset) * 3];
+                uint16_t* to = &frame[size_t(y) * tw * 4];
+                for (unsigned x = 0; x < w; ++x)
+                {
+                    for (unsigned c = 0; c < 3; ++c)
+                        to[x * 4 + c] = FloatToHalf(row[x * 3 + c] + kNoise * Noise());
+                    to[x * 4 + 3] = FloatToHalf(1.0f);
+                }
+            }
+            if (!UploadNow(colour, frame.data(), tw * 8, th, state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+                return -1.0;
+            state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            SetTunables(block, defaults);
+            if (!EvaluateOnce(m, feature, block, in, t == 0 || resetEach ? 1u : 0u))
+                return -1.0;
+            if (t + 4 < kFrames)
+                continue;
+            if (!ReadRgb(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, w, h, &out))
+                return -1.0;
+            double e = 0.0;
+            size_t n = 0;
+            for (unsigned y = margin; y + margin < h; ++y)
+            {
+                const float* clean = &card[(size_t(y) * cw + offset) * 3];
+                for (unsigned x = margin; x + margin < w; ++x)
+                {
+                    for (unsigned c = 0; c < 3; ++c)
+                    {
+                        const double d = std::fabs(double(out[(size_t(y) * w + x) * 3 + c]) - double(clean[x * 3 + c]));
+                        e += d == d ? d : 1.0;
+                        ++n;
+                    }
+                }
+            }
+            sum += e / double(n);
+            ++counted;
+        }
+        return counted != 0 ? sum / double(counted) : -1.0;
+    };
+
+    Say("T10 motion vectors at a smaller picture: the picture %ux%u of a %ux%u frame scrolls %d px a frame, motion "
+        "vectors %ux%u in UV units, MVecScale = f x the frame's size",
+        w, h, W, H, kSpeed, mw, mh);
+    const float factors[] = { 0.39f, 0.5f, 0.58f, 0.67f, 0.79f, 1.0f };
+    for (int way = 0; way < 2; ++way)
+    {
+        const bool inside = way == 0;
+        const char* name = inside ? "inside the feature (subrect)" : "a feature created at the picture's size";
+        const double eReset = run(inside, 0.58f, true);
+        double e[6] = {};
+        int best = -1;
+        for (int i = 0; i < 6; ++i)
+        {
+            e[i] = run(inside, factors[i], false);
+            if (e[i] >= 0.0 && (best < 0 || e[i] < e[best]))
+                best = i;
+        }
+        Note("T10 %s: no history E %.5f; f 0.39 %.5f, 0.50 %.5f, 0.58 %.5f (the games'), 0.67 %.5f (the picture's "
+             "share), 0.79 %.5f, 1.00 %.5f (the frame's)",
+             name, eReset, e[0], e[1], e[2], e[3], e[4], e[5]);
+        if (best < 0 || eReset < 0.0)
+            Note("T10 %s verdict: runs failed (above)", name);
+        else if (eReset - e[best] <= 1.0e-3)
+            Note("T10 %s verdict: inconclusive, history barely helps (%.5f)", name, eReset - e[best]);
+        else
+            Note("T10 %s verdict: best f = %.2f%s", name, double(factors[best]),
+                 best == 2 ? ": the games' motion vectors line up as they are" : ": NOT the games' scale, look closer");
+    }
+    for (ID3D12Resource* r : { motion, bigColour, smallColour, smallOutput })
+        r->Release();
+    m.release(own);
+    SetInputs(evalBlock, base, 1u);
+}
+
 // The --tuning checks, on the feature the basic run made (`handle`, with its evaluation block `evalBlock`, which has
 // never held a tunable), over the basic run's frame (`in`). Every run starts from Reset and evaluates its frame
 // kFrames times; outputs are compared as the mean absolute difference per channel. "Same" is within four times
@@ -1905,7 +2229,7 @@ int wmain(int argc, wchar_t** argv)
     if (!ParseOptions(argc, argv, &options))
         return Fail("usage: nrprobe [--model <path>] [--size WxH] [--evaluates N] [--init N] [--capability]\n"
                     "               [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first] [--tuning]\n"
-                    "               [--dumps <folder>]");
+                    "               [--dumps <folder>] [--subrects]");
     if (options.model.empty())
     {
         const wchar_t* const known[] = { L"D:\\Program Files\\Epic Games\\TheWitcher3\\bin\\x64_dx12\\nvngx_dlssnr.dll",
@@ -2222,7 +2546,7 @@ int wmain(int argc, wchar_t** argv)
     else
         Say("output: could not be read back");
 
-    if (options.tuning && failures == 0)
+    if ((options.tuning || options.subrects) && failures == 0)
     {
         Model model;
         model.populate = bzPopulate;
@@ -2237,8 +2561,21 @@ int wmain(int argc, wchar_t** argv)
         basic.depth = depthTexture;
         basic.motion = motionTexture;
         basic.output = outputTexture;
-        Tuning(model, handle, evalBlock, basic, options.dumps);
-        Say("tuning: %d of the checks failed", g_mustFail);
+        if (options.tuning)
+        {
+            Tuning(model, handle, evalBlock, basic, options.dumps);
+            Say("tuning: %d of the checks failed", g_mustFail);
+        }
+        if (options.subrects)
+        {
+            if (model.allocate == nullptr)
+                Say("subrects: skipped, they need parameter blocks of our own (not --capability)");
+            else
+            {
+                Subrects9(model, handle, evalBlock, basic);
+                Subrects10(model, handle, evalBlock, basic);
+            }
+        }
     }
 
     const int released = bzRelease(handle);
