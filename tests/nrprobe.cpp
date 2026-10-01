@@ -21,10 +21,11 @@
 // FAIL) is printed before any shutdown; whether the process then exits cleanly is what its exit code shows.
 //
 // --tuning then measures, on the same feature, what the model does with its parameters and its motion vectors
-// (Tuning, below: T0 to T6): that its six parameters act when written at every evaluation and not when written only
-// at creation, the model's defaults, its clamps, which motion-vector scale it wants, and on Witcher 3 frames from
-// dxgi.dll's own dumps (--dumps, else %LOCALAPPDATA%\Banana-Zero\dumps) how each setting moves its colour. The
-// exit code is then also 1 when one of its checks fails.
+// (Tuning, below: T0 to T7): that its six parameters act when written at every evaluation and not when written only
+// at creation, the model's defaults, its clamps, which motion-vector scale it wants, on Witcher 3 frames from
+// dxgi.dll's own dumps (--dumps, else %LOCALAPPDATA%\Banana-Zero\dumps) how each setting moves its colour, and
+// whether motion vectors dilated by depth help it along a moving edge. The exit code is then also 1 when one of its
+// checks fails.
 //
 // dxgi.dll from the same folder is loaded too (this exe imports dxgi), so its dlssnr.log appears beside it; it sees
 // no SR/RR evaluation here and does nothing.
@@ -1189,6 +1190,264 @@ void Tuning6(const Model& m, const std::wstring& folderGiven)
     }
 }
 
+// The square T7 moves over the card: its own pattern, finer and brighter, so a smear of either into the other shows.
+float Square(int x, int y, unsigned c)
+{
+    const float stripes = (((x / 3) + (y / 3)) & 1) != 0 ? 0.08f : -0.08f;
+    const float wave =
+        0.18f * std::sin(float(x) * 0.37f + 1.3f * float(c)) * std::sin(float(y) * 0.29f - 0.7f * float(c));
+    return 0.55f + wave + stripes;
+}
+
+// T7: motion vectors dilated by depth. A square nearer than the card moves kSpeed pixels a frame to the right over
+// it, with fresh noise every frame. Depth and motion vectors come at 0.58 of the frame's size, as the games give
+// them, and a texel takes the square's motion and depth where its centre falls inside the square, so along the
+// square's edges some of its pixels get the card's motion (and the other way round) and the model pulls their
+// history from the wrong place. The DLL has a dilation of its own (each pixel takes the motion of the nearest of five
+// depth taps in a cross) but never hands it the depth (the teardown, and T4), so the probe dilates the same way on
+// the CPU and hands over the result. Runs: the vectors as the games give them; dilated; at the frame's own size, each
+// pixel with its own motion (the best there is); and Reset every frame (no history). E as in T5, over the last four
+// frames: within kBand pixels of the square's edges (on either side), inside the square, on the card away from it.
+void Tuning7(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& base)
+{
+    constexpr unsigned kFrames = 16;
+    constexpr unsigned kSpeed = 8;
+    constexpr float kNoise = 0.06f;
+    constexpr unsigned kSide = 320;
+    constexpr unsigned kBand = kSpeed; // a pixel can see the other side of the edge in its history this far from it
+    constexpr unsigned kMargin = 16;
+    constexpr float kNear = 0.2f, kFar = 0.9f; // DepthInverted 0: smaller is nearer
+    const unsigned w = base.width, h = base.height;
+    const unsigned left0 = w / 6, top = h > kSide ? (h - kSide) / 2 : 0;
+    if (left0 + kSide + kSpeed * kFrames + kBand + kMargin >= w || top < kBand + kMargin)
+    {
+        Note("T7 skipped: the frame is too small");
+        return;
+    }
+    const unsigned rw = unsigned(std::lround(0.58 * w)), rh = unsigned(std::lround(0.58 * h));
+    const uint16_t zero = FloatToHalf(0.0f), one = FloatToHalf(1.0f), moving = FloatToHalf(-float(kSpeed) / float(w));
+
+    // The card and the square's pattern once; the frames are cut from them.
+    std::vector<float> card(size_t(w) * h * 3), square(size_t(kSide) * kSide * 3);
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x)
+            for (unsigned c = 0; c < 3; ++c)
+                card[(size_t(y) * w + x) * 3 + c] = Card(int(x), int(y), c);
+    for (unsigned y = 0; y < kSide; ++y)
+        for (unsigned x = 0; x < kSide; ++x)
+            for (unsigned c = 0; c < 3; ++c)
+                square[(size_t(y) * kSide + x) * 3 + c] = Square(int(x), int(y), c);
+    auto clean = [&](unsigned x, unsigned y, unsigned left, unsigned c) {
+        return x >= left && x < left + kSide && y >= top && y < top + kSide
+                   ? square[(size_t(y - top) * kSide + (x - left)) * 3 + c]
+                   : card[(size_t(y) * w + x) * 3 + c];
+    };
+
+    // The guides of frame t at width gw x gh: texel (i, j) is the square's when its centre, in frame pixels, is
+    // inside the square. `dilate` then gives each texel the motion of the nearest of itself and its four neighbours.
+    std::vector<float> depthTexels;
+    std::vector<uint16_t> motionTexels, dilated;
+    auto guides = [&](unsigned t, unsigned gw, unsigned gh, bool dilate) {
+        const double left = double(left0 + kSpeed * t);
+        depthTexels.assign(size_t(gw) * gh, kFar);
+        motionTexels.assign(size_t(gw) * gh * 2, zero);
+        for (unsigned j = 0; j < gh; ++j)
+        {
+            const double cy = (j + 0.5) * double(h) / double(gh);
+            if (cy < double(top) || cy >= double(top + kSide))
+                continue;
+            for (unsigned i = 0; i < gw; ++i)
+            {
+                const double cx = (i + 0.5) * double(w) / double(gw);
+                if (cx >= left && cx < left + kSide)
+                {
+                    depthTexels[size_t(j) * gw + i] = kNear;
+                    motionTexels[(size_t(j) * gw + i) * 2] = moving;
+                }
+            }
+        }
+        if (!dilate)
+            return;
+        dilated = motionTexels;
+        for (unsigned j = 0; j < gh; ++j)
+        {
+            for (unsigned i = 0; i < gw; ++i)
+            {
+                size_t best = size_t(j) * gw + i;
+                const size_t taps[4] = { size_t(j) * gw + (i > 0 ? i - 1 : i),
+                                         size_t(j) * gw + (i + 1 < gw ? i + 1 : i), size_t(j > 0 ? j - 1 : j) * gw + i,
+                                         size_t(j + 1 < gh ? j + 1 : j) * gw + i };
+                for (size_t tap : taps)
+                    if (depthTexels[tap] < depthTexels[best])
+                        best = tap;
+                dilated[(size_t(j) * gw + i) * 2] = motionTexels[best * 2];
+                dilated[(size_t(j) * gw + i) * 2 + 1] = motionTexels[best * 2 + 1];
+            }
+        }
+        motionTexels.swap(dilated);
+    };
+
+    ID3D12Resource* colour =
+        MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    guides(0, rw, rh, false);
+    ID3D12Resource* depthLow = MakeFilled(DXGI_FORMAT_R32_FLOAT, rw, rh, depthTexels.data(), rw * 4);
+    ID3D12Resource* motionLow = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, rw, rh, motionTexels.data(), rw * 4);
+    guides(0, w, h, false);
+    ID3D12Resource* depthFull = MakeFilled(DXGI_FORMAT_R32_FLOAT, w, h, depthTexels.data(), w * 4);
+    ID3D12Resource* motionFull = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, w, h, motionTexels.data(), w * 4);
+    if (colour == nullptr || depthLow == nullptr || motionLow == nullptr || depthFull == nullptr ||
+        motionFull == nullptr)
+    {
+        Note("T7 skipped: could not make its textures");
+        for (ID3D12Resource* r : { colour, depthLow, motionLow, depthFull, motionFull })
+            if (r != nullptr)
+                r->Release();
+        return;
+    }
+    D3D12_RESOURCE_STATES colourState = D3D12_RESOURCE_STATE_COPY_DEST;
+    constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    std::vector<uint16_t> frame(size_t(w) * h * 4);
+    std::vector<float> out;
+    const Tunables defaults;
+
+    // One run: E per region over the last four frames; false when something failed.
+    struct Regions
+    {
+        double edges = 0.0, inside = 0.0, away = 0.0;
+    };
+    enum Guides
+    {
+        kGames,
+        kDilated,
+        kFull
+    };
+    auto run = [&](Guides which, bool resetEach, Regions* e) -> bool {
+        g_random = 0x9E3779B9u; // the same noise in every run
+        const bool full = which == kFull;
+        const unsigned gw = full ? w : rw, gh = full ? h : rh;
+        Inputs in = base;
+        in.colour = colour;
+        in.depth = full ? depthFull : depthLow;
+        in.motion = full ? motionFull : motionLow;
+        in.depthWidth = in.motionWidth = gw;
+        in.depthHeight = in.motionHeight = gh;
+        in.mvScaleX = float(gw); // the vectors are in UV units; the scale makes them texels, as the games give it
+        in.mvScaleY = float(gh);
+        in.depthInverted = 0;
+        Regions sum;
+        unsigned counted = 0;
+        for (unsigned t = 0; t < kFrames; ++t)
+        {
+            const unsigned left = left0 + kSpeed * t;
+            for (unsigned y = 0; y < h; ++y)
+            {
+                uint16_t* to = &frame[size_t(y) * w * 4];
+                for (unsigned x = 0; x < w; ++x)
+                {
+                    for (unsigned c = 0; c < 3; ++c)
+                        to[x * 4 + c] = FloatToHalf(clean(x, y, left, c) + kNoise * Noise());
+                    to[x * 4 + 3] = one;
+                }
+            }
+            guides(t, gw, gh, which == kDilated);
+            if (!UploadNow(colour, frame.data(), w * 8, h, colourState, kRead) ||
+                !UploadNow(in.depth, depthTexels.data(), gw * 4, gh, kRead, kRead) ||
+                !UploadNow(in.motion, motionTexels.data(), gw * 4, gh, kRead, kRead))
+                return false;
+            colourState = kRead;
+            SetTunables(evalBlock, defaults);
+            if (!EvaluateOnce(m, handle, evalBlock, in, t == 0 || resetEach ? 1u : 0u))
+                return false;
+            if (t + 4 < kFrames)
+                continue;
+            if (!ReadRgb(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, w, h, &out))
+                return false;
+            double edges = 0.0, inside = 0.0, away = 0.0;
+            size_t nEdges = 0, nInside = 0, nAway = 0;
+            for (unsigned y = kMargin; y + kMargin < h; ++y)
+            {
+                const bool rowNear = y + kBand >= top && y < top + kSide + kBand;
+                const bool rowDeep = y >= top + kBand && y + kBand < top + kSide;
+                for (unsigned x = kMargin; x + kMargin < w; ++x)
+                {
+                    const bool nearSquare = rowNear && x + kBand >= left && x < left + kSide + kBand;
+                    const bool deepInside = rowDeep && x >= left + kBand && x + kBand < left + kSide;
+                    double d = 0.0;
+                    for (unsigned c = 0; c < 3; ++c)
+                    {
+                        const double diff =
+                            std::fabs(double(out[(size_t(y) * w + x) * 3 + c]) - double(clean(x, y, left, c)));
+                        d += diff == diff ? diff : 1.0;
+                    }
+                    if (deepInside)
+                    {
+                        inside += d;
+                        nInside += 3;
+                    }
+                    else if (nearSquare)
+                    {
+                        edges += d;
+                        nEdges += 3;
+                    }
+                    else
+                    {
+                        away += d;
+                        nAway += 3;
+                    }
+                }
+            }
+            sum.edges += edges / double(nEdges);
+            sum.inside += inside / double(nInside);
+            sum.away += away / double(nAway);
+            ++counted;
+        }
+        e->edges = sum.edges / counted;
+        e->inside = sum.inside / counted;
+        e->away = sum.away / counted;
+        return true;
+    };
+
+    Say("T7 depth-dilated motion vectors: a %ux%u square moves %u px a frame over the card, noise +-%.2f, guides "
+        "%ux%u, %u frames a run; E within %u px of its edges | inside it | on the card away from it",
+        kSide, kSide, kSpeed, double(kNoise), rw, rh, kFrames, kBand);
+    Regions reset, games, dilatedE, perPixel;
+    const bool ok = run(kGames, true, &reset) && run(kGames, false, &games) && run(kDilated, false, &dilatedE) &&
+                    run(kFull, false, &perPixel);
+    for (ID3D12Resource* r : { colour, depthLow, motionLow, depthFull, motionFull })
+        r->Release();
+    if (!ok)
+    {
+        Note("T7 verdict: runs failed (above)");
+        return;
+    }
+    const struct
+    {
+        const char* name;
+        const Regions& e;
+    } rows[] = { { "no history (Reset every frame)", reset },
+                 { "the games' vectors (0.58 size)", games },
+                 { "the same, dilated by depth", dilatedE },
+                 { "per-pixel vectors (frame size)", perPixel } };
+    for (const auto& row : rows)
+        Note("T7 %-32s E %.5f | %.5f | %.5f", row.name, row.e.edges, row.e.inside, row.e.away);
+    const double possible = games.edges - perPixel.edges;
+    const double gain = games.edges - dilatedE.edges;
+    const double noticeable = 3.0e-4;
+    if (possible <= noticeable && gain <= noticeable)
+        Note("T7 verdict: along the edges per-pixel vectors barely beat the games' (%.5f): nothing for a dilation to "
+             "win here",
+             possible);
+    else if (gain >= noticeable && gain >= 0.25 * possible)
+        Note("T7 verdict: the dilation helps along the edges: E %.5f -> %.5f (%.0f%% of what per-pixel vectors gain)",
+             games.edges, dilatedE.edges, possible > 0.0 ? 100.0 * gain / possible : 100.0);
+    else if (gain <= -noticeable)
+        Note("T7 verdict: the dilation makes the edges worse: E %.5f -> %.5f", games.edges, dilatedE.edges);
+    else
+        Note("T7 verdict: the dilation makes no clear difference along the edges (E %.5f -> %.5f; per-pixel vectors "
+             "%.5f)",
+             games.edges, dilatedE.edges, perPixel.edges);
+}
+
 // The --tuning checks, on the feature the basic run made (`handle`, with its evaluation block `evalBlock`, which has
 // never held a tunable), over the basic run's frame (`in`). Every run starts from Reset and evaluates its frame
 // kFrames times; outputs are compared as the mean absolute difference per channel. "Same" is within four times
@@ -1200,6 +1459,7 @@ void Tuning6(const Model& m, const std::wstring& folderGiven)
 //   T4  depth: another depth, DepthInverted, no depth at all (informational: the model is said to ignore it)
 //   T5  motion vectors: the card scrolls, the scale is scanned; which scale the model wants (informational)
 //   T6  the model's colour on real Witcher 3 frames from dxgi.dll's dumps, per setting (informational)
+//   T7  motion vectors dilated by depth along a moving edge, against the games' own and per-pixel ones (informational)
 void Tuning(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const Inputs& in,
             const std::wstring& dumpFolder)
 {
@@ -1374,6 +1634,7 @@ void Tuning(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const 
 
     Tuning5(m, handle, evalBlock, in);
     Tuning6(m, dumpFolder);
+    Tuning7(m, handle, evalBlock, in);
 }
 } // namespace
 
