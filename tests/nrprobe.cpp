@@ -1744,14 +1744,14 @@ int wmain(int argc, wchar_t** argv)
         model.evaluate = bzEvaluate;
         model.release = bzRelease;
         model.allocate = own ? allocate : nullptr;
-        Inputs in;
-        in.width = in.depthWidth = in.motionWidth = w;
-        in.height = in.depthHeight = in.motionHeight = h;
-        in.colour = colourTexture;
-        in.depth = depthTexture;
-        in.motion = motionTexture;
-        in.output = outputTexture;
-        Tuning(model, handle, evalBlock, in, options.dumps);
+        Inputs basic; // the basic run's textures
+        basic.width = basic.depthWidth = basic.motionWidth = w;
+        basic.height = basic.depthHeight = basic.motionHeight = h;
+        basic.colour = colourTexture;
+        basic.depth = depthTexture;
+        basic.motion = motionTexture;
+        basic.output = outputTexture;
+        Tuning(model, handle, evalBlock, basic, options.dumps);
         Say("tuning: %d of the checks failed", g_mustFail);
     }
 
