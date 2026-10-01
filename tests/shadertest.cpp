@@ -1106,12 +1106,18 @@ Pixel ExpectedOutput(const Scene& s, const Setup& u, const std::vector<Pixel>& p
 // What the composite must leave in a texture pixel, and whether that is the game's own bits.
 using Expected = std::function<Pixel(UINT tx, UINT ty, bool* exact)>;
 
-// Compares a composite's Output with the CPU: untouched pixels bit for bit, the rest within two steps of the format.
-void CheckOutput(const Scene& s, const std::vector<uint8_t>& output, const Expected& expected, const char* what)
+// Compares a composite's Output with the CPU: untouched pixels bit for bit, the rest within two steps of the format,
+// or within `spread` times the pixel's largest channel. ModelScale needs that: there a channel is the sum of terms as
+// large as the pixel's largest, which the GPU's float maths and the CPU's can part on by a few millionths of that, and
+// where they nearly cancel (a colour change taking a small channel to almost nothing) two steps of what is left are
+// less than that.
+void CheckOutput(const Scene& s, const std::vector<uint8_t>& output, const Expected& expected, const char* what,
+                 float spread = 0.0f)
 {
     size_t bad = 0, changed = 0;
-    UINT firstX = 0, firstY = 0;
-    Pixel got, want;
+    UINT firstX = 0, firstY = 0, worstX = 0, worstY = 0;
+    Pixel got, want, worstGot, worstWant;
+    float worst = 0.0f; // the largest miss in a channel, over the pixel's largest channel
     for (UINT ty = 0; ty < s.textureHeight; ++ty)
     {
         for (UINT tx = 0; tx < s.textureWidth; ++tx)
@@ -1127,18 +1133,33 @@ void CheckOutput(const Scene& s, const std::vector<uint8_t>& output, const Expec
             else
             {
                 ++changed;
-                ok = ClosePixel(*s.format, o, e) && (s.format->bytes == 4 && s.format->linear ? true : o.a == e.a);
+                const float slack = spread * std::max({ std::fabs(e.r), std::fabs(e.g), std::fabs(e.b) });
+                auto within = [&](int c, float g, float w)
+                { return Close(*s.format, c, g, w) || std::fabs(g - w) <= slack; };
+                ok = within(0, o.r, e.r) && within(1, o.g, e.g) && within(2, o.b, e.b) &&
+                     (s.format->bytes == 4 && s.format->linear ? true : o.a == e.a);
             }
-            if (!ok && bad++ == 0)
-                firstX = tx, firstY = ty, got = o, want = e;
+            if (!ok)
+            {
+                if (bad++ == 0)
+                    firstX = tx, firstY = ty, got = o, want = e;
+                const float scale = std::max({ std::fabs(e.r), std::fabs(e.g), std::fabs(e.b), 1.0e-30f });
+                const float miss =
+                    std::max({ std::fabs(o.r - e.r), std::fabs(o.g - e.g), std::fabs(o.b - e.b) }) / scale;
+                if (!(miss <= worst)) // NaN counts as the worst
+                    worst = miss, worstX = tx, worstY = ty, worstGot = o, worstWant = e;
+            }
         }
     }
     if (bad == 0)
         Check(true, "composite, %s, %s: %zu pixels as the CPU formula, the other %zu bit for bit as they were",
               s.format->name, what, changed, size_t(s.textureWidth) * s.textureHeight - changed);
     else
-        Check(false, "composite, %s, %s: %zu pixels wrong; first (%u,%u) got %g %g %g %g, want %g %g %g %g",
-              s.format->name, what, bad, firstX, firstY, got.r, got.g, got.b, got.a, want.r, want.g, want.b, want.a);
+        Check(false,
+              "composite, %s, %s: %zu pixels wrong; first (%u,%u) got %g %g %g %g, want %g %g %g %g; worst "
+              "(%u,%u), off by %g of its largest channel: got %g %g %g, want %g %g %g",
+              s.format->name, what, bad, firstX, firstY, got.r, got.g, got.b, got.a, want.r, want.g, want.b, want.a,
+              worstX, worstY, worst, worstGot.r, worstGot.g, worstGot.b, worstWant.r, worstWant.g, worstWant.b);
 }
 
 void CheckComposite(const Scene& s, const Setup& u, const std::vector<Pixel>& proxy, const std::vector<Pixel>& model,
@@ -1152,11 +1173,25 @@ void CheckComposite(const Scene& s, const Setup& u, const std::vector<Pixel>& pr
 // The whole Output bit for bit as the game made it.
 void CheckUntouched(const Scene& s, const std::vector<uint8_t>& output, const char* what)
 {
-    size_t bad = 0;
+    size_t bad = 0, first = 0;
     for (size_t i = 0; i < s.texture.size(); ++i)
-        bad += std::memcmp(output.data() + i * s.format->bytes, s.bytes.data() + i * s.format->bytes, s.format->bytes) != 0;
-    Check(bad == 0, "composite, %s, %s: the Output is bit for bit the game's (%zu pixels differ)", s.format->name, what,
-          bad);
+    {
+        const size_t at = i * s.format->bytes;
+        if (std::memcmp(output.data() + at, s.bytes.data() + at, s.format->bytes) != 0 && bad++ == 0)
+            first = i;
+    }
+    if (bad == 0)
+        Check(true, "composite, %s, %s: the Output is bit for bit the game's (0 pixels differ)", s.format->name, what);
+    else
+    {
+        const Pixel o = Decode(*s.format, output.data() + first * s.format->bytes);
+        const Pixel& e = s.texture[first];
+        Check(false,
+              "composite, %s, %s: the Output is bit for bit the game's (%zu pixels differ; first (%zu,%zu) got "
+              "%g %g %g %g, was %g %g %g %g)",
+              s.format->name, what, bad, first % s.textureWidth, first / s.textureWidth, o.r, o.g, o.b, o.a, e.r, e.g,
+              e.b, e.a);
+    }
 }
 
 // The Output over the frame, in the game's units, for brightness ratios.
@@ -1762,6 +1797,11 @@ void CheckPreview(Scene& s, const Setup& u)
 
 const Pixel kSentinel = { 0.25f, 0.5f, 0.75f, 1.0f };
 
+// How far the scaled composite may part from the CPU's, beyond the format's own steps, as a share of the pixel's
+// largest channel (CheckOutput). The GPU takes the guide's log2 and the bilinear weights to a few millionths, and the
+// change follows the guide by slopes of up to a few.
+constexpr float kScaledSpread = 1.0f / 65536.0f;
+
 // The model's picture (mw x mh) out of a frame-sized texture's pixels, and back into one: the rest white, which a
 // pass reading beyond the picture would show as a change.
 std::vector<Pixel> Picture(const std::vector<Pixel>& texture, UINT width, UINT mw, UINT mh)
@@ -1906,10 +1946,14 @@ void CheckFit(const Setup& u, UINT width, UINT mw, UINT mh, const std::vector<Pi
     for (size_t i = 0; i < count; ++i)
     {
         const ref::F3 p = ref::ProxyLinear(Rgb(proxy[i]));
-        const ref::F3 o = ref::ModelLinear(Rgb(model[i]), Rgb(proxy[i]));
-        const ref::F3 chroma = ref::ModelChroma(p, o);
         guide[i] = ref::Guide(p);
-        target[i] = { ref::ModelGain(p, o, u.linear, u.knobs), chroma.r, chroma.b };
+        target[i] = { 0.0f, 0.0f, 0.0f }; // a texel the model returned as it got it changed nothing
+        if (model[i].r != proxy[i].r || model[i].g != proxy[i].g || model[i].b != proxy[i].b)
+        {
+            const ref::F3 o = ref::ModelLinear(Rgb(model[i]), Rgb(proxy[i]));
+            const ref::F3 chroma = ref::ModelChroma(p, o);
+            target[i] = { ref::ModelGain(p, o, u.linear, u.knobs), chroma.r, chroma.b };
+        }
     }
     auto at = [&](int x, int y) {
         return size_t(std::clamp(y, 0, int(mh) - 1)) * mw + size_t(std::clamp(x, 0, int(mw) - 1));
@@ -2142,8 +2186,9 @@ void TestScaled(Scene& s, const Setup& base, UINT mw, UINT mh)
     std::vector<uint8_t> output = RunScaled(s, u, Framed(s, brighter, mw, mh), &fit);
     CheckFit(u, s.width, mw, mh, proxy, brighter, fit, s.format->name, "model +0.5 EV");
     std::snprintf(what, sizeof what, "ModelScale %ux%u, model +0.5 EV", mw, mh);
-    CheckOutput(s, output, [&](UINT tx, UINT ty, bool* exact) { return ExpectedScaledOutput(s, u, fit, tx, ty, exact); },
-                what);
+    CheckOutput(
+        s, output, [&](UINT tx, UINT ty, bool* exact) { return ExpectedScaledOutput(s, u, fit, tx, ty, exact); }, what,
+        kScaledSpread);
     CheckScaledRatio(s, u, fit, output, 0.5f, what);
 
     // Brighter and warmer by the column, every third texel left as it was: edges in the model's change for the fit to
@@ -2163,8 +2208,9 @@ void TestScaled(Scene& s, const Setup& base, UINT mw, UINT mh)
     CheckFit(knobs, s.width, mw, mh, proxy, mixed, fit, s.format->name, "mixed model");
     std::snprintf(what, sizeof what, "ModelScale %ux%u, mixed model, %sColourStrength 1.5, DetailStrength 1.3", mw, mh,
                   u.linear ? "HighlightRestore 1, " : "");
-    CheckOutput(s, output,
-                [&](UINT tx, UINT ty, bool* exact) { return ExpectedScaledOutput(s, knobs, fit, tx, ty, exact); }, what);
+    CheckOutput(
+        s, output, [&](UINT tx, UINT ty, bool* exact) { return ExpectedScaledOutput(s, knobs, fit, tx, ty, exact); },
+        what, kScaledSpread);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
