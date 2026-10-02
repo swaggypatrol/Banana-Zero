@@ -4,7 +4,7 @@
 //
 //   build\Release\nrprobe.exe [--model <path\nvngx_dlssnr.dll>] [--size WxH] [--evaluates N] [--init N]
 //                             [--capability] [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first]
-//                             [--tuning] [--dumps <folder>] [--subrects]
+//                             [--tuning] [--dumps <folder>] [--subrects] [--captures <folder>]
 //
 // It makes the same calls in the same order as dxgi.dll's NR pass (src/nr_dx12.cpp), one line of output per step,
 // and stops at the first step that fails: device, the driver's core and its Init, the bridge from beside this exe,
@@ -32,6 +32,12 @@
 // its picture is a feature's of that size, and which motion-vector scale it wants when its picture is smaller than
 // the frame the motion vectors describe.
 //
+// --captures measures the Witcher 3 colour drift on the files of the capture build of dxgi.dll (Captures, below): per
+// capture, whether its frame, dump and finished picture agree, how the game's picture differs from our proxy, how
+// much bluer or warmer the model makes the picture given our proxy, the game's own picture, our proxy with the game's
+// tone curve, and our proxy with other exposures and settings, and what a colour lock would leave of that; then the
+// range of each across the captures, which is the drift.
+//
 // dxgi.dll from the same folder is loaded too (this exe imports dxgi), so its dlssnr.log appears beside it; it sees
 // no SR/RR evaluation here and does nothing.
 
@@ -47,6 +53,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -475,7 +483,8 @@ struct Options
     bool nvapiFirst = false;
     bool tuning = false;
     bool subrects = false;
-    std::wstring dumps; // --tuning's T6: where the frame dumps are; empty: %LOCALAPPDATA%\Banana-Zero\dumps
+    std::wstring dumps;    // --tuning's T6: where the frame dumps are; empty: %LOCALAPPDATA%\Banana-Zero\dumps
+    std::wstring captures; // --captures: the capture build's folder (debug on the desktop)
 };
 
 bool ParseOptions(int argc, wchar_t** argv, Options* options)
@@ -512,6 +521,8 @@ bool ParseOptions(int argc, wchar_t** argv, Options* options)
             options->subrects = true;
         else if (arg == L"--dumps" && hasValue)
             options->dumps = argv[++i];
+        else if (arg == L"--captures" && hasValue)
+            options->captures = argv[++i];
         else
             return false;
     }
@@ -767,48 +778,68 @@ struct Shift
     double warmShare = 0.0;
 };
 
-Shift ColourShift(const std::vector<float>& before, const std::vector<float>& after, unsigned width, unsigned y0,
-                  unsigned y1)
+// The sums behind a Shift, one pixel at a time, in linear light (decoded).
+struct ShiftSum
 {
-    double sumAll = 0.0, sumWarm = 0.0;
+    double all = 0.0, warm = 0.0;
     unsigned long long nAll = 0, nWarm = 0;
-    const double eps = 1.0e-3;
-    for (unsigned y = y0; y < y1; ++y)
+
+    void Add(double pr, double pg, double pb, double orr, double og, double ob)
     {
-        for (unsigned x = 0; x < width; ++x)
+        const double eps = 1.0e-3;
+        const double yp = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
+        const double pmax = pr > pg ? (pr > pb ? pr : pb) : (pg > pb ? pg : pb);
+        const double pmin = pr < pg ? (pr < pb ? pr : pb) : (pg < pb ? pg : pb);
+        const double omax = orr > og ? (orr > ob ? orr : ob) : (og > ob ? og : ob);
+        if (!(yp > 0.01) || pmax >= 0.97 || !(omax < 0.97) || !(orr >= 0.0) || !(ob >= 0.0))
+            return;
+        const double d = std::log2((ob + eps) / (orr + eps)) - std::log2((pb + eps) / (pr + eps));
+        all += d;
+        ++nAll;
+        if (pr > pg && pg > pb && (pmax - pmin) / pmax > 0.15)
         {
-            const size_t i = (size_t(y) * width + x) * 3;
-            const double pr = SrgbDecode(before[i]), pg = SrgbDecode(before[i + 1]), pb = SrgbDecode(before[i + 2]);
-            const double orr = SrgbDecode(after[i]), og = SrgbDecode(after[i + 1]), ob = SrgbDecode(after[i + 2]);
-            const double yp = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
-            const double pmax = pr > pg ? (pr > pb ? pr : pb) : (pg > pb ? pg : pb);
-            const double pmin = pr < pg ? (pr < pb ? pr : pb) : (pg < pb ? pg : pb);
-            const double omax = orr > og ? (orr > ob ? orr : ob) : (og > ob ? og : ob);
-            if (!(yp > 0.01) || pmax >= 0.97 || !(omax < 0.97) || !(orr >= 0.0) || !(ob >= 0.0))
-                continue;
-            const double d = std::log2((ob + eps) / (orr + eps)) - std::log2((pb + eps) / (pr + eps));
-            sumAll += d;
-            ++nAll;
-            if (pr > pg && pg > pb && (pmax - pmin) / pmax > 0.15)
-            {
-                sumWarm += d;
-                ++nWarm;
-            }
+            warm += d;
+            ++nWarm;
         }
     }
-    Shift s;
-    s.all = nAll != 0 ? sumAll / double(nAll) : 0.0;
-    s.warm = nWarm != 0 ? sumWarm / double(nWarm) : 0.0;
-    s.warmShare = nAll != 0 ? double(nWarm) / double(nAll) : 0.0;
-    return s;
+
+    Shift Result() const
+    {
+        Shift s;
+        s.all = nAll != 0 ? all / double(nAll) : 0.0;
+        s.warm = nWarm != 0 ? warm / double(nWarm) : 0.0;
+        s.warmShare = nAll != 0 ? double(nWarm) / double(nAll) : 0.0;
+        return s;
+    }
+};
+
+// `step` 2 looks at every other pixel of every other row: enough for a full-size frame.
+Shift ColourShift(const std::vector<float>& before, const std::vector<float>& after, unsigned width, unsigned y0,
+                  unsigned y1, unsigned step = 1)
+{
+    ShiftSum sum;
+    for (unsigned y = y0; y < y1; y += step)
+    {
+        for (unsigned x = 0; x < width; x += step)
+        {
+            const size_t i = (size_t(y) * width + x) * 3;
+            sum.Add(SrgbDecode(before[i]), SrgbDecode(before[i + 1]), SrgbDecode(before[i + 2]), SrgbDecode(after[i]),
+                    SrgbDecode(after[i + 1]), SrgbDecode(after[i + 2]));
+        }
+    }
+    return sum.Result();
 }
 
 // A frame dump from dxgi.dll (nr_dx12.cpp, DumpHeader; tools in the M4 docs read the same): the whole frame reduced
-// four times, as the model saw it (the proxy) and as it came back (the model's output), display-encoded RGB.
+// four times, as the game made it (linear for a linear HDR frame), as the model saw it (the proxy) and as it came
+// back (the model's output), the last two display-encoded RGB; the white point the proxy was made with (the block's
+// second word), the shoulder and the pass's flags.
 struct Dump
 {
     unsigned width = 0, height = 0;
-    std::vector<float> proxy, model;
+    std::vector<float> frame, proxy, model;
+    float white = 1.0f, shoulder = 0.7f;
+    uint32_t flags = 0;
 };
 
 bool ReadDump(const std::wstring& path, Dump* d)
@@ -837,9 +868,12 @@ bool ReadDump(const std::wstring& path, Dump* d)
     const uint8_t* block = data.data() + headerBytes;
     d->width = rw;
     d->height = rh;
-    for (int which = 1; which <= 2; ++which)
+    d->flags = word(64);
+    std::memcpy(&d->shoulder, data.data() + 100, 4);
+    std::memcpy(&d->white, block + 4, 4);
+    for (int which = 0; which <= 2; ++which)
     {
-        std::vector<float>& out = which == 1 ? d->proxy : d->model;
+        std::vector<float>& out = which == 0 ? d->frame : which == 1 ? d->proxy : d->model;
         out.resize(size_t(rw) * rh * 3);
         const uint8_t* picture = block + 64 + pictureBytes * unsigned(which);
         for (size_t i = 0; i < size_t(rw) * rh; ++i)
@@ -2185,6 +2219,1301 @@ void Tuning(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const 
     Tuning7(m, handle, evalBlock, in);
     Tuning8(m, handle, evalBlock, in, base, same, differs);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// --captures: the Witcher 3 colour drift, on the files of the capture build of dxgi.dll (a branch of its own, never
+// released). Every 30 s it writes three files side by side into a folder named debug on the desktop:
+// <game>-<date>-<time>.bzdump (the frame dump), .bzframe (the whole frame as DLSS made it, and what the model was
+// given besides its picture) and .bmp (the finished picture the game presented; the composite is skipped around the
+// capture, so it is the game's own). Per capture: whether the three agree; how the game's picture differs from our
+// proxy; how much bluer (+) or warmer (-) the model makes the picture given our proxy (as in the game), the game's own
+// picture, our proxy with the game's tone curve, and our proxy at other exposures and with other settings; and what a
+// colour lock on our side would leave of it. Then the same over all the captures: the drift is how differently the
+// model colours one view and the next, so what tells is the range of its change across them.
+
+constexpr uint32_t kDumpLinearHdr = 0x01; // the dump's flags: nr_shared.h, NR_FLAG_LINEAR_HDR
+constexpr unsigned kRgba16f = 10;         // DXGI_FORMAT_R16G16B16A16_FLOAT
+constexpr unsigned kR11G11B10 = 26;       // DXGI_FORMAT_R11G11B10_FLOAT
+constexpr unsigned kReplayFrames = 12;    // evaluations of the same picture from a reset: the model's history settles
+constexpr unsigned kShiftStep = 2;        // full-size pictures are measured on every other pixel of every other row
+constexpr double kAgreementNeeded = 0.9;  // the finished picture's correlation with the frame (Agreement)
+
+// A picture as RGB floats, row by row: linear light for a frame, display-encoded for the model's input and output.
+struct Image
+{
+    unsigned width = 0, height = 0;
+    std::vector<float> rgb;
+
+    size_t Pixels() const { return size_t(width) * height; }
+};
+
+// The model run on a picture of our own with these parameters and, when `mask` is given, a control mask of the
+// picture's size (per pixel: the final blend, LocalTone and LocalStructure, as T8 has it), its output read back; false
+// when it failed (said why).
+using Replay = std::function<bool(const Image& input, const Tunables& t, const Image* mask, Image* output)>;
+
+bool ReadWhole(const std::wstring& path, std::vector<uint8_t>* data)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || f == nullptr)
+        return false;
+    bool ok = _fseeki64(f, 0, SEEK_END) == 0;
+    const long long size = ok ? _ftelli64(f) : -1;
+    ok = size > 0 && _fseeki64(f, 0, SEEK_SET) == 0;
+    if (ok)
+    {
+        data->resize(size_t(size));
+        ok = std::fread(data->data(), 1, data->size(), f) == data->size();
+    }
+    std::fclose(f);
+    return ok;
+}
+
+// A frame value the model can be given (nr_common.hlsli, Clean): NaN and below zero are 0, infinity a large number.
+float Clean1(float v) { return std::isnan(v) ? 0.0f : std::min(std::max(v, 0.0f), 1.0e30f); }
+
+// sRGB, both ways, held to 0..1 (NaN is 0).
+float Encode(float v)
+{
+    if (!(v > 0.0f))
+        return 0.0f;
+    if (v >= 1.0f)
+        return 1.0f;
+    return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+}
+
+float Decode(float e)
+{
+    if (!(e > 0.0f))
+        return 0.0f;
+    if (e >= 1.0f)
+        return 1.0f;
+    return e <= 0.04045f ? e / 12.92f : std::pow((e + 0.055f) / 1.055f, 2.4f);
+}
+
+float Luma(const float* c) { return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]; }
+float Max3(const float* c) { return std::max(c[0], std::max(c[1], c[2])); }
+float Saturation(const float* c)
+{
+    const float most = Max3(c);
+    return most > 1.0e-6f ? (most - std::min(c[0], std::min(c[1], c[2]))) / most : 0.0f;
+}
+
+// One channel of DXGI_FORMAT_R11G11B10_FLOAT: 5 bits of exponent, `mantissaBits` of mantissa, no sign.
+float SmallFloat(uint32_t bits, unsigned mantissaBits)
+{
+    const uint32_t exponent = bits >> mantissaBits;
+    const float fraction = float(bits & ((1u << mantissaBits) - 1u)) / float(1u << mantissaBits);
+    if (exponent == 0)
+        return std::ldexp(fraction, -14);
+    if (exponent == 31)
+        return fraction == 0.0f ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::quiet_NaN();
+    return std::ldexp(1.0f + fraction, int(exponent) - 15);
+}
+
+const char* FormatName(unsigned format)
+{
+    switch (format)
+    {
+    case 0:
+        return "none";
+    case 10:
+        return "RGBA16F";
+    case 24:
+        return "R10G10B10A2";
+    case 26:
+        return "R11G11B10F";
+    case 28:
+        return "RGBA8";
+    case 29:
+        return "RGBA8 sRGB";
+    case 87:
+        return "BGRA8";
+    case 88:
+        return "BGRX8";
+    case 91:
+        return "BGRA8 sRGB";
+    default:
+        return "another format";
+    }
+}
+
+// The capture build's .bzframe (its nr_dx12.cpp, FrameFileHeader): 168 bytes of header, then the frame's rows.
+struct FrameFile
+{
+    uint64_t number = 0; // our frame counter, the .bzdump's
+    unsigned format = 0;
+    unsigned modelWidth = 0, modelHeight = 0;
+    Tunables t; // the model's six parameters at the capture
+    bool mask = false, dilate = false;
+    unsigned pictureFormat = 0; // the back buffer's DXGI_FORMAT; 0: no finished picture
+    unsigned pictureWidth = 0, pictureHeight = 0;
+    bool displayHdr = false;
+    Image frame; // as DLSS made it, before the composite: linear light for a linear HDR Output
+};
+
+bool ReadFrameFile(const std::wstring& path, FrameFile* f)
+{
+    std::vector<uint8_t> data;
+    if (!ReadWhole(path, &data) || data.size() < 168 || std::memcmp(data.data(), "BZFRAME1", 8) != 0)
+        return false;
+    auto word = [&](size_t at)
+    {
+        uint32_t v = 0;
+        std::memcpy(&v, data.data() + at, 4);
+        return v;
+    };
+    auto real = [&](size_t at)
+    {
+        float v = 0.0f;
+        std::memcpy(&v, data.data() + at, 4);
+        return v;
+    };
+    std::memcpy(&f->number, data.data() + 8, 8);
+    const uint32_t headerBytes = word(16), width = word(24), height = word(28), rowBytes = word(32);
+    f->format = word(20);
+    f->modelWidth = word(36);
+    f->modelHeight = word(40);
+    f->t.intensity = real(56);
+    f->t.style = word(60);
+    f->t.localStructure = real(64);
+    f->t.localTone = real(68);
+    f->t.skin = real(72);
+    f->t.autoMask = int(word(76));
+    f->mask = word(80) != 0;
+    f->dilate = word(84) != 0;
+    f->pictureFormat = word(88);
+    f->pictureWidth = word(92);
+    f->pictureHeight = word(96);
+    f->displayHdr = word(100) != 0;
+    const unsigned pixelBytes = f->format == kRgba16f ? 8u : f->format == kR11G11B10 ? 4u : 0u;
+    if (headerBytes < 168 || width == 0 || height == 0 || pixelBytes == 0 || rowBytes < uint64_t(width) * pixelBytes ||
+        uint64_t(headerBytes) + uint64_t(rowBytes) * height > data.size())
+        return false;
+    Image& im = f->frame;
+    im.width = width;
+    im.height = height;
+    im.rgb.resize(im.Pixels() * 3);
+    for (unsigned y = 0; y < height; ++y)
+    {
+        const uint8_t* row = data.data() + headerBytes + size_t(y) * rowBytes;
+        float* to = im.rgb.data() + size_t(y) * width * 3;
+        for (unsigned x = 0; x < width; ++x)
+        {
+            if (pixelBytes == 8)
+            {
+                uint16_t half[3] = {};
+                std::memcpy(half, row + size_t(x) * 8, 6);
+                for (unsigned c = 0; c < 3; ++c)
+                    to[x * 3 + c] = HalfToFloat(half[c]);
+            }
+            else
+            {
+                uint32_t v = 0;
+                std::memcpy(&v, row + size_t(x) * 4, 4);
+                to[x * 3] = SmallFloat(v & 0x7FFu, 6);
+                to[x * 3 + 1] = SmallFloat((v >> 11) & 0x7FFu, 6);
+                to[x * 3 + 2] = SmallFloat(v >> 22, 5);
+            }
+        }
+    }
+    return true;
+}
+
+// The capture build's finished picture (its nr_dx12.cpp, WriteBmp): 24-bit, rows padded to four bytes, as
+// display-encoded RGB 0..1.
+bool ReadBmp(const std::wstring& path, Image* out)
+{
+    std::vector<uint8_t> data;
+    if (!ReadWhole(path, &data) || data.size() < 54 || data[0] != 'B' || data[1] != 'M')
+        return false;
+    uint32_t pixelsAt = 0, compression = 0;
+    int32_t width = 0, height = 0;
+    uint16_t bits = 0;
+    std::memcpy(&pixelsAt, data.data() + 10, 4);
+    std::memcpy(&width, data.data() + 18, 4);
+    std::memcpy(&height, data.data() + 22, 4);
+    std::memcpy(&bits, data.data() + 28, 2);
+    std::memcpy(&compression, data.data() + 30, 4);
+    if (bits != 24 || compression != 0 || width <= 0 || height == 0 || height == INT32_MIN)
+        return false;
+    const unsigned w = unsigned(width), h = unsigned(height < 0 ? -height : height);
+    const size_t rowBytes = (size_t(w) * 3 + 3) & ~size_t(3);
+    if (uint64_t(pixelsAt) + uint64_t(rowBytes) * h > data.size())
+        return false;
+    out->width = w;
+    out->height = h;
+    out->rgb.resize(out->Pixels() * 3);
+    for (unsigned y = 0; y < h; ++y)
+    {
+        const unsigned fileRow = height > 0 ? h - 1 - y : y; // positive height: the bottom row first
+        const uint8_t* from = data.data() + pixelsAt + size_t(fileRow) * rowBytes;
+        float* to = out->rgb.data() + size_t(y) * w * 3;
+        for (unsigned x = 0; x < w; ++x)
+        {
+            to[x * 3] = float(from[x * 3 + 2]) / 255.0f;
+            to[x * 3 + 1] = float(from[x * 3 + 1]) / 255.0f;
+            to[x * 3 + 2] = float(from[x * 3]) / 255.0f;
+        }
+    }
+    return true;
+}
+
+// Our proxy, the model's input, from the frame: for a linear HDR frame the white point, then the shoulder on the
+// largest channel, then sRGB (nr_common.hlsli, EncodeLinear; nr.hlsl, the encode); a display-encoded frame as it is.
+Image EncodeProxy(const Image& frame, bool linear, float white, float shoulder)
+{
+    Image p;
+    p.width = frame.width;
+    p.height = frame.height;
+    p.rgb.resize(frame.rgb.size());
+    for (size_t i = 0; i < frame.rgb.size(); i += 3)
+    {
+        float x[3] = {};
+        for (unsigned c = 0; c < 3; ++c)
+            x[c] = Clean1(frame.rgb[i + c]) / (linear ? white : 1.0f);
+        if (!linear)
+        {
+            for (unsigned c = 0; c < 3; ++c)
+                p.rgb[i + c] = std::min(x[c], 1.0f);
+            continue;
+        }
+        const float m = Max3(x);
+        float k = 1.0f;
+        if (m > shoulder && shoulder < 1.0f)
+        {
+            const float t = (m - shoulder) / (1.0f - shoulder);
+            k = (shoulder + (1.0f - shoulder) * (t / (1.0f + t))) / m;
+        }
+        for (unsigned c = 0; c < 3; ++c)
+            p.rgb[i + c] = Encode(std::min(x[c] * k, 1.0f));
+    }
+    return p;
+}
+
+// The mean of each `factor` square, as the dump reduces the frame (nr.hlsl, DumpRead): the right and bottom edges
+// that make no whole square are left out.
+Image Reduce(const Image& a, unsigned factor)
+{
+    Image r;
+    r.width = a.width / factor;
+    r.height = a.height / factor;
+    r.rgb.assign(r.Pixels() * 3, 0.0f);
+    const float scale = 1.0f / float(factor * factor);
+    for (unsigned y = 0; y < r.height; ++y)
+    {
+        for (unsigned x = 0; x < r.width; ++x)
+        {
+            for (unsigned c = 0; c < 3; ++c)
+            {
+                float sum = 0.0f;
+                for (unsigned dy = 0; dy < factor; ++dy)
+                    for (unsigned dx = 0; dx < factor; ++dx)
+                        sum += a.rgb[((size_t(y) * factor + dy) * a.width + size_t(x) * factor + dx) * 3 + c];
+                r.rgb[(size_t(y) * r.width + x) * 3 + c] = sum * scale;
+            }
+        }
+    }
+    return r;
+}
+
+// A display-encoded picture at another size, made the way the pass makes the model's smaller picture with ModelScale
+// (nr.hlsl, EncodeScaled): each new pixel the mean, in linear light, of the old pixels it covers, each weighted by how
+// much of it it covers.
+Image Resize(const Image& a, unsigned width, unsigned height)
+{
+    struct Tap
+    {
+        unsigned at;
+        float weight;
+    };
+    auto taps = [](unsigned from, unsigned to)
+    {
+        std::vector<std::vector<Tap>> list(to);
+        const double step = double(from) / double(to);
+        for (unsigned q = 0; q < to; ++q)
+        {
+            const double lo = double(q) * step, hi = std::min(lo + step, double(from));
+            const unsigned end = std::min(unsigned(std::ceil(hi)), from);
+            for (unsigned i = unsigned(lo); i < end; ++i)
+            {
+                const double w = std::min(hi, double(i) + 1.0) - std::max(lo, double(i));
+                if (w > 0.0)
+                    list[q].push_back({ i, float(w) });
+            }
+        }
+        return list;
+    };
+    const std::vector<std::vector<Tap>> across = taps(a.width, width), down = taps(a.height, height);
+    std::vector<float> light(a.rgb.size());
+    for (size_t i = 0; i < a.rgb.size(); ++i)
+        light[i] = Decode(a.rgb[i]);
+    Image r;
+    r.width = width;
+    r.height = height;
+    r.rgb.resize(r.Pixels() * 3);
+    for (unsigned y = 0; y < height; ++y)
+    {
+        for (unsigned x = 0; x < width; ++x)
+        {
+            float sum[3] = {};
+            float weight = 0.0f;
+            for (const Tap& ty : down[y])
+            {
+                for (const Tap& tx : across[x])
+                {
+                    const float w = ty.weight * tx.weight;
+                    const float* c = light.data() + (size_t(ty.at) * a.width + tx.at) * 3;
+                    sum[0] += w * c[0];
+                    sum[1] += w * c[1];
+                    sum[2] += w * c[2];
+                    weight += w;
+                }
+            }
+            for (unsigned c = 0; c < 3; ++c)
+                r.rgb[(size_t(y) * width + x) * 3 + c] = Encode(weight > 0.0f ? sum[c] / weight : 0.0f);
+        }
+    }
+    return r;
+}
+
+// A picture at the model's size seen at the frame's pixels, as the dump reads the model's input and output with
+// ModelScale (nr.hlsl, ModelTexel): each frame pixel takes the model texel it falls in.
+Image AtFramePixels(const Image& a, unsigned width, unsigned height)
+{
+    const float stepX = float(width) / float(a.width), stepY = float(height) / float(a.height);
+    Image r;
+    r.width = width;
+    r.height = height;
+    r.rgb.resize(r.Pixels() * 3);
+    for (unsigned y = 0; y < height; ++y)
+    {
+        const unsigned ty = std::min(unsigned((float(y) + 0.5f) / stepY), a.height - 1);
+        for (unsigned x = 0; x < width; ++x)
+        {
+            const unsigned tx = std::min(unsigned((float(x) + 0.5f) / stepX), a.width - 1);
+            for (unsigned c = 0; c < 3; ++c)
+                r.rgb[(size_t(y) * width + x) * 3 + c] = a.rgb[(size_t(ty) * a.width + tx) * 3 + c];
+        }
+    }
+    return r;
+}
+
+// Rows y0..y1 of a picture.
+Image Rows(const Image& a, unsigned y0, unsigned y1)
+{
+    Image r;
+    r.width = a.width;
+    r.height = y1 - y0;
+    r.rgb.assign(a.rgb.begin() + std::ptrdiff_t(size_t(y0) * a.width * 3),
+                 a.rgb.begin() + std::ptrdiff_t(size_t(y1) * a.width * 3));
+    return r;
+}
+
+// How closely the finished picture follows the frame: the correlation, over squares of 16 pixels, of the log2 of
+// their mean luminance (the frame's linear, the picture's decoded). The game's curve rises with the frame's light, so
+// the same view gives close to 1; a moved camera, a menu or another view does not. NaN when there is too little.
+double Agreement(const Image& frame, const Image& picture)
+{
+    constexpr unsigned kSquare = 16;
+    std::vector<double> a, b;
+    for (unsigned by = 0; by + kSquare <= frame.height; by += kSquare)
+    {
+        for (unsigned bx = 0; bx + kSquare <= frame.width; bx += kSquare)
+        {
+            double sumFrame = 0.0, sumPicture = 0.0;
+            for (unsigned y = by; y < by + kSquare; ++y)
+            {
+                for (unsigned x = bx; x < bx + kSquare; ++x)
+                {
+                    const size_t i = (size_t(y) * frame.width + x) * 3;
+                    const float f[3] = { Clean1(frame.rgb[i]), Clean1(frame.rgb[i + 1]), Clean1(frame.rgb[i + 2]) };
+                    const float p[3] = { Decode(picture.rgb[i]), Decode(picture.rgb[i + 1]),
+                                         Decode(picture.rgb[i + 2]) };
+                    sumFrame += Luma(f);
+                    sumPicture += Luma(p);
+                }
+            }
+            const double n = double(kSquare * kSquare);
+            a.push_back(std::log2(sumFrame / n + 1.0e-6));
+            b.push_back(std::log2(sumPicture / n + 1.0e-6));
+        }
+    }
+    if (a.size() < 16)
+        return std::numeric_limits<double>::quiet_NaN();
+    double meanA = 0.0, meanB = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        meanA += a[i];
+        meanB += b[i];
+    }
+    meanA /= double(a.size());
+    meanB /= double(b.size());
+    double ab = 0.0, aa = 0.0, bb = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        ab += (a[i] - meanA) * (b[i] - meanB);
+        aa += (a[i] - meanA) * (a[i] - meanA);
+        bb += (b[i] - meanB) * (b[i] - meanB);
+    }
+    return aa > 0.0 && bb > 0.0 ? ab / std::sqrt(aa * bb) : std::numeric_limits<double>::quiet_NaN();
+}
+
+// Whether a display-linear pixel is bright and blue, as a clear sky is: luminance above 0.18, blue above red by 15%.
+bool SkyLikePixel(const float* c) { return Luma(c) > 0.18f && c[2] > 1.15f * c[0]; }
+
+// The share of a display-encoded picture that is sky-like: which captures look at the sky.
+double SkyLike(const Image& p)
+{
+    unsigned long long count = 0, sky = 0;
+    for (unsigned y = 0; y < p.height; y += kShiftStep)
+    {
+        for (unsigned x = 0; x < p.width; x += kShiftStep)
+        {
+            const size_t i = (size_t(y) * p.width + x) * 3;
+            const float c[3] = { Decode(p.rgb[i]), Decode(p.rgb[i + 1]), Decode(p.rgb[i + 2]) };
+            ++count;
+            if (SkyLikePixel(c))
+                ++sky;
+        }
+    }
+    return count != 0 ? double(sky) / double(count) : 0.0;
+}
+
+// The game's finished picture against our proxy, by the frame's light: per band of EV from the white point, the
+// share of the frame, the mean luminance of each (display-linear), their mean saturation ((most - least) / most), and
+// how much bluer the game's picture is (the mean of log2(blue / red), the picture's less the proxy's, where neither is
+// near black or clipped).
+void ToneTable(const char* tag, const Image& frame, float white, const Image& ours, const Image& picture)
+{
+    static const char* const kNames[] = { "below -6", "-6 to -4", "-4 to -2", "-2 to -1",
+                                          "-1 to 0",  "0 to +1",  "above +1" };
+    static const double kUpper[] = { -6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 1.0e9 };
+    constexpr unsigned kBands = 7;
+    double count[kBands] = {}, lumOurs[kBands] = {}, lumGame[kBands] = {}, satOurs[kBands] = {}, satGame[kBands] = {};
+    double cast[kBands] = {}, castCount[kBands] = {};
+    double total = 0.0;
+    for (unsigned y = 0; y < frame.height; y += kShiftStep)
+    {
+        for (unsigned x = 0; x < frame.width; x += kShiftStep)
+        {
+            const size_t i = (size_t(y) * frame.width + x) * 3;
+            float f[3] = {}, p[3] = {}, s[3] = {};
+            for (unsigned c = 0; c < 3; ++c)
+            {
+                f[c] = Clean1(frame.rgb[i + c]);
+                p[c] = Decode(ours.rgb[i + c]);
+                s[c] = Decode(picture.rgb[i + c]);
+            }
+            const float light = Luma(f) / white;
+            const double ev = light > 0.0f ? std::log2(double(light)) : -1.0e9;
+            unsigned b = 0;
+            while (b + 1 < kBands && ev >= kUpper[b])
+                ++b;
+            count[b] += 1.0;
+            total += 1.0;
+            lumOurs[b] += Luma(p);
+            lumGame[b] += Luma(s);
+            satOurs[b] += Saturation(p);
+            satGame[b] += Saturation(s);
+            if (Luma(p) > 0.01f && Luma(s) > 0.01f && Max3(p) < 0.97f && Max3(s) < 0.97f)
+            {
+                cast[b] += std::log2((double(s[2]) + 1.0e-3) / (double(s[0]) + 1.0e-3)) -
+                           std::log2((double(p[2]) + 1.0e-3) / (double(p[0]) + 1.0e-3));
+                castCount[b] += 1.0;
+            }
+        }
+    }
+    Note("%s   the game's picture against our proxy, by the frame's light in EV from the white point:", tag);
+    Note("%s     %-9s %6s %9s %9s %8s %8s %11s", tag, "EV", "share", "lum ours", "lum game", "sat ours", "sat game",
+         "game bluer");
+    for (unsigned b = 0; b < kBands; ++b)
+    {
+        if (count[b] == 0.0)
+            continue;
+        Note("%s     %-9s %5.1f%% %9.4f %9.4f %8.3f %8.3f %+11.3f", tag, kNames[b], 100.0 * count[b] / total,
+             lumOurs[b] / count[b], lumGame[b] / count[b], satOurs[b] / count[b], satGame[b] / count[b],
+             castCount[b] > 0.0 ? cast[b] / castCount[b] : 0.0);
+    }
+}
+
+// The game's tone curve, read off one capture: in bins of a quarter EV of the frame's value over the white point, the
+// median of the finished picture's display-linear value, for one channel or the three pooled. Every other pixel of
+// every other row; a bin with fewer than 64 values takes its neighbours' line; then made to rise. The HUD and what
+// moved between the frame and the picture fall out in the medians.
+constexpr int kCurveBins = 80;
+constexpr double kCurveLow = -14.0; // log2 of the frame's value over the white point at the first bin's low edge
+constexpr double kCurveStep = 0.25;
+
+struct Curve
+{
+    float y[kCurveBins] = {}; // the picture's display-linear value at each bin's centre
+    bool ok = false;
+};
+
+Curve FitCurve(const Image& frame, float white, const Image& picture, unsigned channel /* 3: pooled */)
+{
+    std::vector<std::vector<float>> bins(kCurveBins);
+    for (unsigned y = 0; y < frame.height; y += 2)
+    {
+        for (unsigned x = 0; x < frame.width; x += 2)
+        {
+            const size_t i = (size_t(y) * frame.width + x) * 3;
+            for (unsigned c = 0; c < 3; ++c)
+            {
+                if (channel < 3 && c != channel)
+                    continue;
+                const float v = Clean1(frame.rgb[i + c]) / white;
+                if (!(v > 0.0f))
+                    continue;
+                const double at = (std::log2(double(v)) - kCurveLow) / kCurveStep;
+                if (at < 0.0 || at >= double(kCurveBins))
+                    continue;
+                bins[size_t(at)].push_back(Decode(picture.rgb[i + c]));
+            }
+        }
+    }
+    Curve k;
+    bool filled[kCurveBins] = {};
+    int first = -1, last = -1, count = 0;
+    for (int b = 0; b < kCurveBins; ++b)
+    {
+        std::vector<float>& v = bins[size_t(b)];
+        if (v.size() < 64)
+            continue;
+        std::nth_element(v.begin(), v.begin() + std::ptrdiff_t(v.size() / 2), v.end());
+        k.y[b] = v[v.size() / 2];
+        filled[b] = true;
+        if (first < 0)
+            first = b;
+        last = b;
+        ++count;
+    }
+    if (count < 8)
+        return k;
+    for (int b = 0; b < kCurveBins; ++b)
+    {
+        if (filled[b])
+            continue;
+        if (b < first)
+            k.y[b] = k.y[first] * float(std::exp2(double(b - first) * kCurveStep)); // in proportion to the value
+        else if (b > last)
+            k.y[b] = k.y[last];
+        else
+        {
+            int lo = b - 1, hi = b + 1;
+            while (!filled[lo])
+                --lo;
+            while (!filled[hi])
+                ++hi;
+            k.y[b] = k.y[lo] + float(b - lo) / float(hi - lo) * (k.y[hi] - k.y[lo]);
+        }
+    }
+    for (int b = 1; b < kCurveBins; ++b)
+        k.y[b] = std::max(k.y[b], k.y[b - 1]);
+    k.ok = true;
+    return k;
+}
+
+// The curve at a frame value over the white point: a straight line between bin centres, in proportion to the value
+// below the first centre, held above the last.
+float ApplyCurve(const Curve& k, float v)
+{
+    if (!(v > 0.0f))
+        return 0.0f;
+    const double at = (std::log2(double(v)) - kCurveLow) / kCurveStep - 0.5;
+    if (at <= 0.0)
+        return float(double(k.y[0]) * double(v) / std::exp2(kCurveLow + 0.5 * kCurveStep));
+    if (at >= double(kCurveBins - 1))
+        return k.y[kCurveBins - 1];
+    const int b = int(at);
+    const float f = float(at - double(b));
+    return k.y[b] + f * (k.y[b + 1] - k.y[b]);
+}
+
+// Our proxy with the game's curves in place of our white point and shoulder: each channel of the frame over the white
+// point through its curve (`curves`: three), then sRGB.
+Image EncodeWithCurves(const Image& frame, float white, const Curve* curves)
+{
+    Image p;
+    p.width = frame.width;
+    p.height = frame.height;
+    p.rgb.resize(frame.rgb.size());
+    for (size_t i = 0; i < frame.rgb.size(); i += 3)
+        for (unsigned c = 0; c < 3; ++c)
+            p.rgb[i + c] = Encode(ApplyCurve(curves[c], Clean1(frame.rgb[i + c]) / white));
+    return p;
+}
+
+// Our curve on a grey at `ev` from the white point, display-linear: the value itself up to the shoulder, then the
+// shoulder's (nr_common.hlsli, Shoulder).
+float OurCurve(double ev, float shoulder)
+{
+    const float m = float(std::exp2(ev));
+    if (m <= shoulder || shoulder >= 1.0f)
+        return std::min(m, 1.0f);
+    const float t = (m - shoulder) / (1.0f - shoulder);
+    return shoulder + (1.0f - shoulder) * (t / (1.0f + t));
+}
+
+// The curves at a few points, against ours.
+void PrintCurves(const char* tag, const Curve& pooled, const Curve* each, float shoulder)
+{
+    static const double kPoints[] = { -8.0, -6.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0 };
+    char line[4][256] = {};
+    const char* const names[4] = { "ours", "the game's", "red", "blue" };
+    for (unsigned r = 0; r < 4; ++r)
+    {
+        int at = std::snprintf(line[r], sizeof line[r], "%-10s", names[r]);
+        for (double ev : kPoints)
+        {
+            const float v = float(std::exp2(ev));
+            const float value = r == 0   ? OurCurve(ev, shoulder)
+                                : r == 1 ? ApplyCurve(pooled, v)
+                                : r == 2 ? ApplyCurve(each[0], v)
+                                         : ApplyCurve(each[2], v);
+            if (at >= 0 && size_t(at) < sizeof line[r])
+                at += std::snprintf(line[r] + at, sizeof line[r] - size_t(at), " %7.4f", double(value));
+        }
+    }
+    Note("%s   the curves, display-linear, at EV -8 -6 -4 -3 -2 -1 0 +1 +2 from the white point:", tag);
+    for (unsigned r = 0; r < 4; ++r)
+        if (r < 2 || (each[0].ok && each[2].ok))
+            Note("%s     %s", tag, line[r]);
+}
+
+// A box `r` pixels each way over `channels` interleaved values per pixel, along the rows and then the columns; outside
+// the picture counts as zero.
+void BoxBlur(std::vector<float>* data, unsigned w, unsigned h, unsigned channels, unsigned r)
+{
+    std::vector<float>& d = *data;
+    std::vector<double> line;
+    auto pass = [&](unsigned lines, unsigned length, size_t lineStride, size_t stepStride)
+    {
+        for (unsigned l = 0; l < lines; ++l)
+        {
+            for (unsigned c = 0; c < channels; ++c)
+            {
+                const size_t start = size_t(l) * lineStride + c;
+                auto at = [&](unsigned i) -> float& { return d[start + size_t(i) * stepStride]; };
+                line.assign(length, 0.0);
+                double sum = 0.0;
+                for (unsigned i = 0; i < std::min(r, length); ++i)
+                    sum += at(i);
+                for (unsigned i = 0; i < length; ++i)
+                {
+                    if (i + r < length)
+                        sum += at(i + r);
+                    line[i] = sum;
+                    if (i >= r)
+                        sum -= at(i - r);
+                }
+                for (unsigned i = 0; i < length; ++i)
+                    at(i) = float(line[i]);
+            }
+        }
+    };
+    pass(h, w, size_t(w) * channels, channels); // along each row
+    pass(w, h, channels, size_t(w) * channels); // along each column
+}
+
+// How a colour lock takes the model's colour change: as the composite does, the output's chromaticity less the
+// input's, added (nr_common.hlsli, ModelChroma); as a gain per channel, the change of log2 of each channel over the
+// luminance, which is how a white balance moves a picture; or the whole of it, which is Colour 0.
+enum LockKind
+{
+    kLockAdded,
+    kLockGains,
+    kLockAll,
+};
+
+// What a colour lock on our side would leave of the model's colour change on `p` (its input) and `o` (its output),
+// both display-encoded: the change, taken as `kind` says, less its low-pass, and the output brought back to its own
+// luminance. `radius` 0 takes the change's mean over the frame; else a box that many pixels each way, three times
+// over (close to a Gaussian), worked at an eighth of the size. The shift that is left, and in `kept` the share of the
+// change's energy left.
+Shift ColourLock(const Image& p, const Image& o, unsigned radius, LockKind kind, double* kept)
+{
+    constexpr float kFloor = 1.0f / 16384.0f; // nr_common.hlsli, kChromaFloor
+    constexpr float kEps = 1.0e-3f;           // as ColourShift's
+    constexpr unsigned kCoarse = 8;
+    const bool all = kind == kLockAll;
+    const unsigned w = p.width, h = p.height;
+    const size_t n = p.Pixels();
+    std::vector<float> pl(n * 3), ol(n * 3), change(n * 3, 0.0f);
+    std::vector<uint8_t> valid(n, 0);
+    for (size_t i = 0; i < n; ++i)
+    {
+        for (unsigned c = 0; c < 3; ++c)
+        {
+            pl[i * 3 + c] = Decode(p.rgb[i * 3 + c]);
+            ol[i * 3 + c] = Decode(o.rgb[i * 3 + c]);
+        }
+        const float yp = Luma(&pl[i * 3]), yo = Luma(&ol[i * 3]);
+        if (yp > kFloor && yo > kFloor)
+        {
+            valid[i] = 1;
+            for (unsigned c = 0; c < 3; ++c)
+                change[i * 3 + c] = kind == kLockGains ? std::log2((ol[i * 3 + c] + kEps) / (pl[i * 3 + c] + kEps)) -
+                                                             std::log2((yo + kEps) / (yp + kEps))
+                                                       : ol[i * 3 + c] / yo - pl[i * 3 + c] / yp;
+        }
+    }
+    // The low-pass: the mean, or the change blurred at an eighth of the size and brought back bilinearly.
+    float mean[3] = {};
+    std::vector<float> coarse;
+    const unsigned cw = (w + kCoarse - 1) / kCoarse, ch = (h + kCoarse - 1) / kCoarse;
+    if (!all && radius == 0)
+    {
+        double sum[3] = {}, count = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (valid[i] == 0)
+                continue;
+            for (unsigned c = 0; c < 3; ++c)
+                sum[c] += change[i * 3 + c];
+            count += 1.0;
+        }
+        for (unsigned c = 0; c < 3; ++c)
+            mean[c] = count > 0.0 ? float(sum[c] / count) : 0.0f;
+    }
+    else if (!all)
+    {
+        std::vector<float> sums(size_t(cw) * ch * 3, 0.0f), weights(size_t(cw) * ch, 0.0f);
+        for (unsigned y = 0; y < h; ++y)
+        {
+            for (unsigned x = 0; x < w; ++x)
+            {
+                const size_t i = size_t(y) * w + x;
+                if (valid[i] == 0)
+                    continue;
+                const size_t cell = size_t(y / kCoarse) * cw + x / kCoarse;
+                for (unsigned c = 0; c < 3; ++c)
+                    sums[cell * 3 + c] += change[i * 3 + c];
+                weights[cell] += 1.0f;
+            }
+        }
+        const unsigned r = std::max(1u, radius / kCoarse);
+        for (unsigned pass = 0; pass < 3; ++pass)
+        {
+            BoxBlur(&sums, cw, ch, 3, r);
+            BoxBlur(&weights, cw, ch, 1, r);
+        }
+        coarse.assign(size_t(cw) * ch * 3, 0.0f);
+        for (size_t cell = 0; cell < size_t(cw) * ch; ++cell)
+            for (unsigned c = 0; c < 3; ++c)
+                coarse[cell * 3 + c] = weights[cell] > 1.0e-6f ? sums[cell * 3 + c] / weights[cell] : 0.0f;
+    }
+    double energy = 0.0, left = 0.0;
+    ShiftSum sum;
+    for (unsigned y = 0; y < h; ++y)
+    {
+        const float gy = std::min(std::max((float(y) + 0.5f) / float(kCoarse) - 0.5f, 0.0f), float(ch - 1));
+        const unsigned y0 = unsigned(gy), y1 = std::min(y0 + 1, ch - 1);
+        const float fy = gy - float(y0);
+        for (unsigned x = 0; x < w; ++x)
+        {
+            const size_t i = size_t(y) * w + x;
+            float lock[3] = { mean[0], mean[1], mean[2] };
+            if (!coarse.empty())
+            {
+                const float gx = std::min(std::max((float(x) + 0.5f) / float(kCoarse) - 0.5f, 0.0f), float(cw - 1));
+                const unsigned x0 = unsigned(gx), x1 = std::min(x0 + 1, cw - 1);
+                const float fx = gx - float(x0);
+                for (unsigned c = 0; c < 3; ++c)
+                {
+                    const float top = coarse[(size_t(y0) * cw + x0) * 3 + c] * (1.0f - fx) +
+                                      coarse[(size_t(y0) * cw + x1) * 3 + c] * fx;
+                    const float bottom = coarse[(size_t(y1) * cw + x0) * 3 + c] * (1.0f - fx) +
+                                         coarse[(size_t(y1) * cw + x1) * 3 + c] * fx;
+                    lock[c] = top * (1.0f - fy) + bottom * fy;
+                }
+            }
+            float result[3] = { ol[i * 3], ol[i * 3 + 1], ol[i * 3 + 2] };
+            if (valid[i] != 0)
+            {
+                const float yp = Luma(&pl[i * 3]), yo = Luma(&ol[i * 3]);
+                for (unsigned c = 0; c < 3; ++c)
+                {
+                    const float d = change[i * 3 + c];
+                    energy += double(d) * d;
+                    if (all)
+                        result[c] = pl[i * 3 + c] * (yo / yp); // the luminance change alone
+                    else
+                    {
+                        result[c] = kind == kLockGains ? ol[i * 3 + c] * std::exp2(-lock[c])
+                                                       : std::max(ol[i * 3 + c] - yo * lock[c], 0.0f);
+                        left += double(d - lock[c]) * (d - lock[c]);
+                    }
+                }
+                const float lum = Luma(result);
+                if (kind == kLockGains && lum > 0.0f)
+                    for (unsigned c = 0; c < 3; ++c)
+                        result[c] *= yo / lum; // the output's own luminance: only its colour is locked
+            }
+            if (y % kShiftStep == 0 && x % kShiftStep == 0)
+                sum.Add(pl[i * 3], pl[i * 3 + 1], pl[i * 3 + 2], result[0], result[1], result[2]);
+        }
+    }
+    *kept = energy > 0.0 ? left / energy : 0.0;
+    return sum.Result();
+}
+
+// What each capture is measured on: the model in the game, then the replays, then the locks on the replay of our
+// proxy.
+enum Variant
+{
+    kInGame,
+    kOurs,
+    kFinished,
+    kCurve,
+    kCurves,
+    kDarker,
+    kBrighter,
+    kTone0,
+    kTone05,
+    kStyle1,
+    kStyle2,
+    kStructure0,
+    kAutoMask1,
+    kNeutralMask,
+    kSkyTone0,
+    kLockMean,
+    kLock8,
+    kLock32,
+    kGainsMean,
+    kGains8,
+    kGains32,
+    kColour0,
+    kVariants
+};
+
+const char* const kVariantNames[kVariants] = {
+    "in the game (the dump)",
+    "replay: our proxy",
+    "replay: the game's own picture",
+    "replay: our proxy, the game's curve",
+    "replay: our proxy, the game's 3 curves",
+    "replay: our proxy 1 EV darker",
+    "replay: our proxy 1 EV brighter",
+    "replay: our proxy, LocalTone 0",
+    "replay: our proxy, LocalTone 0.5",
+    "replay: our proxy, Style 1",
+    "replay: our proxy, Style 2",
+    "replay: our proxy, LocalStructure 0",
+    "replay: our proxy, AutoMask 1",
+    "replay: our proxy, a mask of all 1s",
+    "replay: our proxy, mask: sky at LocalTone 0",
+    "lock, added: the change's mean off",
+    "lock, added: low-pass over 1/8 height off",
+    "lock, added: low-pass over 1/32 height off",
+    "lock, gains: the change's mean off",
+    "lock, gains: low-pass over 1/8 height off",
+    "lock, gains: low-pass over 1/32 height off",
+    "lock: all of it off (Colour 0)",
+};
+
+struct CaptureNumbers
+{
+    bool have[kVariants] = {};
+    Shift shift[kVariants];
+    double kept[kVariants] = {}; // the locks: the share of the colour change's energy left
+    double sky = 0.0;            // SkyLike, of our proxy
+};
+
+// One capture: its three files read, checked against each other, compared and replayed. False when it could not be
+// read.
+bool OneCapture(unsigned index, const std::wstring& folder, const std::wstring& base, const Replay& replay,
+                CaptureNumbers* numbers)
+{
+    char tag[16];
+    std::snprintf(tag, sizeof tag, "C%u", index);
+    const std::string name = Utf8(base);
+    FrameFile f;
+    if (!ReadFrameFile(folder + L"\\" + base + L".bzframe", &f))
+    {
+        Say("%s %s: its .bzframe could not be read", tag, name.c_str());
+        return false;
+    }
+    Dump d;
+    if (!ReadDump(folder + L"\\" + base + L".bzdump", &d))
+    {
+        Say("%s %s: no .bzdump beside it that this probe can read, so no white point: skipped", tag, name.c_str());
+        return false;
+    }
+    const bool linear = (d.flags & kDumpLinearHdr) != 0;
+    const float white = linear && d.white > 1.0e-20f && d.white < 1.0e20f ? d.white : 1.0f;
+    const Image& frame = f.frame;
+    const unsigned mw = f.modelWidth != 0 ? f.modelWidth : frame.width;
+    const unsigned mh = f.modelHeight != 0 ? f.modelHeight : frame.height;
+    const bool scaled = mw != frame.width || mh != frame.height;
+    Image picture;
+    const bool havePicture = f.pictureFormat != 0 && ReadBmp(folder + L"\\" + base + L".bmp", &picture);
+    Say("%s %s (frame %llu): %ux%u %s, %s, white point %.4g, shoulder %.2f", tag, name.c_str(),
+        static_cast<unsigned long long>(f.number), frame.width, frame.height, FormatName(f.format),
+        linear ? "linear HDR" : "display-encoded", double(white), double(d.shoulder));
+    Note("%s   the model %ux%u%s: Intensity %.2f, Style %u, LocalStructure %.2f, LocalTone %.2f, SkinStructure %.2f, "
+         "AutoMask %d%s%s",
+         tag, mw, mh, scaled ? " (ModelScale)" : "", double(f.t.intensity), f.t.style, double(f.t.localStructure),
+         double(f.t.localTone), double(f.t.skin), f.t.autoMask,
+         f.mask ? "; it had the sky sliders' mask, the replays have none" : "", f.dilate ? "; motion dilated" : "");
+
+    // Our proxy rebuilt from the frame (at the model's size, `p`), against the dump's: the frame and the dump are of
+    // the same frame, read right.
+    const Image ours = EncodeProxy(frame, linear, white, d.shoulder);
+    const Image p = scaled ? Resize(ours, mw, mh) : ours;
+    const Image oursReduced = Reduce(scaled ? AtFramePixels(p, frame.width, frame.height) : ours, 4); // NR_DUMP_SCALE
+    const double proxyDiff =
+        oursReduced.width == d.width && oursReduced.height == d.height ? Difference(oursReduced.rgb, d.proxy) : 1.0e9;
+    // The finished picture against the frame: the same view, or of no use here.
+    double agreement = std::numeric_limits<double>::quiet_NaN();
+    bool usePicture = false;
+    if (havePicture)
+    {
+        if (picture.width != frame.width || picture.height != frame.height)
+            picture = Resize(picture, frame.width, frame.height);
+        agreement = Agreement(frame, picture);
+        usePicture = !f.displayHdr && agreement >= kAgreementNeeded;
+    }
+    char pictureNote[160];
+    if (!havePicture)
+        std::snprintf(pictureNote, sizeof pictureNote, "%s",
+                      f.pictureFormat == 0 ? "none was taken" : "its .bmp could not be read");
+    else
+        std::snprintf(pictureNote, sizeof pictureNote, "%s %ux%u, display %s, correlation with the frame %.3f%s",
+                      FormatName(f.pictureFormat), f.pictureWidth, f.pictureHeight, f.displayHdr ? "HDR" : "SDR",
+                      agreement,
+                      usePicture     ? " (the same view)"
+                      : f.displayHdr ? " (not used: an HDR picture)"
+                                     : " (not used: another view, or it moved)");
+    Note("%s   checks: our proxy rebuilt from the frame against the dump's, mean |difference| %.5f%s; the finished "
+         "picture: %s",
+         tag, proxyDiff, proxyDiff < 0.004 ? " (the same frame)" : " (NOT the same: what follows is doubtful)",
+         pictureNote);
+    if (usePicture)
+        ToneTable(tag, frame, white, ours, picture);
+
+    // The model.
+    CaptureNumbers& n = *numbers;
+    n.sky = SkyLike(ours);
+    n.have[kInGame] = true;
+    n.shift[kInGame] = ColourShift(d.proxy, d.model, d.width, 0, d.height);
+    Image o;
+    const bool replayed = replay(p, f.t, nullptr, &o);
+    if (replayed)
+    {
+        n.have[kOurs] = true;
+        n.shift[kOurs] = ColourShift(p.rgb, o.rgb, mw, 0, mh, kShiftStep);
+        Note("%s   the replay on our proxy against the model's output in the game: mean |difference| %.4f, both "
+             "reduced as the dump is",
+             tag, Difference(Reduce(scaled ? AtFramePixels(o, frame.width, frame.height) : o, 4).rgb, d.model));
+    }
+    auto run = [&](Variant v, const Image& input, const Tunables& t, const Image* mask = nullptr)
+    {
+        Image result;
+        if (!replay(input, t, mask, &result))
+            return;
+        n.have[v] = true;
+        n.shift[v] = ColourShift(input.rgb, result.rgb, mw, 0, mh, kShiftStep);
+    };
+    if (replayed && usePicture)
+    {
+        run(kFinished, scaled ? Resize(picture, mw, mh) : picture, f.t);
+        if (linear)
+        {
+            const Curve pooled = FitCurve(frame, white, picture, 3);
+            const Curve each[3] = { FitCurve(frame, white, picture, 0), FitCurve(frame, white, picture, 1),
+                                    FitCurve(frame, white, picture, 2) };
+            if (pooled.ok)
+            {
+                PrintCurves(tag, pooled, each, d.shoulder);
+                const Curve three[3] = { pooled, pooled, pooled };
+                const Image curved = EncodeWithCurves(frame, white, three);
+                run(kCurve, scaled ? Resize(curved, mw, mh) : curved, f.t);
+            }
+            if (each[0].ok && each[1].ok && each[2].ok)
+            {
+                const Image curved = EncodeWithCurves(frame, white, each);
+                run(kCurves, scaled ? Resize(curved, mw, mh) : curved, f.t);
+            }
+        }
+    }
+    if (replayed && linear)
+    {
+        const Image darker = EncodeProxy(frame, true, white * 2.0f, d.shoulder);
+        run(kDarker, scaled ? Resize(darker, mw, mh) : darker, f.t);
+        const Image brighter = EncodeProxy(frame, true, white * 0.5f, d.shoulder);
+        run(kBrighter, scaled ? Resize(brighter, mw, mh) : brighter, f.t);
+    }
+    if (replayed)
+    {
+        Tunables t = f.t;
+        t.localTone = 0.0f;
+        run(kTone0, p, t);
+        t.localTone = 0.5f;
+        run(kTone05, p, t);
+        t = f.t;
+        t.style = 1;
+        run(kStyle1, p, t);
+        t.style = 2;
+        run(kStyle2, p, t);
+        t = f.t;
+        t.localStructure = 0.0f;
+        run(kStructure0, p, t);
+        t = f.t;
+        t.autoMask = 1;
+        run(kAutoMask1, p, t);
+        // A control mask switches the model's own skin mask off (T8): first one that changes nothing else, then one
+        // with LocalTone off where the picture looks like sky, as the sky sliders would set it from the depth.
+        Image mask;
+        mask.width = mw;
+        mask.height = mh;
+        mask.rgb.assign(mask.Pixels() * 3, 1.0f);
+        run(kNeutralMask, p, f.t, &mask);
+        for (size_t i = 0; i < mask.Pixels(); ++i)
+        {
+            const float c[3] = { Decode(p.rgb[i * 3]), Decode(p.rgb[i * 3 + 1]), Decode(p.rgb[i * 3 + 2]) };
+            if (SkyLikePixel(c))
+                mask.rgb[i * 3 + 1] = 0.0f;
+        }
+        run(kSkyTone0, p, f.t, &mask);
+        const Variant locks[] = { kLockMean, kLock8, kLock32, kGainsMean, kGains8, kGains32, kColour0 };
+        const LockKind kinds[] = { kLockAdded, kLockAdded, kLockAdded, kLockGains, kLockGains, kLockGains, kLockAll };
+        const unsigned radii[] = { 0, mh / 8, mh / 32, 0, mh / 8, mh / 32, 0 };
+        for (unsigned i = 0; i < 7; ++i)
+        {
+            n.have[locks[i]] = true;
+            n.shift[locks[i]] = ColourLock(p, o, radii[i], kinds[i], &n.kept[locks[i]]);
+        }
+    }
+
+    Note("%s   bright and blue (sky-like): %.0f%% of our proxy; the model's change of log2(blue / red), whole frame | "
+         "warm pixels (%.0f%% of the frame):",
+         tag, 100.0 * n.sky, 100.0 * n.shift[kInGame].warmShare);
+    for (unsigned v = 0; v < kVariants; ++v)
+    {
+        if (!n.have[v])
+            continue;
+        if (v >= kLockMean)
+            Note("%s     %-44s %+.3f | %+.3f   colour change kept %3.0f%%", tag, kVariantNames[v], n.shift[v].all,
+                 n.shift[v].warm, 100.0 * n.kept[v]);
+        else
+            Note("%s     %-44s %+.3f | %+.3f", tag, kVariantNames[v], n.shift[v].all, n.shift[v].warm);
+    }
+    if (!replayed)
+        Note("%s     the replays failed (above)", tag);
+
+    // The bottom half alone: if the sky above it is what cools the ground, the ground alone comes back less cooled.
+    const unsigned top = mh / 2;
+    Image alone;
+    const Image bottom = Rows(p, top, mh);
+    if (replayed && replay(bottom, f.t, nullptr, &alone))
+    {
+        const Shift inFrame = ColourShift(p.rgb, o.rgb, mw, top, mh, kShiftStep);
+        const Shift byItself = ColourShift(bottom.rgb, alone.rgb, mw, 0, mh - top, kShiftStep);
+        Note("%s   the bottom half of our proxy: in the whole frame %+.3f | %+.3f, alone %+.3f | %+.3f", tag,
+             inFrame.all, inFrame.warm, byItself.all, byItself.warm);
+    }
+    return true;
+}
+
+// Over all the captures: per variant the mean change on warm pixels, its least and most, and its range, which is
+// the drift from one view to the next; then whether the replays stand for the game, and where the drift comes from.
+void CaptureSummary(const std::vector<CaptureNumbers>& all)
+{
+    if (all.empty())
+        return;
+    Say("captures: over %u, the model's change of log2(blue / red) on warm pixels: mean, least .. most, and the range "
+        "(the drift from one view to the next)",
+        unsigned(all.size()));
+    double range[kVariants] = {};
+    unsigned count[kVariants] = {};
+    for (unsigned v = 0; v < kVariants; ++v)
+    {
+        double sum = 0.0, sumAll = 0.0, kept = 0.0, least = 1.0e9, most = -1.0e9;
+        for (const CaptureNumbers& c : all)
+        {
+            if (!c.have[v])
+                continue;
+            sum += c.shift[v].warm;
+            sumAll += c.shift[v].all;
+            kept += c.kept[v];
+            least = std::min(least, c.shift[v].warm);
+            most = std::max(most, c.shift[v].warm);
+            ++count[v];
+        }
+        if (count[v] == 0)
+            continue;
+        range[v] = most - least;
+        const double k = double(count[v]);
+        if (v >= kLockMean)
+            Note("captures   %-44s n %2u  mean %+.3f  %+.3f .. %+.3f  range %.3f  (whole frame %+.3f)  kept %3.0f%%",
+                 kVariantNames[v], count[v], sum / k, least, most, range[v], sumAll / k, 100.0 * kept / k);
+        else
+            Note("captures   %-44s n %2u  mean %+.3f  %+.3f .. %+.3f  range %.3f  (whole frame %+.3f)",
+                 kVariantNames[v], count[v], sum / k, least, most, range[v], sumAll / k);
+    }
+    double difference = 0.0;
+    unsigned both = 0;
+    for (const CaptureNumbers& c : all)
+    {
+        if (c.have[kInGame] && c.have[kOurs])
+        {
+            difference += std::fabs(c.shift[kOurs].warm - c.shift[kInGame].warm);
+            ++both;
+        }
+    }
+    if (both != 0)
+        Note("captures   the replay on our proxy against the game, warm pixels: mean |difference| %.3f over %u: %s",
+             difference / double(both), both,
+             difference / double(both) < 0.15 ? "close, the replays stand for the game"
+                                              : "NOT close, the replays say less about the game");
+    if (count[kOurs] >= 2 && count[kFinished] >= 2 && range[kOurs] > 0.05)
+    {
+        const double share = range[kFinished] / range[kOurs];
+        Note("captures   the drift with the game's own picture as the input is %.0f%% of that with our proxy: %s",
+             100.0 * share,
+             share < 0.35  ? "it comes mostly from our proxy"
+             : share > 0.7 ? "it is mostly the model's own"
+                           : "both have a part");
+    }
+    else
+        Note("captures   no verdict on where the drift comes from: that needs two captures or more with the finished "
+             "picture, and a drift on our proxy");
+}
+
+// Every capture in `folder` (its .bzframe files, oldest first: the names carry the time), then the summary.
+void Captures(const std::wstring& folder, const Replay& replay)
+{
+    std::vector<std::wstring> bases;
+    WIN32_FIND_DATAW found;
+    const HANDLE find = FindFirstFileW((folder + L"\\*.bzframe").c_str(), &found);
+    if (find != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            const std::wstring file = found.cFileName;
+            if (file.size() > 8 && file.compare(file.size() - 8, 8, L".bzframe") == 0)
+                bases.push_back(file.substr(0, file.size() - 8));
+        } while (FindNextFileW(find, &found));
+        FindClose(find);
+    }
+    if (bases.empty())
+    {
+        Say("captures: no .bzframe files in %s", Utf8(folder).c_str());
+        return;
+    }
+    std::sort(bases.begin(), bases.end());
+    Say("captures: %u in %s; the model's change is in log2(blue / red): bluer +, warmer -", unsigned(bases.size()),
+        Utf8(folder).c_str());
+    std::vector<CaptureNumbers> all;
+    unsigned index = 0;
+    for (const std::wstring& base : bases)
+    {
+        CaptureNumbers numbers;
+        if (OneCapture(++index, folder, base, replay, &numbers))
+            all.push_back(numbers);
+    }
+    CaptureSummary(all);
+}
+
+// The model on pictures of our own, for --captures: a feature per size (few: a process may only create so many),
+// kept for every capture of that size, with its Color, Depth (flat: 310.8 never reads it), MVec (still) and Output
+// textures. Each run starts from a reset and evaluates the same picture kReplayFrames times, as T6 does, so that the
+// model's history settles on it.
+struct ReplaySlot
+{
+    void* feature = nullptr;
+    NVSDK_NGX_Parameter* block = nullptr;
+    Inputs in;
+    ID3D12Resource* mask = nullptr; // made the first time a mask is given
+};
+
+void DropSlot(const Model& m, ReplaySlot* s)
+{
+    if (s->feature != nullptr)
+        m.release(s->feature);
+    for (ID3D12Resource* r : { s->in.colour, s->in.depth, s->in.motion, s->in.output, s->mask })
+        if (r != nullptr)
+            r->Release();
+    *s = ReplaySlot();
+}
+
+bool MakeSlot(const Model& m, unsigned w, unsigned h, ReplaySlot* s)
+{
+    const std::vector<float> flat(size_t(w) * h, 0.5f);
+    const std::vector<uint16_t> still(size_t(w) * h * 2, FloatToHalf(0.0f));
+    Inputs& in = s->in;
+    in.width = in.depthWidth = in.motionWidth = w;
+    in.height = in.depthHeight = in.motionHeight = h;
+    in.mvScaleX = float(w);
+    in.mvScaleY = float(h);
+    in.colour = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, D3D12_RESOURCE_FLAG_NONE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    in.depth = MakeFilled(DXGI_FORMAT_R32_FLOAT, w, h, flat.data(), w * 4);
+    in.motion = MakeFilled(DXGI_FORMAT_R16G16_FLOAT, w, h, still.data(), w * 4);
+    in.output = MakeOutput(w, h);
+    if (in.colour == nullptr || in.depth == nullptr || in.motion == nullptr || in.output == nullptr)
+    {
+        Say("    no textures of %ux%u for the replays", w, h);
+        return false;
+    }
+    s->feature = CreateOwn(m, w, h, nullptr, &s->block);
+    return s->feature != nullptr;
+}
+
+bool ReplayOn(const Model& m, std::vector<ReplaySlot>* slots, const Image& input, const Tunables& t, const Image* mask,
+              Image* output)
+{
+    ReplaySlot* slot = nullptr;
+    for (ReplaySlot& s : *slots)
+        if (s.in.width == input.width && s.in.height == input.height)
+            slot = &s;
+    if (slot == nullptr)
+    {
+        if (slots->size() >= 3)
+        {
+            DropSlot(m, &slots->front());
+            slots->erase(slots->begin());
+        }
+        slots->emplace_back();
+        if (!MakeSlot(m, input.width, input.height, &slots->back()))
+        {
+            DropSlot(m, &slots->back());
+            slots->pop_back();
+            return false;
+        }
+        slot = &slots->back();
+    }
+    const std::vector<uint16_t> rgba = ToHalfRgba(input.rgb, 0, input.Pixels());
+    if (!UploadNow(slot->in.colour, rgba.data(), input.width * 8, input.height,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+    {
+        Say("    the replay's picture could not be uploaded");
+        return false;
+    }
+    if (mask != nullptr)
+    {
+        if (slot->mask == nullptr)
+            slot->mask = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, input.width, input.height,
+                                     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const std::vector<uint16_t> texels = ToHalfRgba(mask->rgb, 0, mask->Pixels());
+        if (slot->mask == nullptr ||
+            !UploadNow(slot->mask, texels.data(), input.width * 8, input.height,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+        {
+            Say("    the replay's mask could not be made");
+            return false;
+        }
+        SetMask(slot->block, slot->mask, input.width, input.height);
+    }
+    output->width = input.width;
+    output->height = input.height;
+    const bool ran = Run(m, slot->feature, slot->block, slot->in, &t, kReplayFrames, &output->rgb);
+    if (mask != nullptr)
+        SetMask(slot->block, nullptr, 0, 0);
+    return ran;
+}
 } // namespace
 
 constexpr int kFaulted = -1;
@@ -2229,7 +3558,7 @@ int wmain(int argc, wchar_t** argv)
     if (!ParseOptions(argc, argv, &options))
         return Fail("usage: nrprobe [--model <path>] [--size WxH] [--evaluates N] [--init N] [--capability]\n"
                     "               [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first] [--tuning]\n"
-                    "               [--dumps <folder>] [--subrects]");
+                    "               [--dumps <folder>] [--subrects] [--captures <folder>]");
     if (options.model.empty())
     {
         const wchar_t* const known[] = { L"D:\\Program Files\\Epic Games\\TheWitcher3\\bin\\x64_dx12\\nvngx_dlssnr.dll",
@@ -2546,7 +3875,7 @@ int wmain(int argc, wchar_t** argv)
     else
         Say("output: could not be read back");
 
-    if ((options.tuning || options.subrects) && failures == 0)
+    if ((options.tuning || options.subrects || !options.captures.empty()) && failures == 0)
     {
         Model model;
         model.populate = bzPopulate;
@@ -2574,6 +3903,19 @@ int wmain(int argc, wchar_t** argv)
             {
                 Subrects9(model, handle, evalBlock, basic);
                 Subrects10(model, handle, evalBlock, basic);
+            }
+        }
+        if (!options.captures.empty())
+        {
+            if (model.allocate == nullptr)
+                Say("captures: skipped, they need parameter blocks of our own (not --capability)");
+            else
+            {
+                std::vector<ReplaySlot> slots;
+                Captures(options.captures, [&](const Image& input, const Tunables& t, const Image* mask, Image* output)
+                         { return ReplayOn(model, &slots, input, t, mask, output); });
+                for (ReplaySlot& s : slots)
+                    DropSlot(model, &s);
             }
         }
     }
