@@ -18,6 +18,12 @@
 // While the menu is open, timestamps around the pass and around the model are resolved into a readback ring the
 // same way, for its GPU time; a slot is read when it comes round again, kRing frames later.
 //
+// The capture build (a branch of its own, for the Witcher 3 colour drift; never released) turns the dump into a
+// capture every kCaptureSeconds, written to a folder named debug on the desktop: the dump, the whole frame as DLSS
+// made it, and the finished picture the game presented (capture.h). Around each, a window of kWindowFrames frames
+// goes without the composite, so that the game presents its own picture; the dump and the frame's copy are taken
+// kDumpInWindow frames in, the finished picture at the kPresentsToCapture-th present after the window opened.
+//
 // Nothing else reads back, waits or allocates per frame; the descriptors come from a ring, the constants are root
 // constants. One lock guards the whole state and is only ever tried, never waited for, on the evaluate path: a
 // second thread evaluating at the same time skips its frame. A second, small lock guards what the menu is handed of
@@ -30,8 +36,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <vector>
 
 #include "build_hash.h"
+#include "capture.h"
 #include "freeze.h"
 #include "log.h"
 #include "ngx_hook.h"
@@ -67,7 +75,13 @@ constexpr uint64_t kStatsLatency = 3;         // frames before a statistics copy
 constexpr uint64_t kStatsGiveUp = 60;         // ... and after which it is written off
 constexpr uint64_t kDumpLatency = 8;
 constexpr uint64_t kDumpGiveUp = 240;
-constexpr unsigned kMaxDumps = 16;            // per process: each is about 25 MB at 4K
+constexpr unsigned kMaxDumps = 20;            // per process: each capture is about 120 MB at 4K
+constexpr float kCaptureSeconds = 30.0f;      // the capture build: a capture this often, whatever DumpEvery says
+constexpr double kFirstCapture = 20.0;        // ... the first this long after NR starts
+constexpr uint64_t kWindowFrames = 16;        // frames without the composite around a capture
+constexpr uint64_t kDumpInWindow = 6;         // the frame of the window the dump and the frame's copy are taken at
+constexpr unsigned kPresentsToCapture = 8;    // the present after the window opened that the picture is taken at
+constexpr double kPictureWait = 3.0;          // seconds a landed dump waits for its finished picture
 constexpr unsigned kPreviewWidth = 768;       // the preview picture's width to aim for: a fifth of a 4K frame
 constexpr double kPreviewHold = 0.5;          // seconds the preview is kept after the menu last asked for it
 constexpr unsigned kTimestamps = 4;           // per frame: the pass begins, the model begins, the model ends, the
@@ -511,6 +525,9 @@ struct FrameInfo
     float colour = 0.0f;
     float maxGain = 0.0f;
     float highlight = 0.0f;
+    ModelSettings model; // the capture build's .bzframe: the model's parameters,
+    bool mask = false;   // whether it was given a control mask (the sky sliders),
+    bool dilate = false; // and motion vectors dilated by depth
 };
 
 // The statistics of one frame, handed from the render thread to the background thread that logs them.
@@ -676,6 +693,20 @@ struct Nr
     unsigned dumpHeight = 0;
     bool dumpFailed = false;
     FrameInfo dumpInfo; // written before dumpState becomes Ready, read by the background thread after
+
+    // The capture build: the window without the composite around a capture, and the copy of the whole frame taken
+    // beside its dump (made the first time one is due, again when the frame's size or format changes; read by the
+    // background thread like the dump).
+    bool windowOpen = false;
+    uint64_t windowStart = 0;                 // the NR frame the window opened at
+    bool armPending = false;                  // the finished picture is armed once the lock is released
+    std::atomic<bool> pictureArmed { false }; // ... and was: the background thread waits for it beside the dump
+    Buffer frameCopy;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT frameFootprint = {};
+    unsigned frameCopyWidth = 0;
+    unsigned frameCopyHeight = 0;
+    DXGI_FORMAT frameCopyFormat = DXGI_FORMAT_UNKNOWN;
+    bool frameCopyFailed = false;
 
     uint64_t frame = 0; // NR frames recorded
     double badgeUntil = 0.0;
@@ -1274,18 +1305,37 @@ void FillCreate(NVSDK_NGX_Parameter* params, unsigned width, unsigned height, co
         params->Set("DLSSNR.Hint.Render.Preset", m.preset.value);
 }
 
+// The six values the model is given at every evaluation: the user's where set, else the model's own defaults.
+struct ModelValues
+{
+    float intensity;
+    unsigned style;
+    float localStructure;
+    float localTone;
+    float skinStructure;
+    int autoMask;
+};
+
+ModelValues Values(const ModelSettings& m)
+{
+    return { m.intensity.set ? m.intensity.value : 1.0f,           m.style.set ? m.style.value : 0u,
+             m.localStructure.set ? m.localStructure.value : 1.0f, m.localTone.set ? m.localTone.value : 1.0f,
+             m.skinStructure.set ? m.skinStructure.value : -1.0f,  m.autoMask.set && m.autoMask.value != 0 ? 1 : 0 };
+}
+
 // The model's own parameters, which it reads at every evaluation, so a change shows from the next frame (a change of
 // Style, the two local strengths, skin structure or the auto mask also restarts the model's history). A key once
 // written stays in the block, so one the user has not set is written as the model's default, which is also what the
 // model takes for a key that is absent. Each with the type the model reads it as.
 void FillTunables(NVSDK_NGX_Parameter* p, const ModelSettings& m)
 {
-    p->Set("DLSSNR.Intensity", m.intensity.set ? m.intensity.value : 1.0f);
-    p->Set("DLSSNR.Style", m.style.set ? m.style.value : 0u);
-    p->Set("DLSSNR.LocalStructureStrength", m.localStructure.set ? m.localStructure.value : 1.0f);
-    p->Set("DLSSNR.LocalToneStrength", m.localTone.set ? m.localTone.value : 1.0f);
-    p->Set("DLSSNR.SkinStructureStrength", m.skinStructure.set ? m.skinStructure.value : -1.0f);
-    p->Set("DLSSNR.UseAutoMask", m.autoMask.set && m.autoMask.value != 0 ? 1 : 0);
+    const ModelValues v = Values(m);
+    p->Set("DLSSNR.Intensity", v.intensity);
+    p->Set("DLSSNR.Style", v.style);
+    p->Set("DLSSNR.LocalStructureStrength", v.localStructure);
+    p->Set("DLSSNR.LocalToneStrength", v.localTone);
+    p->Set("DLSSNR.SkinStructureStrength", v.skinStructure);
+    p->Set("DLSSNR.UseAutoMask", v.autoMask);
 }
 
 void DescribeFrame(const Frame& f)
@@ -1575,6 +1625,34 @@ bool EnsureDump(const Frame& f)
     DropBuffer(&g_nr.dump);
     DropBuffer(&g_nr.dumpReadback);
     g_nr.dumpFailed = true;
+    return false;
+}
+
+// The capture build: the readback buffer the whole frame is copied into, in the Output's own format. Only called
+// while no dump is in flight, like EnsureDump.
+bool EnsureFrameCopy(const Frame& f)
+{
+    if (g_nr.frameCopy.resource != nullptr && g_nr.frameCopyWidth == f.width && g_nr.frameCopyHeight == f.height &&
+        g_nr.frameCopyFormat == f.outputDesc.Format)
+        return true;
+    if (g_nr.frameCopyFailed)
+        return false;
+    DropBuffer(&g_nr.frameCopy);
+    D3D12_RESOURCE_DESC desc = f.outputDesc;
+    desc.Width = f.width;
+    desc.Height = f.height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    UINT64 bytes = 0;
+    g_nr.device->GetCopyableFootprints(&desc, 0, 1, 0, &g_nr.frameFootprint, nullptr, nullptr, &bytes);
+    if (bytes != 0 && bytes != UINT64_MAX && MakeBuffer(&g_nr.frameCopy, D3D12_HEAP_TYPE_READBACK, bytes, "frame copy"))
+    {
+        g_nr.frameCopyWidth = f.width;
+        g_nr.frameCopyHeight = f.height;
+        g_nr.frameCopyFormat = f.outputDesc.Format;
+        return true;
+    }
+    g_nr.frameCopyFailed = true;
     return false;
 }
 
@@ -1939,6 +2017,27 @@ void CopyOut(ID3D12GraphicsCommandList* list, const Buffer& from, const Buffer& 
     list->ResourceBarrier(1, &barrier);
 }
 
+// The capture build: the frame's subrect of the Output, as DLSS made it, into the frame's readback buffer. The Output
+// is in NPSR before and after.
+void CopyFrame(ID3D12GraphicsCommandList* list, const Frame& f)
+{
+    D3D12_RESOURCE_BARRIER barrier;
+    Transition(&barrier, f.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION to = {};
+    to.pResource = g_nr.frameCopy.resource;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint = g_nr.frameFootprint;
+    D3D12_TEXTURE_COPY_LOCATION from = {};
+    from.pResource = f.output;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    from.SubresourceIndex = 0;
+    const D3D12_BOX box = { f.baseX, f.baseY, 0, f.baseX + f.width, f.baseY + f.height, 1 };
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+    Transition(&barrier, f.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(1, &barrier);
+}
+
 // Copies the subrect of a typeless guide into its typed clone; the source is back in NPSR when it returns.
 void Clone(ID3D12GraphicsCommandList* list, ID3D12Resource* source, unsigned baseX, unsigned baseY,
            const Texture& clone)
@@ -2144,6 +2243,7 @@ FrameInfo Info(const Frame& f, const Settings& s, WhiteSource source, const NrCo
     info.colour = s.colourStrength;
     info.maxGain = s.maxGainEV;
     info.highlight = s.highlightRestore;
+    info.model = s.model;
     return info;
 }
 
@@ -2228,8 +2328,29 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const bool stats = !g_nr.statsPending && (logStats || previewing) && EnsureStats();
     if (stats && logStats)
         g_nr.statsWanted.store(false, std::memory_order_relaxed);
-    const bool dumpDue = g_nr.dumpState.load(std::memory_order_acquire) == kDumpIdle &&
-                         g_nr.dumpWanted.load(std::memory_order_relaxed) && EnsureDump(f);
+    // A capture opens its window at once; its dump and the frame's copy come kDumpInWindow frames into it.
+    const bool captureWanted =
+        g_nr.dumpState.load(std::memory_order_acquire) == kDumpIdle && g_nr.dumpWanted.load(std::memory_order_relaxed);
+    if (g_nr.windowOpen && frameIndex - g_nr.windowStart >= kWindowFrames)
+        g_nr.windowOpen = false;
+    if (captureWanted && !g_nr.windowOpen)
+    {
+        if (EnsureDump(f) && EnsureFrameCopy(f))
+        {
+            g_nr.windowOpen = true;
+            g_nr.windowStart = frameIndex;
+            g_nr.armPending = true;
+            g_nr.pictureArmed.store(false, std::memory_order_relaxed);
+        }
+        else
+        {
+            g_nr.dumpWanted.store(false, std::memory_order_relaxed);
+            Log("NR: capture dropped: no buffers for it");
+        }
+    }
+    const bool window = g_nr.windowOpen;
+    const bool captureFrame = window && frameIndex == g_nr.windowStart + kDumpInWindow;
+    const bool dumpDue = captureFrame && captureWanted && EnsureDump(f) && EnsureFrameCopy(f);
     const DumpLayout layout = dumpDue ? Layout(f.width, f.height) : DumpLayout {};
     const bool preview = previewing && EnsurePreview(f);
 
@@ -2420,6 +2541,11 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const bool delivered = result == NVSDK_NGX_Result_Success;
     const bool dump = dumpDue && delivered;
     const bool fit = scaled && delivered;
+    if (captureFrame && captureWanted && !dump)
+    {
+        g_nr.dumpWanted.store(false, std::memory_order_relaxed); // the next one comes kCaptureSeconds later
+        Log("NR: capture dropped: %s", dumpDue ? "the model did not deliver its frame" : "no buffers for it");
+    }
 
     // 5: the model's output, and with ModelScale the fit over it.
     count = 0;
@@ -2454,7 +2580,10 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
             Dispatch(list, g_nr.statsPipeline, compositeTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
         }
         if (dump)
+        {
             DumpPasses(list, dumpTable, constants, NR_MODE_DUMP_BEFORE, layout);
+            CopyFrame(list, f);
+        }
         Transition(&barriers[0], f.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->ResourceBarrier(1, barriers);
@@ -2466,7 +2595,10 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         }
         constants.mode = NR_MODE_COMPOSITE;
         constants.badgeSize = LogClock() < g_nr.badgeUntil ? g_nr.badgeSize : 0;
-        Dispatch(list, g_nr.pipeline, compositeTable, constants, groupsX, groupsY);
+        NrConstants composite = constants;
+        if (window)
+            composite.detail = 0.0f; // a capture's window: the frame stays as DLSS made it
+        Dispatch(list, g_nr.pipeline, compositeTable, composite, groupsX, groupsY);
         constants.badgeSize = 0;
         if (dump)
         {
@@ -2534,6 +2666,8 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         CopyOut(list, g_nr.dump, g_nr.dumpReadback, 0);
         g_nr.dumpInfo = Info(f, s, source, constants, frameIndex, feature);
         g_nr.dumpInfo.modelRan = true;
+        g_nr.dumpInfo.mask = sky;
+        g_nr.dumpInfo.dilate = dilate;
         g_nr.dumpWanted.store(false, std::memory_order_relaxed);
         g_nr.dumpState.store(kDumpRecorded, std::memory_order_relaxed);
     }
@@ -2742,25 +2876,31 @@ void ExeName(wchar_t* out, size_t size)
     wcsncpy_s(out, size, name, _TRUNCATE);
 }
 
-void WriteDump(unsigned index)
+// One file: a header, then `bytes` from a mapped readback buffer. False if any of it was not written.
+bool WriteRows(const wchar_t* path, const void* header, DWORD headerBytes, const uint8_t* data, uint64_t bytes)
+{
+    const HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    DWORD written = 0;
+    bool ok = WriteFile(file, header, headerBytes, &written, nullptr) && written == headerBytes;
+    while (ok && bytes != 0)
+    {
+        const DWORD chunk = DWORD(bytes < (16u << 20) ? bytes : (16u << 20));
+        ok = WriteFile(file, data, chunk, &written, nullptr) && written == chunk;
+        data += chunk;
+        bytes -= chunk;
+    }
+    CloseHandle(file);
+    return ok;
+}
+
+bool WriteDump(const wchar_t* path)
 {
     const FrameInfo& info = g_nr.dumpInfo;
     const DumpLayout layout = Layout(info.width, info.height);
-    wchar_t folder[MAX_PATH];
-    if (!LocalFolder(L"dumps", folder, MAX_PATH))
-    {
-        Log("NR: no folder for frame dumps under %%LOCALAPPDATA%%\\Banana-Zero; dump dropped");
-        return;
-    }
     wchar_t exe[64];
     ExeName(exe, 64);
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    wchar_t path[MAX_PATH];
-    swprintf_s(path, MAX_PATH, L"%ls\\%ls-%04u%02u%02u-%02u%02u%02u-f%llu.bzdump", folder, exe, unsigned(now.wYear),
-               unsigned(now.wMonth), unsigned(now.wDay), unsigned(now.wHour), unsigned(now.wMinute),
-               unsigned(now.wSecond), static_cast<unsigned long long>(info.frame));
-
     DumpHeader header = {};
     memcpy(header.magic, "BZDUMP1", 8);
     header.headerBytes = sizeof header;
@@ -2791,36 +2931,305 @@ void WriteDump(unsigned index)
     header.maxGain = info.maxGain;
     header.highlight = info.highlight;
     WideCharToMultiByte(CP_UTF8, 0, exe, -1, header.exe, int(sizeof header.exe) - 1, nullptr, nullptr);
+    return WriteRows(path, &header, sizeof header, g_nr.dumpReadback.mapped, layout.bytes);
+}
+
+// The capture build's .bzframe file (nrprobe reads it): this header, then the whole frame as DLSS made it, before the
+// composite: `height` rows of `rowBytes` bytes in the Output's own format, top row first (a row may be longer than its
+// pixels: the copy's row pitch).
+struct FrameFileHeader
+{
+    char magic[8];        // "BZFRAME1"
+    uint64_t frame;       // our frame counter: the .bzdump's
+    uint32_t headerBytes; // sizeof(FrameFileHeader)
+    uint32_t format;      // DXGI_FORMAT of the rows
+    uint32_t width;       // the frame
+    uint32_t height;
+    uint32_t rowBytes;
+    uint32_t modelWidth; // the model's picture (ModelScale)
+    uint32_t modelHeight;
+    uint32_t windowFrames; // the window the capture was taken in: kWindowFrames, kDumpInWindow, kPresentsToCapture
+    uint32_t dumpInWindow;
+    uint32_t presentsToCapture;
+    // What the model was given besides its picture: its six parameters, a control mask (the sky sliders), motion
+    // vectors dilated by depth.
+    float intensity;
+    uint32_t style;
+    float localStructure;
+    float localTone;
+    float skinStructure;
+    uint32_t autoMask;
+    uint32_t mask;
+    uint32_t dilate;
+    // The finished picture, the .bmp beside it: the back buffer's DXGI_FORMAT (0: there is none) and size, and
+    // whether the display was in HDR mode.
+    uint32_t pictureFormat;
+    uint32_t pictureWidth;
+    uint32_t pictureHeight;
+    uint32_t displayHdr;
+    char exe[64]; // the game's executable, without .exe, UTF-8
+};
+static_assert(sizeof(FrameFileHeader) == 168, "nrprobe reads this layout");
+
+bool WriteFrame(const wchar_t* path, const CapturePicture* picture)
+{
+    const FrameInfo& info = g_nr.dumpInfo;
+    const D3D12_SUBRESOURCE_FOOTPRINT& rows = g_nr.frameFootprint.Footprint;
+    wchar_t exe[64];
+    ExeName(exe, 64);
+    FrameFileHeader header = {};
+    memcpy(header.magic, "BZFRAME1", 8);
+    header.frame = info.frame;
+    header.headerBytes = sizeof header;
+    header.format = uint32_t(g_nr.frameCopyFormat);
+    header.width = rows.Width;
+    header.height = rows.Height;
+    header.rowBytes = rows.RowPitch;
+    header.modelWidth = info.modelWidth;
+    header.modelHeight = info.modelHeight;
+    header.windowFrames = uint32_t(kWindowFrames);
+    header.dumpInWindow = uint32_t(kDumpInWindow);
+    header.presentsToCapture = kPresentsToCapture;
+    const ModelValues v = Values(info.model);
+    header.intensity = v.intensity;
+    header.style = v.style;
+    header.localStructure = v.localStructure;
+    header.localTone = v.localTone;
+    header.skinStructure = v.skinStructure;
+    header.autoMask = uint32_t(v.autoMask);
+    header.mask = info.mask ? 1u : 0u;
+    header.dilate = info.dilate ? 1u : 0u;
+    if (picture != nullptr)
+    {
+        header.pictureFormat = uint32_t(picture->format);
+        header.pictureWidth = picture->width;
+        header.pictureHeight = picture->height;
+        header.displayHdr = picture->displayHdr ? 1u : 0u;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, exe, -1, header.exe, int(sizeof header.exe) - 1, nullptr, nullptr);
+    return WriteRows(path, &header, sizeof header, g_nr.frameCopy.mapped, uint64_t(rows.RowPitch) * rows.Height);
+}
+
+float HalfBits(uint16_t half)
+{
+    const uint32_t sign = uint32_t(half >> 15) << 31;
+    const uint32_t exponent = (half >> 10) & 31u;
+    const uint32_t mantissa = half & 1023u;
+    if (exponent == 0)
+        return (sign != 0 ? -1.0f : 1.0f) * std::ldexp(float(mantissa), -24);
+    const uint32_t bits =
+        exponent == 31 ? sign | 0x7F800000u | (mantissa << 13) : sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    return FloatBits(bits);
+}
+
+// The finished picture as a 24-bit BMP, the way a screenshot shows it: 8-bit formats as they are, 10-bit rounded to
+// 8 bits, FP16 (scRGB, linear) through sRGB. False for a format it does not know, or when the file was not written.
+bool WriteBmp(const wchar_t* path, const CapturePicture& p)
+{
+    enum Kind
+    {
+        kRgba8,
+        kBgra8,
+        kRgb10,
+        kHalf
+    };
+    Kind kind = kRgba8;
+    switch (p.format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        kind = kRgba8;
+        break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+        kind = kBgra8;
+        break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        kind = kRgb10;
+        break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        kind = kHalf;
+        break;
+    default:
+        return false;
+    }
+#pragma pack(push, 2)
+    struct BmpHeader
+    {
+        uint16_t type;
+        uint32_t fileBytes;
+        uint32_t reserved;
+        uint32_t pixelsAt;
+        uint32_t infoBytes;
+        int32_t width;
+        int32_t height; // positive: the bottom row first
+        uint16_t planes;
+        uint16_t bits;
+        uint32_t compression;
+        uint32_t pixelBytes;
+        int32_t xPerMetre;
+        int32_t yPerMetre;
+        uint32_t colours;
+        uint32_t important;
+    };
+#pragma pack(pop)
+    static_assert(sizeof(BmpHeader) == 54, "the BMP file and info headers");
+    const uint32_t rowBytes = (p.width * 3 + 3) & ~3u;
+    BmpHeader header = {};
+    header.type = 0x4D42; // "BM"
+    header.pixelsAt = sizeof header;
+    header.pixelBytes = rowBytes * p.height;
+    header.fileBytes = header.pixelsAt + header.pixelBytes;
+    header.infoBytes = 40;
+    header.width = int32_t(p.width);
+    header.height = int32_t(p.height);
+    header.planes = 1;
+    header.bits = 24;
+    header.xPerMetre = header.yPerMetre = 2835; // 72 dpi
 
     const HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
-    {
-        Log("NR: frame dump %ls not written (%lu)", path, GetLastError());
-        return;
-    }
+        return false;
     DWORD written = 0;
     bool ok = WriteFile(file, &header, sizeof header, &written, nullptr) && written == sizeof header;
-    const uint8_t* data = g_nr.dumpReadback.mapped;
-    uint64_t left = layout.bytes;
-    while (ok && left != 0)
+    auto eight = [](float v) { return uint8_t(v > 0.0f ? (v < 1.0f ? v * 255.0f + 0.5f : 255.0f) : 0.0f); };
+    auto srgb = [](float v)
     {
-        const DWORD chunk = DWORD(left < (16u << 20) ? left : (16u << 20));
-        ok = WriteFile(file, data, chunk, &written, nullptr) && written == chunk;
-        data += chunk;
-        left -= chunk;
+        v = v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f; // NaN too
+        return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+    };
+    constexpr unsigned kRowsAtOnce = 64;
+    std::vector<uint8_t> chunk(size_t(rowBytes) * kRowsAtOnce, 0);
+    unsigned filled = 0;
+    for (unsigned done = 0; ok && done < p.height; ++done)
+    {
+        const uint8_t* from = p.data + size_t(p.height - 1 - done) * p.rowPitch;
+        uint8_t* to = chunk.data() + size_t(filled) * rowBytes;
+        for (unsigned x = 0; x < p.width; ++x)
+        {
+            uint8_t r, g, b;
+            if (kind == kRgba8 || kind == kBgra8)
+            {
+                const uint8_t* q = from + size_t(x) * 4;
+                r = kind == kRgba8 ? q[0] : q[2];
+                g = q[1];
+                b = kind == kRgba8 ? q[2] : q[0];
+            }
+            else if (kind == kRgb10)
+            {
+                uint32_t v;
+                memcpy(&v, from + size_t(x) * 4, 4);
+                r = uint8_t(((v & 1023u) * 255u + 511u) / 1023u);
+                g = uint8_t((((v >> 10) & 1023u) * 255u + 511u) / 1023u);
+                b = uint8_t((((v >> 20) & 1023u) * 255u + 511u) / 1023u);
+            }
+            else
+            {
+                uint16_t h[3];
+                memcpy(h, from + size_t(x) * 8, 6);
+                r = eight(srgb(HalfBits(h[0])));
+                g = eight(srgb(HalfBits(h[1])));
+                b = eight(srgb(HalfBits(h[2])));
+            }
+            to[x * 3] = b;
+            to[x * 3 + 1] = g;
+            to[x * 3 + 2] = r;
+        }
+        if (++filled == kRowsAtOnce || done + 1 == p.height)
+        {
+            const DWORD bytes = DWORD(size_t(filled) * rowBytes);
+            ok = WriteFile(file, chunk.data(), bytes, &written, nullptr) && written == bytes;
+            filled = 0;
+        }
     }
     CloseHandle(file);
-    Log("NR: frame dump %u of at most %u, frame %llu: %ls (%.1f MB)%s", index, kMaxDumps,
-        static_cast<unsigned long long>(info.frame), path, double(layout.bytes + sizeof header) / 1048576.0,
-        ok ? "" : "; writing it failed");
+    return ok;
+}
+
+// The capture build's folder: debug on the desktop, wherever Windows keeps the desktop, made if need be; else
+// %LOCALAPPDATA%\Banana-Zero\dumps. False when neither can be had.
+bool CaptureFolder(wchar_t* out, size_t size)
+{
+    using KnownFolderPath = HRESULT(WINAPI*)(const GUID&, DWORD, HANDLE, PWSTR*);
+    using TaskMemFree = void(WINAPI*)(void*);
+    static const GUID kDesktop = { 0xB4BFCC3A, 0xDB2C, 0x424C, { 0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41 } };
+    const HMODULE shell = LoadLibraryW(L"shell32.dll");
+    const HMODULE ole = LoadLibraryW(L"ole32.dll");
+    const auto known = shell != nullptr ? Proc<KnownFolderPath>(shell, "SHGetKnownFolderPath") : nullptr;
+    const auto taskFree = ole != nullptr ? Proc<TaskMemFree>(ole, "CoTaskMemFree") : nullptr;
+    PWSTR desktop = nullptr;
+    bool ok = known != nullptr && taskFree != nullptr && SUCCEEDED(known(kDesktop, 0, nullptr, &desktop)) &&
+              desktop != nullptr && wcslen(desktop) + 7 < size;
+    if (ok)
+    {
+        wcscpy_s(out, size, desktop);
+        wcscat_s(out, size, L"\\debug");
+        CreateDirectoryW(out, nullptr);
+        const DWORD attributes = GetFileAttributesW(out);
+        ok = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+    if (desktop != nullptr && taskFree != nullptr)
+        taskFree(desktop);
+    return ok || LocalFolder(L"dumps", out, size);
+}
+
+// <folder>\<game>-<date>-<time>: the path of a capture's files without their extensions.
+void CaptureBase(const wchar_t* folder, wchar_t* out, size_t size)
+{
+    wchar_t exe[64];
+    ExeName(exe, 64);
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    swprintf_s(out, size, L"%ls\\%ls-%04u%02u%02u-%02u%02u%02u", folder, exe, unsigned(now.wYear), unsigned(now.wMonth),
+               unsigned(now.wDay), unsigned(now.wHour), unsigned(now.wMinute), unsigned(now.wSecond));
+}
+
+// One capture's files side by side: <base>.bzdump, <base>.bzframe and, with a picture, <base>.bmp.
+void WriteCapture(unsigned index, const wchar_t* base, const CapturePicture* picture)
+{
+    wchar_t path[MAX_PATH];
+    const bool dump = swprintf_s(path, MAX_PATH, L"%ls.bzdump", base) > 0 && WriteDump(path);
+    const bool frame = swprintf_s(path, MAX_PATH, L"%ls.bzframe", base) > 0 && WriteFrame(path, picture);
+    const bool shot =
+        picture != nullptr && swprintf_s(path, MAX_PATH, L"%ls.bmp", base) > 0 && WriteBmp(path, *picture);
+    char format[32] = "-";
+    if (picture != nullptr)
+        DescribeFormat(picture->format, format, sizeof format);
+    Log("NR: capture %u of at most %u, frame %llu: %ls: dump %s, frame %s, finished picture %s (%s, %ux%u, display "
+        "%s)",
+        index, kMaxDumps, static_cast<unsigned long long>(g_nr.dumpInfo.frame), base, dump ? "written" : "NOT written",
+        frame ? "written" : "NOT written",
+        picture == nullptr ? "none"
+        : shot             ? "written"
+                           : "NOT written",
+        format, picture != nullptr ? picture->width : 0, picture != nullptr ? picture->height : 0,
+        picture == nullptr    ? "-"
+        : picture->displayHdr ? "HDR"
+                              : "SDR");
 }
 
 DWORD WINAPI Worker(void*)
 {
     double nextStats = 0.0;
-    double nextDump = 0.0;
-    unsigned dumps = 0;
-    bool dumpLimitSaid = false;
+    double nextCapture = 0.0;
+    unsigned captures = 0;
+    bool limitSaid = false;
+    wchar_t folder[MAX_PATH] = {};
+    wchar_t base[MAX_PATH] = {}; // the capture asked for last: its files' path without the extensions
+    double readyAt = 0.0;        // when its dump was first seen landed
+    CapturePicture picture = {};
+    bool havePicture = false;
+    const bool haveFolder = CaptureFolder(folder, MAX_PATH);
+    if (haveFolder)
+        Log("NR: the capture build: a capture every %.0f s while NR runs, at most %u, into %ls",
+            double(kCaptureSeconds), kMaxDumps, folder);
+    else
+        Log("NR: the capture build: no folder for the captures (the desktop's debug, %%LOCALAPPDATA%%); none taken");
     while (!g_nr.off.load(std::memory_order_acquire) || g_nr.dumpState.load(std::memory_order_acquire) == kDumpReady)
     {
         Sleep(250);
@@ -2847,31 +3256,50 @@ DWORD WINAPI Worker(void*)
             nextStats = 0.0;
         }
 
-        int ready = kDumpReady;
-        if (g_nr.dumpState.compare_exchange_strong(ready, kDumpWriting, std::memory_order_acquire))
+        // A capture: its dump and frame once they have landed, with its finished picture once that has too (or
+        // kPictureWait later without it).
+        if (g_nr.dumpState.load(std::memory_order_acquire) == kDumpReady)
         {
-            WriteDump(++dumps);
-            g_nr.dumpState.store(kDumpIdle, std::memory_order_release);
-        }
-        if (s->dumpSeconds > 0.0f && dumps < kMaxDumps)
-        {
-            // The first a little after dumps are switched on (or NR starts), then every DumpEvery seconds.
-            if (nextDump == 0.0)
-                nextDump = now + (s->dumpSeconds < 20.0f ? double(s->dumpSeconds) : 20.0);
-            if (now >= nextDump)
+            if (readyAt == 0.0)
+                readyAt = now;
+            const bool armed = g_nr.pictureArmed.load(std::memory_order_acquire);
+            if (armed && !havePicture)
+                havePicture = CaptureTake(&picture);
+            if (havePicture || !armed || now - readyAt >= kPictureWait)
             {
+                int ready = kDumpReady;
+                if (g_nr.dumpState.compare_exchange_strong(ready, kDumpWriting, std::memory_order_acquire))
+                {
+                    WriteCapture(++captures, base, havePicture ? &picture : nullptr);
+                    g_nr.dumpState.store(kDumpIdle, std::memory_order_release);
+                }
+                if (havePicture)
+                    CaptureDone();
+                else
+                    CaptureCancel();
+                havePicture = false;
+                readyAt = 0.0;
+            }
+        }
+        if (haveFolder && captures < kMaxDumps)
+        {
+            // The first a little after NR starts, then every kCaptureSeconds, whatever DumpEvery says.
+            if (nextCapture == 0.0)
+                nextCapture = now + kFirstCapture;
+            if (now >= nextCapture)
+            {
+                CaptureBase(folder, base, MAX_PATH);
                 g_nr.dumpWanted.store(true, std::memory_order_relaxed);
-                nextDump = now + double(s->dumpSeconds);
+                nextCapture = now + double(kCaptureSeconds);
             }
         }
         else
         {
             g_nr.dumpWanted.store(false, std::memory_order_relaxed);
-            nextDump = 0.0;
-            if (dumps >= kMaxDumps && !dumpLimitSaid)
+            if (captures >= kMaxDumps && !limitSaid)
             {
-                dumpLimitSaid = true;
-                Log("NR: %u frame dumps written; no more in this process", dumps);
+                limitSaid = true;
+                Log("NR: %u captures written; no more in this process", captures);
             }
         }
     }
@@ -3046,7 +3474,12 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
     const Skip skip = Evaluate(list, params, source);
     if (g_nr.attempted.load(std::memory_order_relaxed))
         PublishStatus();
+    const bool arm = g_nr.armPending;
+    g_nr.armPending = false;
     ReleaseSRWLockExclusive(&g_lock);
+    // A capture's finished picture, armed outside the lock: the first time, the overlay probes the swap chain.
+    if (arm)
+        g_nr.pictureArmed.store(CaptureArm(list, kPresentsToCapture), std::memory_order_release);
     if (skip != kSkipNone)
         CountSkip(skip, source);
 }
@@ -3122,6 +3555,7 @@ void ReleaseBuffers()
     {
         DropBuffer(&g_nr.dump);
         DropBuffer(&g_nr.dumpReadback);
+        DropBuffer(&g_nr.frameCopy);
     }
 }
 

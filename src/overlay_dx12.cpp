@@ -9,6 +9,9 @@
 // it is, FP16 as scRGB, 10-bit under an HDR display as PQ), on the queue the chain presents from, so that it lands
 // after everything the game drew. Nothing of the chain's is kept between two presents (no buffer, no view), so the
 // game's ResizeBuffers needs nothing from us: the next present sees the new size and format.
+//
+// The capture build (capture.h) has the entries point at us while a capture is armed as well: at its present the back
+// buffer is copied into a readback buffer of ours, on the same queue, before the menu (if open) is drawn onto it.
 
 #include "overlay_dx12.h"
 
@@ -25,6 +28,7 @@
 
 #include "backends/imgui_impl_dx12.h"
 #include "backends/imgui_impl_win32.h"
+#include "capture.h"
 #include "log.h"
 #include "menu.h"
 #include "menu_input.h"
@@ -180,6 +184,30 @@ struct Overlay
 };
 
 Overlay g;
+
+// The capture build's finished picture (capture.h): Idle -> Armed (CaptureArm) -> Copied (the copy is on the chain's
+// queue) -> Reading (CaptureTake: the background thread reads it) -> Idle (CaptureDone). Under the menu's lock; the
+// hook's first look at the state is the one read without it.
+enum CaptureState : int
+{
+    kCaptureIdle,
+    kCaptureArmed,
+    kCaptureCopied,
+    kCaptureReading,
+};
+
+struct Capture
+{
+    std::atomic<int> state { kCaptureIdle };
+    unsigned presentsLeft = 0;
+    ID3D12Resource* readback = nullptr; // mapped for good
+    const uint8_t* mapped = nullptr;
+    uint64_t bytes = 0;
+    uint64_t fenceValue = 0; // our fence's value once the copy is done
+    CapturePicture picture = {};
+};
+
+Capture g_capture;
 
 template <typename T> void Release(T** object)
 {
@@ -824,29 +852,34 @@ void ShutdownImGui()
 // ---------------------------------------------------------------------------------------------------------------
 // The frame.
 
+// Whether the display is in HDR mode, asked of the chain's output at most every kOutputCheckSeconds.
+void CheckOutput(IDXGISwapChain* chain)
+{
+    const double now = LogClock();
+    if (now - g.outputCheckedAt < kOutputCheckSeconds)
+        return;
+    g.outputCheckedAt = now;
+    IDXGIOutput* output = nullptr;
+    IDXGIOutput6* output6 = nullptr;
+    bool hdr = false;
+    if (SUCCEEDED(chain->GetContainingOutput(&output)) && output != nullptr &&
+        SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6))) && output6 != nullptr)
+    {
+        DXGI_OUTPUT_DESC1 desc;
+        if (SUCCEEDED(output6->GetDesc1(&desc)))
+            hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    }
+    Release(&output6);
+    Release(&output);
+    if (hdr != g.displayHdr)
+        Log("menu: the display is in %s mode", hdr ? "HDR" : "SDR");
+    g.displayHdr = hdr;
+}
+
 // Which encoding the back buffer takes: by its format and the display's mode, or as MenuColour says.
 void ChooseMode(IDXGISwapChain* chain, const Settings& s)
 {
-    const double now = LogClock();
-    if (now - g.outputCheckedAt >= kOutputCheckSeconds)
-    {
-        g.outputCheckedAt = now;
-        IDXGIOutput* output = nullptr;
-        IDXGIOutput6* output6 = nullptr;
-        bool hdr = false;
-        if (SUCCEEDED(chain->GetContainingOutput(&output)) && output != nullptr &&
-            SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6))) && output6 != nullptr)
-        {
-            DXGI_OUTPUT_DESC1 desc;
-            if (SUCCEEDED(output6->GetDesc1(&desc)))
-                hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-        }
-        Release(&output6);
-        Release(&output);
-        if (hdr != g.displayHdr)
-            Log("menu: the display is in %s mode", hdr ? "HDR" : "SDR");
-        g.displayHdr = hdr;
-    }
+    CheckOutput(chain);
     const bool fp16 = g.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
     const bool tenBit = g.format == DXGI_FORMAT_R10G10B10A2_UNORM;
     bool hdr = g.displayHdr;
@@ -890,55 +923,109 @@ void Barrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOU
     g.list->ResourceBarrier(1, &barrier);
 }
 
+// Under the lock: the chain this present is for, adopted unless it already is: the real chain inside a wrapper, its
+// queue, our objects. False when it cannot be drawn on (said once per chain) or our objects cannot be made.
+bool AdoptLocked(IDXGISwapChain* chain, const DXGI_SWAP_CHAIN_DESC& desc)
+{
+    if (g.failure != nullptr)
+        return false;
+    if (chain == g.chain)
+        return true;
+    if (chain == g.refusedChain)
+        return false;
+    DropChain();
+    const bool ours = OurWindow(desc.OutputWindow);
+    bool unwrapped = false;
+    IDXGISwapChain* native = ours ? NativeChain(chain, g.dxgi, &unwrapped) : nullptr;
+    ID3D12CommandQueue* queue = native != nullptr ? FindQueue(native) : nullptr;
+    if (queue == nullptr)
+    {
+        if (unwrapped)
+            native->Release();
+        char module[64];
+        g.refusedChain = chain;
+        g.state = "no queue for the game's swap chain";
+        Log("menu: swap chain %p (window %p, %ux%u, format %d, table in %s): %s, the menu is not drawn on it", chain,
+            desc.OutputWindow, desc.BufferDesc.Width, desc.BufferDesc.Height, int(desc.BufferDesc.Format),
+            ModuleName(*reinterpret_cast<void* const*>(chain), module, sizeof module),
+            !ours               ? "not this process's window"
+            : native == nullptr ? "a wrapper and the real chain was not found in it"
+                                : "its queue was not found");
+        return false;
+    }
+    g.chain = chain;
+    g.native = native;
+    g.nativeOwned = unwrapped;
+    g.queue = queue;
+    g.window = desc.OutputWindow;
+    g.refusedChain = nullptr;
+    g.outputCheckedAt = -1.0e9;
+    Log("menu: drawing on swap chain %p%s, window %p, %ux%u, format %d, %u buffers", chain,
+        unwrapped ? " (the real one inside a wrapper)" : "", g.window, desc.BufferDesc.Width, desc.BufferDesc.Height,
+        int(desc.BufferDesc.Format), desc.BufferCount);
+    if (!MakeObjects())
+    {
+        g.failure = "the overlay's objects could not be made";
+        g.state = g.failure;
+        return false;
+    }
+    return true;
+}
+
+// Under the lock: the allocator for this submission, once the GPU is done with what it held kFrames submissions ago,
+// and the list reset onto it. Null when the GPU is far behind.
+Frame* BeginList()
+{
+    Frame& frame = g.frame[g.frameIndex % kFrames];
+    if (frame.fenceValue != 0 && g.fence->GetCompletedValue() < frame.fenceValue)
+    {
+        if (FAILED(g.fence->SetEventOnCompletion(frame.fenceValue, g.fenceEvent)) ||
+            WaitForSingleObject(g.fenceEvent, 1000) != WAIT_OBJECT_0)
+            return nullptr;
+    }
+    if (FAILED(frame.allocator->Reset()) || FAILED(g.list->Reset(frame.allocator, nullptr)))
+        return nullptr;
+    return &frame;
+}
+
+// Under the lock: the list closed and run on the chain's queue, our fence signalled after it.
+bool SubmitList(Frame* frame)
+{
+    if (FAILED(g.list->Close()))
+        return false;
+    ID3D12CommandList* lists[] = { g.list };
+    g.queue->ExecuteCommandLists(1, lists);
+    frame->fenceValue = ++g.fenceValue;
+    g.queue->Signal(g.fence, g.fenceValue);
+    ++g.frameIndex;
+    return true;
+}
+
+// The back buffer the chain is about to present, referenced; null when it cannot be had.
+ID3D12Resource* BackBuffer()
+{
+    IDXGISwapChain3* chain3 = nullptr;
+    ID3D12Resource* back = nullptr;
+    UINT index = 0;
+    if (SUCCEEDED(g.native->QueryInterface(IID_PPV_ARGS(&chain3))) && chain3 != nullptr)
+        index = chain3->GetCurrentBackBufferIndex();
+    Release(&chain3);
+    if (FAILED(g.native->GetBuffer(index, IID_PPV_ARGS(&back))))
+        back = nullptr;
+    return back;
+}
+
 // Under the menu's lock, with the menu open.
 void DrawLocked(IDXGISwapChain* chain)
 {
-    if (g.failure != nullptr)
-        return;
     DXGI_SWAP_CHAIN_DESC desc;
-    if (FAILED(chain->GetDesc(&desc)))
+    if (FAILED(chain->GetDesc(&desc)) || !AdoptLocked(chain, desc))
         return;
-
-    if (chain != g.chain)
+    if (!InitImGui(g.window))
     {
-        if (chain == g.refusedChain)
-            return;
-        DropChain();
-        const bool ours = OurWindow(desc.OutputWindow);
-        bool unwrapped = false;
-        IDXGISwapChain* native = ours ? NativeChain(chain, g.dxgi, &unwrapped) : nullptr;
-        ID3D12CommandQueue* queue = native != nullptr ? FindQueue(native) : nullptr;
-        if (queue == nullptr)
-        {
-            if (unwrapped)
-                native->Release();
-            char module[64];
-            g.refusedChain = chain;
-            g.state = "no queue for the game's swap chain";
-            Log("menu: swap chain %p (window %p, %ux%u, format %d, table in %s): %s, the menu is not drawn on it",
-                chain, desc.OutputWindow, desc.BufferDesc.Width, desc.BufferDesc.Height, int(desc.BufferDesc.Format),
-                ModuleName(*reinterpret_cast<void* const*>(chain), module, sizeof module),
-                !ours               ? "not this process's window"
-                : native == nullptr ? "a wrapper and the real chain was not found in it"
-                                    : "its queue was not found");
-            return;
-        }
-        g.chain = chain;
-        g.native = native;
-        g.nativeOwned = unwrapped;
-        g.queue = queue;
-        g.window = desc.OutputWindow;
-        g.refusedChain = nullptr;
-        g.outputCheckedAt = -1.0e9;
-        Log("menu: drawing on swap chain %p%s, window %p, %ux%u, format %d, %u buffers", chain,
-            unwrapped ? " (the real one inside a wrapper)" : "", g.window, desc.BufferDesc.Width,
-            desc.BufferDesc.Height, int(desc.BufferDesc.Format), desc.BufferCount);
-        if (!MakeObjects() || !InitImGui(g.window))
-        {
-            g.failure = "the overlay's objects could not be made";
-            g.state = g.failure;
-            return;
-        }
+        g.failure = "the overlay's objects could not be made";
+        g.state = g.failure;
+        return;
     }
     MenuInputAttach(g.window); // the keyboard and mouse, for as long as the menu is open (a no-op once attached)
     if (desc.BufferDesc.Width == 0 || desc.BufferDesc.Height == 0)
@@ -966,15 +1053,9 @@ void DrawLocked(IDXGISwapChain* chain)
     ChooseMode(g.native, s);
 
     // This frame's allocator: wait for the frame that used it kFrames presents ago.
-    Frame& frame = g.frame[g.frameIndex % kFrames];
-    if (frame.fenceValue != 0 && g.fence->GetCompletedValue() < frame.fenceValue)
-    {
-        if (FAILED(g.fence->SetEventOnCompletion(frame.fenceValue, g.fenceEvent)) ||
-            WaitForSingleObject(g.fenceEvent, 1000) != WAIT_OBJECT_0)
-            return; // the GPU is far behind: this frame goes without the menu
-    }
-    if (FAILED(frame.allocator->Reset()) || FAILED(g.list->Reset(frame.allocator, nullptr)))
-        return;
+    Frame* frame = BeginList();
+    if (frame == nullptr)
+        return; // the GPU is far behind: this frame goes without the menu
 
     // The ImGui frame.
     ScaleStyle(float(g.height) / 1080.0f);
@@ -997,13 +1078,8 @@ void DrawLocked(IDXGISwapChain* chain)
     Barrier(g.offscreen, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     // 2. The picture over the back buffer.
-    IDXGISwapChain3* chain3 = nullptr;
-    ID3D12Resource* back = nullptr;
-    UINT index = 0;
-    if (SUCCEEDED(g.native->QueryInterface(IID_PPV_ARGS(&chain3))) && chain3 != nullptr)
-        index = chain3->GetCurrentBackBufferIndex();
-    Release(&chain3);
-    if (FAILED(g.native->GetBuffer(index, IID_PPV_ARGS(&back))) || back == nullptr)
+    ID3D12Resource* back = BackBuffer();
+    if (back == nullptr)
     {
         g.list->Close();
         return;
@@ -1032,24 +1108,131 @@ void DrawLocked(IDXGISwapChain* chain)
     Barrier(back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     back->Release(); // before the game's ResizeBuffers could ask: the list holds no reference
 
-    if (FAILED(g.list->Close()))
+    if (!SubmitList(frame))
         return;
-    ID3D12CommandList* lists[] = { g.list };
-    g.queue->ExecuteCommandLists(1, lists);
-    frame.fenceValue = ++g.fenceValue;
-    g.queue->Signal(g.fence, g.fenceValue);
-    ++g.frameIndex;
     ++g.frames;
     g.state = "drawing";
 }
 
+// Under the lock: a readback buffer of at least `bytes`, mapped. A smaller one goes once our work on it is done.
+bool EnsureCaptureBuffer(uint64_t bytes)
+{
+    if (g_capture.readback != nullptr && g_capture.bytes >= bytes)
+        return true;
+    WaitForOurWork();
+    Release(&g_capture.readback);
+    g_capture.mapped = nullptr;
+    g_capture.bytes = 0;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    HRESULT hr = g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   nullptr, IID_PPV_ARGS(&g_capture.readback));
+    void* mapped = nullptr;
+    if (SUCCEEDED(hr))
+    {
+        const D3D12_RANGE all = { 0, SIZE_T(bytes) };
+        hr = g_capture.readback->Map(0, &all, &mapped);
+    }
+    if (FAILED(hr))
+    {
+        Log("capture: no readback buffer of %llu bytes for the finished picture: 0x%08X",
+            static_cast<unsigned long long>(bytes), unsigned(hr));
+        Release(&g_capture.readback);
+        return false;
+    }
+    g_capture.mapped = static_cast<const uint8_t*>(mapped);
+    g_capture.bytes = bytes;
+    return true;
+}
+
+// Under the lock, at each present while a capture is armed: at the last of its presents, the back buffer copied into
+// our readback buffer on the chain's queue, before the menu (if open) is drawn onto it.
+void CaptureLocked(IDXGISwapChain* chain)
+{
+    if (g_capture.presentsLeft > 1)
+    {
+        --g_capture.presentsLeft;
+        return;
+    }
+    const char* failure = nullptr;
+    DXGI_SWAP_CHAIN_DESC desc;
+    ID3D12Resource* back = nullptr;
+    if (FAILED(chain->GetDesc(&desc)) || !AdoptLocked(chain, desc))
+        failure = "the game's swap chain cannot be had";
+    else if ((back = BackBuffer()) == nullptr)
+        failure = "its back buffer cannot be had";
+    else
+    {
+        const D3D12_RESOURCE_DESC backDesc = back->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+        UINT64 bytes = 0;
+        g.device->GetCopyableFootprints(&backDesc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+        Frame* frame = nullptr;
+        if (bytes == 0 || bytes == UINT64_MAX || !EnsureCaptureBuffer(bytes))
+            failure = "no readback buffer";
+        else if ((frame = BeginList()) == nullptr)
+            failure = "the GPU is far behind";
+        else
+        {
+            Barrier(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION to = {};
+            to.pResource = g_capture.readback;
+            to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            to.PlacedFootprint = footprint;
+            D3D12_TEXTURE_COPY_LOCATION from = {};
+            from.pResource = back;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.SubresourceIndex = 0;
+            g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            Barrier(back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+            if (!SubmitList(frame))
+                failure = "the copy could not be recorded";
+            else
+            {
+                CheckOutput(g.native);
+                g_capture.fenceValue = frame->fenceValue;
+                g_capture.picture.data = g_capture.mapped;
+                g_capture.picture.width = footprint.Footprint.Width;
+                g_capture.picture.height = footprint.Footprint.Height;
+                g_capture.picture.rowPitch = footprint.Footprint.RowPitch;
+                g_capture.picture.format = backDesc.Format;
+                g_capture.picture.displayHdr = g.displayHdr;
+                g_capture.state.store(kCaptureCopied, std::memory_order_relaxed);
+            }
+        }
+    }
+    Release(&back);
+    if (failure != nullptr)
+    {
+        g_capture.state.store(kCaptureIdle, std::memory_order_relaxed);
+        Log("capture: no finished picture this time: %s", failure);
+    }
+}
+
+void Unpatch();
+
 void Draw(IDXGISwapChain* chain, UINT flags)
 {
-    if ((flags & DXGI_PRESENT_TEST) != 0 || !g.open.load(std::memory_order_acquire))
+    if ((flags & DXGI_PRESENT_TEST) != 0)
+        return;
+    if (!g.open.load(std::memory_order_acquire) && g_capture.state.load(std::memory_order_acquire) != kCaptureArmed)
         return;
     MenuLock();
+    if (g_capture.state.load(std::memory_order_relaxed) == kCaptureArmed)
+        CaptureLocked(chain);
     if (g.open.load(std::memory_order_relaxed))
         DrawLocked(chain);
+    else if (g_capture.state.load(std::memory_order_relaxed) != kCaptureArmed)
+        Unpatch(); // neither the menu nor a capture wants the presents any more
     MenuUnlock();
 }
 
@@ -1143,7 +1326,8 @@ void OverlayClose()
 {
     g.open.store(false, std::memory_order_release);
     MenuInputRelease();
-    Unpatch();
+    if (g_capture.state.load(std::memory_order_relaxed) != kCaptureArmed)
+        Unpatch(); // an armed capture keeps the presents until it is taken
     if (g.failure == nullptr)
         g.state = "closed";
 }
@@ -1151,9 +1335,17 @@ void OverlayClose()
 void OverlayRelease()
 {
     g.open.store(false, std::memory_order_release);
+    if (g_capture.state.load(std::memory_order_relaxed) != kCaptureReading)
+        g_capture.state.store(kCaptureIdle, std::memory_order_relaxed);
     MenuInputDetach();
     Unpatch();
     WaitForOurWork();
+    if (g_capture.state.load(std::memory_order_relaxed) != kCaptureReading)
+    {
+        Release(&g_capture.readback); // else the background thread is reading it: left for the rest of the process
+        g_capture.mapped = nullptr;
+        g_capture.bytes = 0;
+    }
     ShutdownImGui();
     Release(&g.offscreen);
     Release(&g.pipeline);
@@ -1224,3 +1416,66 @@ bool OverlayFrameSize(unsigned* width, unsigned* height)
 }
 
 const char* OverlayState() { return g.state; }
+
+bool CaptureArm(ID3D12GraphicsCommandList* list, unsigned presents)
+{
+    MenuLock();
+    if (g.device == nullptr && list != nullptr && FAILED(list->GetDevice(IID_PPV_ARGS(&g.device))))
+        g.device = nullptr;
+    const char* failure = nullptr;
+    if (g_capture.state.load(std::memory_order_relaxed) == kCaptureReading)
+        failure = "the last one is still being written";
+    else if (g.device == nullptr)
+        failure = "no device yet";
+    else if (g.failure != nullptr || !ProbeOnce())
+        failure = g.failure;
+    else
+    {
+        Patch();
+        failure = g.failure;
+    }
+    if (failure == nullptr)
+    {
+        g_capture.presentsLeft = presents > 0 ? presents : 1;
+        g_capture.state.store(kCaptureArmed, std::memory_order_release);
+    }
+    else
+        Log("capture: no finished picture this time: %s", failure);
+    MenuUnlock();
+    return failure == nullptr;
+}
+
+bool CaptureTake(CapturePicture* out)
+{
+    MenuLock();
+    const bool ready = g_capture.state.load(std::memory_order_relaxed) == kCaptureCopied && g.fence != nullptr &&
+                       g.fence->GetCompletedValue() >= g_capture.fenceValue;
+    if (ready)
+    {
+        *out = g_capture.picture;
+        g_capture.state.store(kCaptureReading, std::memory_order_relaxed);
+    }
+    MenuUnlock();
+    return ready;
+}
+
+void CaptureDone()
+{
+    MenuLock();
+    if (g_capture.state.load(std::memory_order_relaxed) == kCaptureReading)
+        g_capture.state.store(kCaptureIdle, std::memory_order_relaxed);
+    MenuUnlock();
+}
+
+void CaptureCancel()
+{
+    MenuLock();
+    const int state = g_capture.state.load(std::memory_order_relaxed);
+    if (state == kCaptureArmed || state == kCaptureCopied)
+    {
+        g_capture.state.store(kCaptureIdle, std::memory_order_relaxed);
+        if (!g.open.load(std::memory_order_relaxed))
+            Unpatch();
+    }
+    MenuUnlock();
+}
