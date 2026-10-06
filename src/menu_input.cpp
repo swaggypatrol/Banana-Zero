@@ -26,6 +26,8 @@
 #include "menu.h"
 #include "overlay_dx12.h"
 
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
 // From the Win32 backend, as its header says to declare it.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -43,6 +45,11 @@ constexpr USHORT kUsageKeyboard = 0x06;
 std::atomic<HWND> g_window { nullptr };
 std::atomic<bool> g_capture { false }; // the menu is open: ImGui sees the messages
 HHOOK g_hook = nullptr;
+// Where the raw input the menu keeps is sent instead of the game's window: a message-only window of ours on the
+// window's thread, made there by the hook the first time.
+HWND g_sink = nullptr;
+DWORD g_sinkThread = 0;
+bool g_saidNoSink = false;
 int g_front = -1; // the game in front, as ImGui was last told: -1 not yet, 0 no, 1 yes
 const char* g_state = "not attached";
 
@@ -272,6 +279,56 @@ bool OnRawInput(HWND window, LPARAM lParam)
 // ---------------------------------------------------------------------------------------------------------------
 // The message hook.
 
+LRESULT CALLBACK SinkProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    return DefWindowProcW(window, message, wParam, lParam); // for WM_INPUT, the system's clean-up of the raw data
+}
+
+// The sink on this thread, made if need be; null if it cannot be.
+HWND Sink()
+{
+    const DWORD thread = GetCurrentThreadId();
+    if (g_sink != nullptr && g_sinkThread == thread)
+        return g_sink;
+    const HINSTANCE instance = reinterpret_cast<HINSTANCE>(&__ImageBase);
+    WNDCLASSEXW windowClass = {};
+    windowClass.cbSize = sizeof windowClass;
+    windowClass.lpfnWndProc = &SinkProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = L"BananaZeroInputSink";
+    if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return nullptr;
+    const HWND sink = CreateWindowExW(0, windowClass.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                      instance, nullptr);
+    if (sink != nullptr)
+    {
+        g_sink = sink; // one before, on another thread, stays: that thread may still dispatch to it
+        g_sinkThread = thread;
+    }
+    return sink;
+}
+
+// A WM_INPUT the menu keeps goes to the sink. The raw data's handle (a USER object) is freed only when
+// DefWindowProc handles the message as it is dispatched: called from the hook, or skipped by a WM_NULL, it stayed,
+// one per mouse movement, and in Resident Evil Requiem the process ran out of USER objects after a minute or two in
+// the menu (SetWindowsHookEx then failed with 1158, and the game's own raw input stopped). Without a sink the game
+// gets the message.
+void Divert(MSG* msg)
+{
+    const HWND sink = Sink();
+    if (sink != nullptr)
+    {
+        msg->hwnd = sink;
+        return;
+    }
+    if (!g_saidNoSink)
+    {
+        g_saidNoSink = true;
+        Log("menu: input: no window of ours on the window's thread (error %lu): the game keeps its raw input",
+            GetLastError());
+    }
+}
+
 // Takes a message from the game: it becomes a WM_NULL, which the game's loop translates and dispatches as nothing.
 void Swallow(MSG* msg)
 {
@@ -298,10 +355,7 @@ void OnMessage(MSG* msg)
     if (message == WM_INPUT)
     {
         if (!OnRawInput(window, msg->lParam))
-        {
-            DefWindowProcW(window, message, msg->wParam, msg->lParam); // the system's part of WM_INPUT, not the game's
-            Swallow(msg);
-        }
+            Divert(msg);
         return;
     }
     const bool mouse = MouseMessage(message);
