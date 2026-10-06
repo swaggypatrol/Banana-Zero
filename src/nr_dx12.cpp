@@ -33,6 +33,7 @@
 
 #include "build_hash.h"
 #include "freeze.h"
+#include "list_state.h"
 #include "log.h"
 #include "ngx_hook.h"
 #include "nr_fit_shader.h"
@@ -134,6 +135,7 @@ enum Skip
     kSkipCreated,     // the model's feature was created this frame; its first evaluation is next frame
     kSkipWaiting,     // a rebuild is due but too soon after the last one
     kSkipTypedLoad,   // the GPU cannot read the Output's format through a UAV, which the in-place composite needs
+    kSkipState,       // what the game has bound on this list is not known yet (list_state.h)
     kSkipCount
 };
 
@@ -151,6 +153,7 @@ const char* const kSkipText[kSkipCount] = {
     "the model's feature was created this frame",
     "a rebuild is due but the last creation was fewer than 30 evaluations ago",
     "the GPU cannot load the Output's format through a UAV (typed UAV load), which the in-place composite needs",
+    "what the game has bound on this command list is not known yet, so it could not be bound again afterwards",
 };
 
 const char* ResultName(int result)
@@ -755,6 +758,35 @@ bool Join(const wchar_t* directory, const wchar_t* name, wchar_t* out, size_t si
     wcscpy_s(out, size, directory);
     wcscat_s(out, size, name);
     return true;
+}
+
+bool FileExists(const wchar_t* path)
+{
+    const DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// Where dlssnr.ini is: beside the game's exe, else beside this DLL. The two are one folder unless a loader runs the
+// DLLs from elsewhere: REFramework runs every DLL of the game's folder from copies in a _storage_ folder, where an
+// ini put in the game's folder was not seen. With the file in neither, beside the exe, where the menu then writes it.
+bool IniPath(wchar_t* out, size_t size)
+{
+    wchar_t directory[MAX_PATH];
+    wchar_t beside[MAX_PATH];
+    bool haveExe = false;
+    const DWORD length = GetModuleFileNameW(nullptr, directory, MAX_PATH);
+    wchar_t* slash = length != 0 && length < MAX_PATH ? wcsrchr(directory, L'\\') : nullptr;
+    if (slash != nullptr)
+    {
+        slash[1] = L'\0';
+        haveExe = Join(directory, L"dlssnr.ini", out, size);
+    }
+    if (haveExe && FileExists(out))
+        return true;
+    if (ModuleDirectory(directory, MAX_PATH) && Join(directory, L"dlssnr.ini", beside, MAX_PATH) &&
+        (!haveExe || FileExists(beside)))
+        return wcscpy_s(out, size, beside) == 0;
+    return haveExe;
 }
 
 // %LOCALAPPDATA%\Banana-Zero\<name>, created if need be. False if it cannot be made.
@@ -2934,16 +2966,18 @@ void PublishStatus()
 }
 
 // Under the lock: everything after the cheap checks.
-Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, const NrSource& source)
+// `game` is filled with what the game has bound on `list` before anything is recorded into it, and `*captured` set;
+// the caller binds it again afterwards.
+Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, const NrSource& source, ListState* game,
+              bool* captured)
 {
     if (g_nr.off.load(std::memory_order_relaxed))
         return kSkipOff; // turned off between the caller's check and its lock (the game shutting the core down)
     if (!g_nr.settingsLoaded)
     {
         g_nr.settingsLoaded = true;
-        wchar_t directory[MAX_PATH];
         wchar_t ini[MAX_PATH];
-        if (ModuleDirectory(directory, MAX_PATH) && Join(directory, L"dlssnr.ini", ini, MAX_PATH))
+        if (IniPath(ini, MAX_PATH))
             SettingsLoad(ini);
         StartWorker(); // after the first load: from here on only that thread reads the file
     }
@@ -2970,6 +3004,10 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
         return kSkipGeometry;
     }
     NoteFrame(frame, source.feature);
+    // Everything below may record into the game's list and bind state of its own (ours, the model's).
+    if (!ListStateCapture(list, game))
+        return kSkipState;
+    *captured = true;
     // The frozen frame (M3, freeze.h) goes first, NR on or off: with NR off the frozen picture still replaces the
     // game's Output, so that A/B and the split screen compare the same picture.
     FreezeApply(list, &frame);
@@ -3043,7 +3081,11 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
         CountSkip(kSkipBusy, source);
         return;
     }
-    const Skip skip = Evaluate(list, params, source);
+    static ListState game; // under g_lock
+    bool captured = false;
+    const Skip skip = Evaluate(list, params, source, &game, &captured);
+    if (captured)
+        ListStateRestore(list, game);
     if (g_nr.attempted.load(std::memory_order_relaxed))
         PublishStatus();
     ReleaseSRWLockExclusive(&g_lock);
