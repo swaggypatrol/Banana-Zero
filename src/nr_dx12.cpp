@@ -33,6 +33,7 @@
 
 #include "build_hash.h"
 #include "freeze.h"
+#include "list_state.h"
 #include "log.h"
 #include "ngx_hook.h"
 #include "nr_fit_shader.h"
@@ -134,6 +135,7 @@ enum Skip
     kSkipCreated,     // the model's feature was created this frame; its first evaluation is next frame
     kSkipWaiting,     // a rebuild is due but too soon after the last one
     kSkipTypedLoad,   // the GPU cannot read the Output's format through a UAV, which the in-place composite needs
+    kSkipState,       // what the game has bound on this list is not known yet (list_state.h)
     kSkipCount
 };
 
@@ -151,6 +153,7 @@ const char* const kSkipText[kSkipCount] = {
     "the model's feature was created this frame",
     "a rebuild is due but the last creation was fewer than 30 evaluations ago",
     "the GPU cannot load the Output's format through a UAV (typed UAV load), which the in-place composite needs",
+    "what the game has bound on this command list is not known yet, so it could not be bound again afterwards",
 };
 
 const char* ResultName(int result)
@@ -2934,7 +2937,10 @@ void PublishStatus()
 }
 
 // Under the lock: everything after the cheap checks.
-Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, const NrSource& source)
+// `game` is filled with what the game has bound on `list` before anything is recorded into it, and `*captured` set;
+// the caller binds it again afterwards.
+Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, const NrSource& source, ListState* game,
+              bool* captured)
 {
     if (g_nr.off.load(std::memory_order_relaxed))
         return kSkipOff; // turned off between the caller's check and its lock (the game shutting the core down)
@@ -2970,6 +2976,10 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
         return kSkipGeometry;
     }
     NoteFrame(frame, source.feature);
+    // Everything below may record into the game's list and bind state of its own (ours, the model's).
+    if (!ListStateCapture(list, game))
+        return kSkipState;
+    *captured = true;
     // The frozen frame (M3, freeze.h) goes first, NR on or off: with NR off the frozen picture still replaces the
     // game's Output, so that A/B and the split screen compare the same picture.
     FreezeApply(list, &frame);
@@ -3043,7 +3053,11 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
         CountSkip(kSkipBusy, source);
         return;
     }
-    const Skip skip = Evaluate(list, params, source);
+    static ListState game; // under g_lock
+    bool captured = false;
+    const Skip skip = Evaluate(list, params, source, &game, &captured);
+    if (captured)
+        ListStateRestore(list, game);
     if (g_nr.attempted.load(std::memory_order_relaxed))
         PublishStatus();
     ReleaseSRWLockExclusive(&g_lock);

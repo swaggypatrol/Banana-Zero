@@ -25,6 +25,8 @@
 //   - the sky's control mask
 //   - the motion vectors dilated by depth, at the render and at the display resolution, inside larger textures
 //   - Show sky's stripes in the composite, and every other pixel left as it was
+// And, first, the game's compute state dxgi.dll binds again after its pass (src/list_state.cpp), as it learns it
+// from this process's own lists on the D3D12 runtime the games use. Everything after runs through those hooks.
 // The exit code is the number of failed checks.
 
 #include <windows.h>
@@ -41,6 +43,7 @@
 #include <functional>
 #include <vector>
 
+#include "list_state.h"
 #include "nr_fit_shader.h"
 #include "nr_shader.h"
 #include "nr_shared.h"
@@ -2683,11 +2686,151 @@ void TestDepth()
     }
     targets->Release();
 }
+// What the NR pass binds again (src/list_state.cpp): unknown until the list is reset, then whatever the game bound
+// last, nothing after a Reset or ClearState, our own bindings undone by the restore, and each list its own.
+bool SameState(const ListState& a, const ListState& b)
+{
+    if (a.known != b.known || a.heapCount != b.heapCount || a.heaps[0] != b.heaps[0] || a.heaps[1] != b.heaps[1] ||
+        a.pipeline != b.pipeline || a.stateObject != b.stateObject || a.computeRoot != b.computeRoot ||
+        a.constantCount != b.constantCount)
+        return false;
+    for (unsigned i = 0; i < kListStateArgs; ++i)
+    {
+        if (a.args[i].kind != b.args[i].kind || (a.args[i].kind != 0 && a.args[i].value != b.args[i].value))
+            return false;
+    }
+    for (unsigned i = 0; i < a.constantCount; ++i)
+    {
+        if (a.constants[i].parameter != b.constants[i].parameter || a.constants[i].offset != b.constants[i].offset ||
+            a.constants[i].value != b.constants[i].value)
+            return false;
+    }
+    return true;
+}
+
+bool Empty(const ListState& s, ID3D12PipelineState* pipeline)
+{
+    ListState empty = {};
+    empty.known = true;
+    empty.pipeline = pipeline;
+    return SameState(s, empty);
+}
+
+void TestListState()
+{
+    auto makeHeap = [](D3D12_DESCRIPTOR_HEAP_TYPE type) {
+        D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+        desc.Type = type;
+        desc.NumDescriptors = 4;
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ID3D12DescriptorHeap* heap = nullptr;
+        Must(g.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)), "CreateDescriptorHeap");
+        return heap;
+    };
+    ID3D12DescriptorHeap* gameHeap = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ID3D12DescriptorHeap* gameSampler = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    ID3D12DescriptorHeap* ourHeap = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // The game's root signature: four constants, a CBV, a table; ours is shadertest's (as dxgi.dll's: two parameters).
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameters[3] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = 4;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[1].Descriptor.ShaderRegister = 1; // b0 holds the constants
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[2].DescriptorTable.pDescriptorRanges = &range;
+    D3D12_ROOT_SIGNATURE_DESC desc = {};
+    desc.NumParameters = 3;
+    desc.pParameters = parameters;
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* errors = nullptr;
+    Must(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors), "the game's root signature");
+    ID3D12RootSignature* gameRoot = nullptr;
+    Must(g.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&gameRoot)),
+         "CreateRootSignature");
+    blob->Release();
+    if (errors != nullptr)
+        errors->Release();
+
+    ListState s = {};
+    Check(!ListStateCapture(g.list, &s), "list state: a list first seen is unknown");
+    g.list->SetDescriptorHeaps(1, &gameHeap);
+    Check(!ListStateCapture(g.list, &s), "list state: and stays unknown until it is reset");
+    Submit(); // Close, Reset with no pipeline
+    Check(ListStateCapture(g.list, &s) && Empty(s, nullptr), "list state: nothing bound after a Reset");
+
+    // The game binds its compute state.
+    ID3D12DescriptorHeap* gameHeaps[] = { gameHeap, gameSampler };
+    g.list->SetDescriptorHeaps(2, gameHeaps);
+    g.list->SetComputeRootSignature(gameRoot);
+    const uint32_t constants[] = { 7, 8 };
+    g.list->SetComputeRoot32BitConstants(0, 2, constants, 1);
+    g.list->SetComputeRoot32BitConstant(0, 9, 3);
+    g.list->SetComputeRoot32BitConstant(0, 10, 1); // replaces the 7
+    g.list->SetComputeRootConstantBufferView(1, 0x10000);
+    g.list->SetComputeRootDescriptorTable(2, gameHeap->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetPipelineState(g.nr);
+    ListState game = {};
+    const bool known = ListStateCapture(g.list, &game);
+    Check(known && game.heapCount == 2 && game.heaps[0] == gameHeap && game.heaps[1] == gameSampler &&
+              game.computeRoot == gameRoot && game.pipeline == g.nr && game.args[1].value == 0x10000 &&
+              game.args[2].value == gameHeap->GetGPUDescriptorHandleForHeapStart().ptr && game.constantCount == 3,
+          "list state: the game's heaps, root signature, CBV, table, three constants and pipeline");
+    bool constantsRight = game.constantCount == 3;
+    for (unsigned i = 0; i < game.constantCount; ++i)
+    {
+        const ListStateConstant& c = game.constants[i];
+        const uint32_t want = c.offset == 1 ? 10 : c.offset == 2 ? 8 : c.offset == 3 ? 9 : 0;
+        constantsRight = constantsRight && c.parameter == 0 && c.value == want;
+    }
+    Check(constantsRight, "list state: constants 10, 8, 9 at offsets 1, 2, 3");
+
+    // The NR pass binds its own, then the game's again.
+    g.list->SetDescriptorHeaps(1, &ourHeap);
+    g.list->SetComputeRootSignature(g.root);
+    g.list->SetPipelineState(g.stats);
+    Check(ListStateCapture(g.list, &s) && s.computeRoot == g.root && s.args[1].kind == 0 && s.args[2].kind == 0 &&
+              s.constantCount == 0 && s.heapCount == 1 && s.heaps[0] == ourHeap && s.pipeline == g.stats,
+          "list state: ours while the pass runs, and a new root signature leaves no argument bound");
+    ListStateRestore(g.list, game);
+    Check(ListStateCapture(g.list, &s) && SameState(s, game), "list state: the game's own again after the pass");
+
+    g.list->ClearState(g.nr);
+    Check(ListStateCapture(g.list, &s) && Empty(s, g.nr), "list state: nothing but ClearState's pipeline after it");
+    Submit();
+    Check(ListStateCapture(g.list, &s) && Empty(s, nullptr), "list state: nothing bound after the next Reset");
+
+    ID3D12CommandAllocator* otherAllocator = nullptr;
+    Must(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&otherAllocator)),
+         "CreateCommandAllocator");
+    ID3D12GraphicsCommandList* other = nullptr;
+    Must(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, otherAllocator, nullptr, IID_PPV_ARGS(&other)),
+         "CreateCommandList");
+    Check(!ListStateCapture(other, &s), "list state: a second list starts unknown");
+    Must(other->Close(), "Close");
+    Must(other->Reset(otherAllocator, nullptr), "Reset");
+    other->SetDescriptorHeaps(1, &ourHeap);
+    Check(ListStateCapture(other, &s) && s.heapCount == 1 && s.heaps[0] == ourHeap && ListStateCapture(g.list, &s) &&
+              Empty(s, nullptr),
+          "list state: each list its own");
+    other->Close();
+    other->Release();
+    otherAllocator->Release();
+    gameRoot->Release();
+    gameHeap->Release();
+    gameSampler->Release();
+    ourHeap->Release();
+}
 } // namespace
 
 int main()
 {
     Init();
+    TestListState();
     D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
     g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options);
     Say("shadertest: nr_cso %zu bytes, nr_stats_cso %zu bytes, nr_fit_cso %zu bytes, typed UAV loads of the "
