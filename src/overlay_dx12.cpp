@@ -37,7 +37,7 @@ namespace
 {
 constexpr unsigned kPresentIndex = 8;   // IDXGISwapChain::Present
 constexpr unsigned kPresent1Index = 22; // IDXGISwapChain1::Present1
-constexpr unsigned kFrames = 3;         // command allocators in flight
+constexpr unsigned kFrames = 6;         // command allocators in flight
 constexpr unsigned kSrvOffscreen = 0;   // our heap: the menu picture
 constexpr unsigned kSrvPreview = 1;     // the preview picture
 constexpr unsigned kSrvImGui = 2;       // from here: ImGui's textures (the font atlas)
@@ -150,6 +150,7 @@ struct Overlay
     float nits = 80.0f;
     bool modeSaid = false; // the log has the first choice too, not only the changes
     uint64_t frames = 0;   // frames drawn
+    uint64_t behind = 0;   // presents that went without the menu: the queue had not finished its last use
 
     // GPU objects of ours.
     ID3D12DescriptorHeap* srvHeap = nullptr;
@@ -965,13 +966,17 @@ void DrawLocked(IDXGISwapChain* chain)
     const Settings& s = *SettingsCurrent();
     ChooseMode(g.native, s);
 
-    // This frame's allocator: wait for the frame that used it kFrames presents ago.
+    // This frame's allocator, if the queue is done with the frame that used it kFrames draws ago. Never waited for:
+    // where the chain's queue only moves on as frames are presented (Resident Evil Requiem, frame generation and
+    // REFramework), a Present held up here held the queue up too, and the game crawled at a few frames a second.
     Frame& frame = g.frame[g.frameIndex % kFrames];
     if (frame.fenceValue != 0 && g.fence->GetCompletedValue() < frame.fenceValue)
     {
-        if (FAILED(g.fence->SetEventOnCompletion(frame.fenceValue, g.fenceEvent)) ||
-            WaitForSingleObject(g.fenceEvent, 1000) != WAIT_OBJECT_0)
-            return; // the GPU is far behind: this frame goes without the menu
+        if (g.behind++ == 0)
+            Log("menu: the chain's queue had not finished the menu of %u draws ago; such presents go without the "
+                "menu (logged once, counted at close)",
+                kFrames);
+        return;
     }
     if (FAILED(frame.allocator->Reset()) || FAILED(g.list->Reset(frame.allocator, nullptr)))
         return;
@@ -1144,6 +1149,9 @@ void OverlayClose()
     g.open.store(false, std::memory_order_release);
     MenuInputRelease();
     Unpatch();
+    if (g.behind != 0)
+        Log("menu: so far drawn on %llu presents; %llu went without it, the chain's queue behind",
+            static_cast<unsigned long long>(g.frames), static_cast<unsigned long long>(g.behind));
     if (g.failure == nullptr)
         g.state = "closed";
 }
