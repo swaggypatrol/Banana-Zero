@@ -252,7 +252,13 @@ const char* ModuleName(const void* address, char* out, size_t size)
 IDXGISwapChain* NativeChain(IDXGISwapChain* chain, const Image& dxgi, bool* unwrapped)
 {
     *unwrapped = false;
-    if (dxgi.size == 0 || Within(dxgi, *reinterpret_cast<void* const*>(chain)))
+    void* const* own = *reinterpret_cast<void* const* const*>(chain);
+    if (dxgi.size == 0 || Within(dxgi, own))
+        return chain;
+    // The real chain with a table of another hook's: a copy of dxgi.dll's with a few entries its own (REFramework
+    // gives the game's chain one, on the heap), while a wrapper's table points into the wrapper's module.
+    if (Readable(own, 10 * sizeof(void*)) && Within(dxgi, own[0]) && Within(dxgi, own[1]) && Within(dxgi, own[2]) &&
+        Within(dxgi, own[9]))
         return chain;
     const char* base = reinterpret_cast<const char*>(chain);
     for (size_t offset = sizeof(void*); offset < 0x200; offset += sizeof(void*))
