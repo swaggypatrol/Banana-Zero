@@ -44,6 +44,7 @@ It is NVIDIA's and not ours to hand out, so you bring your own, the way you brin
 |---|---|---|
 | The Witcher 3 (Epic, DX12) | `<game folder>\bin\x64_dx12\`, next to `witcher3.exe` | Ray Reconstruction + Frame Generation, through Streamline |
 | The Last of Us Part II Remastered | The game's root folder, next to `tlou-ii.exe` | Super Resolution + Frame Generation, through Streamline |
+| Resident Evil Requiem (Steam) | The game's root folder, next to `re9.exe`, with [REFramework](#re-engine-games-and-reframework) | Ray Reconstruction + Frame Generation, through Streamline |
 
 Other DX12 games with DLSS should work the same way in principle. "In principle" is doing some heavy lifting in that
 sentence; please report back.
@@ -59,6 +60,14 @@ Like any good sub, placement matters.
 4. Copy in `dxgi.dll` and `banana.nvngx.dll` from the same zip, plus your own `nvngx_dlssnr.dll`.
 5. Start the game with DLSS on. A small **green square** in the bottom-right corner for a few seconds means NR is
    running. That is the power LED. Enjoy the power LED.
+
+### RE Engine games and REFramework
+
+Resident Evil Requiem closes itself a few seconds after it starts whenever a DLL like ours is in its folder, even with
+NR switched off: that is the game's tamper check, not Banana-Zero. Install
+[REFramework](https://github.com/praydog/REFramework) next to it (its `dinput8.dll`), which switches that check off.
+REFramework then runs every DLL of the game's folder from copies in a `_storage_` folder; put Banana-Zero's files and
+`dlssnr.ini` in the game's root folder all the same. Banana-Zero's menu works alongside REFramework's.
 
 **Upgrading:** replace both DLLs together (they check that they come from the same build). Keep `dlssnr.ini`.
 Coming from v0.1.1 or older? Style and the Model sliders never reached the model there, so whatever you set them to
@@ -210,8 +219,8 @@ To bind a key, click its button and press the key. `Esc` cancels, Clear unbinds.
 
 ## dlssnr.ini
 
-Optional, lives next to `dxgi.dll`, one `Key = value` per line. The menu writes it for you; this is for people who
-like to open the back panel.
+Optional, lives next to the game's `.exe` (the folder you put `dxgi.dll` in), one `Key = value` per line. The menu
+writes it for you; this is for people who like to open the back panel.
 
 | Key | Values | Default | In the menu |
 |---|---|---|---|
@@ -261,6 +270,7 @@ never saved.
 | No green square | DLSS is off in the game, the files are in the wrong folder, or `nvngx_dlssnr.dll` is missing. Read `dlssnr.log` next to `dxgi.dll`; it says what happened and why |
 | `End` does nothing | The game is not running DLSS at that moment (main menu, loading screen), or another tool uses End. Rebind `MenuKey` |
 | The game crashes at start | Another `dxgi.dll` or overlay is fighting for the same spot. Try with only Banana-Zero |
+| Resident Evil Requiem closes a few seconds in, NR on or off | The game's tamper check. Install [REFramework](#re-engine-games-and-reframework) |
 | Halos, noise, white fringes | Lower Max gain (EV), then Strength |
 | Colours look off | Lower Colour |
 | Menu too dark or washed out in HDR | Set Menu colour by hand and adjust Menu brightness |
@@ -269,7 +279,8 @@ never saved.
 ## Known limitations
 
 - **DirectX 12 only.** Vulkan is the next milestone. DX11 is not planned.
-- **Tested in exactly two games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are untested.
+- **Tested in exactly three games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are
+  untested.
 - **It costs frame time.** About 7 ms per frame for the whole NR pass on an RTX 5090 at 4K output, nearly all of it
   inside the model. The Speed page shows what it costs on your machine, and its Model input size trades some of the
   effect for time.
@@ -282,6 +293,7 @@ never saved.
 
 | Version | What changed |
 |---|---|
+| v0.1.4 | Resident Evil Requiem works, with [REFramework](#re-engine-games-and-reframework). The NR pass now puts back what the game had bound on its command list (some games, RE Engine among them, rely on it surviving the DLSS call, and crashed), and the menu opens, works and closes alongside REFramework's own hooks. `dlssnr.ini` is read next to the game's `.exe` first. The menu reads its input without touching the game's window procedure. The picture is the same as v0.1.3 |
 | v0.1.3 | The release candidate held up in play and is now the current release: [Speed (experimental)](#speed-experimental) and [Depth (experimental)](#depth-experimental) are in. New since the candidate: Model input size goes down to 33.3%, with notches at 33.3%, 50%, 66.7% and 80% and 1% steps between them. Leave both pages as they come and the picture is the same as v0.1.2 |
 | v0.1.3-rc.1 | A release candidate, published as a pre-release: v0.1.2 stays the current release until this one has seen more games. New: [Speed (experimental)](#speed-experimental), the model on a smaller copy of the frame for less GPU time, with the pass's GPU time on the page; [Depth (experimental)](#depth-experimental), motion vectors dilated by depth and the sky's own Local tone and Local structure. New for builders: `nrprobe --subrects`. Leave both pages as they come and the picture is the same as v0.1.2 |
 | v0.1.2 | The knobs are connected now. Style and the five Model knobs were handed to the model only when it was created, but the model reads them every frame, so in v0.1.1 they did nothing. They now act from the next frame, every slider applies while you drag, and turning a knob no longer rebuilds the model. New: `nrprobe --tuning` measures what the knobs do |
@@ -304,6 +316,9 @@ never saved.
   itself changed at the four nearest of its pixels. The model is not rebuilt for this; each frame it is simply handed
   a smaller part of its input and output.
 - The model only uses what the game already gives DLSS: colour, depth and motion vectors. No per-game patching.
+- The NR pass binds descriptor heaps, a compute root signature and pipelines of its own on the game's command list.
+  Banana-Zero follows what the game has bound (through the command list's function table) and binds it again when
+  the pass is done, because some games set it once and expect it to survive the DLSS call.
 - **Why the bridge DLL?** The model only accepts callers whose file name contains `nvngx.dll`, and the driver's NGX
   runtime refuses to load the model itself because of its signature. So `dxgi.dll` calls it through
   `banana.nvngx.dll`, which knows no parameter names and just passes calls along.
@@ -335,7 +350,7 @@ Run these from the repository root after a build. The exit code is the number of
 | `build\Release\dxgitest.exe` | nothing special | The export table matches the real `dxgi.dll`, every export reaches its real function, and a DXGI factory and D3D12 device can be made through ours |
 | `build\Release\ngxtest.exe` | nothing special | The five hooks against a fake NGX runtime and the bridge against a fake model |
 | `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back |
-| `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU |
+| `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU, and checks that the game's compute state is followed and put back after the NR pass |
 | `build\Release\nrprobe.exe [--model <path>]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll` |
 | `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along moving edges and thin bars, whether a control mask sets it per pixel, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
 | `build\Release\nrprobe.exe --subrects` | the same | Runs the model on smaller pictures inside a feature made for the full one, as Model input size does: that the result matches a feature made at the smaller size, that nothing outside the smaller picture is written, how long each size takes, and which motion-vector scale it wants then |
