@@ -1,8 +1,8 @@
 #pragma once
 
 // Settings: one immutable snapshot, published through an atomic pointer, read once per
-// evaluation without a lock. dlssnr.ini beside the DLL is read at the first Neural Rendering evaluation, and read
-// again whenever it changes (M4). The menu (M3) publishes a new snapshot at every step of a dragged slider
+// evaluation without a lock. dlssnr.ini beside the game's exe (else beside the DLL, see IniPath in nr_dx12.cpp) is
+// read at the first Neural Rendering evaluation, and read again whenever it changes (M4). The menu (M3) publishes a new snapshot at every step of a dragged slider
 // and writes the changed keys back to the file (settings_write.h). Keys the file does not name keep their defaults;
 // for the model's own parameters, that is the model's own default.
 

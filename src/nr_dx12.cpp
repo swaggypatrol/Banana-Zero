@@ -760,6 +760,35 @@ bool Join(const wchar_t* directory, const wchar_t* name, wchar_t* out, size_t si
     return true;
 }
 
+bool FileExists(const wchar_t* path)
+{
+    const DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// Where dlssnr.ini is: beside the game's exe, else beside this DLL. The two are one folder unless a loader runs the
+// DLLs from elsewhere: REFramework runs every DLL of the game's folder from copies in a _storage_ folder, where an
+// ini put in the game's folder was not seen. With the file in neither, beside the exe, where the menu then writes it.
+bool IniPath(wchar_t* out, size_t size)
+{
+    wchar_t directory[MAX_PATH];
+    wchar_t beside[MAX_PATH];
+    bool haveExe = false;
+    const DWORD length = GetModuleFileNameW(nullptr, directory, MAX_PATH);
+    wchar_t* slash = length != 0 && length < MAX_PATH ? wcsrchr(directory, L'\\') : nullptr;
+    if (slash != nullptr)
+    {
+        slash[1] = L'\0';
+        haveExe = Join(directory, L"dlssnr.ini", out, size);
+    }
+    if (haveExe && FileExists(out))
+        return true;
+    if (ModuleDirectory(directory, MAX_PATH) && Join(directory, L"dlssnr.ini", beside, MAX_PATH) &&
+        (!haveExe || FileExists(beside)))
+        return wcscpy_s(out, size, beside) == 0;
+    return haveExe;
+}
+
 // %LOCALAPPDATA%\Banana-Zero\<name>, created if need be. False if it cannot be made.
 bool LocalFolder(const wchar_t* name, wchar_t* out, size_t size)
 {
@@ -2947,9 +2976,8 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     if (!g_nr.settingsLoaded)
     {
         g_nr.settingsLoaded = true;
-        wchar_t directory[MAX_PATH];
         wchar_t ini[MAX_PATH];
-        if (ModuleDirectory(directory, MAX_PATH) && Join(directory, L"dlssnr.ini", ini, MAX_PATH))
+        if (IniPath(ini, MAX_PATH))
             SettingsLoad(ini);
         StartWorker(); // after the first load: from here on only that thread reads the file
     }
