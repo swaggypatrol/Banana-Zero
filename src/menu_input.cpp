@@ -1,10 +1,11 @@
 // The menu's keyboard and mouse: see menu_input.h.
 //
-// SetWindowSubclass and RemoveWindowSubclass want the window's own thread. The menu opens on the game's render
-// thread, which in most games is also the window's thread, and then they are called directly. When it is not, the
-// window procedure is pointed at a small function of ours (SetWindowLongPtr works across threads of one process)
-// whose first message, on the window's thread, puts the original back and installs the subclass the same way; a
-// posted message ends the same way. Everything ImGui is told goes through the menu's lock, like the frame.
+// Not a window procedure of ours: other mods keep their own on the game's window, and check that it is still the
+// window's (REFramework hooks it again when it is not, on top of whatever is there, and a subclass of ours under it
+// then made a loop that overflowed the window thread's stack in Resident Evil Requiem). A WH_GETMESSAGE hook on the
+// window's thread sees each message as the game's loop takes it from the queue, before it is translated and
+// dispatched, and turns the ones the menu keeps into WM_NULL. It goes on when the menu opens and off when it closes,
+// from any thread. Everything ImGui is told goes through the menu's lock, like the frame.
 //
 // The mouse: a game in play keeps the cursor hidden and often held still (clipped to a point, or put back to the
 // centre every frame), so the cursor's position says nothing. While the menu is open the raw mouse data (WM_INPUT)
@@ -14,7 +15,6 @@
 
 #include "menu_input.h"
 
-#include <commctrl.h>
 #include <windowsx.h>
 
 #include <atomic>
@@ -35,18 +35,15 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace
 {
-constexpr UINT_PTR kSubclassId = 0xBA4A;
 constexpr USHORT kUsagePageGeneric = 0x01;
 constexpr USHORT kUsageMouse = 0x02;
 constexpr USHORT kUsageKeyboard = 0x06;
 
-HWND g_window = nullptr;
+// Set on the drawing thread before the hook goes on and cleared after it is off, read by the hook on the window's.
+std::atomic<HWND> g_window { nullptr };
 std::atomic<bool> g_capture { false }; // the menu is open: ImGui sees the messages
-std::atomic<bool> g_attached { false };
-std::atomic<bool> g_pending { false }; // our stand-in procedure waits for its first message
-WNDPROC g_original = nullptr;
-bool g_unicode = true;
-UINT g_detachMessage = 0;
+HHOOK g_hook = nullptr;
+int g_front = -1; // the game in front, as ImGui was last told: -1 not yet, 0 no, 1 yes
 const char* g_state = "not attached";
 
 // Raw input: what the game had registered for the mouse and the keyboard, ours in its place while capturing.
@@ -72,8 +69,6 @@ void StorePointer(POINT p)
 {
     g_pointer.store(uint64_t(uint32_t(p.x)) | (uint64_t(uint32_t(p.y)) << 32), std::memory_order_relaxed);
 }
-
-bool OnWindowThread(HWND window) { return GetWindowThreadProcessId(window, nullptr) == GetCurrentThreadId(); }
 
 bool InFront()
 {
@@ -275,103 +270,115 @@ bool OnRawInput(HWND window, LPARAM lParam)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The subclass.
+// The message hook.
 
-LRESULT CALLBACK SubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR)
+// Takes a message from the game: it becomes a WM_NULL, which the game's loop translates and dispatches as nothing.
+void Swallow(MSG* msg)
 {
-    if (message == g_detachMessage || message == WM_NCDESTROY)
-    {
-        RemoveWindowSubclass(window, &SubclassProc, id);
-        if (window == g_window)
-        {
-            g_attached.store(false, std::memory_order_release);
-            g_state = message == WM_NCDESTROY ? "the window went" : "removed";
-        }
-        return message == WM_NCDESTROY ? DefSubclassProc(window, message, wParam, lParam) : 0;
-    }
-    if (!g_capture.load(std::memory_order_acquire) || window != g_window)
-        return DefSubclassProc(window, message, wParam, lParam); // closed, or a window the chain left behind
+    msg->message = WM_NULL;
+    msg->wParam = 0;
+    msg->lParam = 0;
+}
 
+// A key press that stays with the menu still makes its characters (WM_CHAR, WM_SYSCHAR), as the game's own
+// TranslateMessage would have; they come back through here for ImGui.
+void SwallowKey(MSG* msg)
+{
+    if (msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN)
+        TranslateMessage(msg);
+    Swallow(msg);
+}
+
+// One message the window's thread took from its queue while the menu is open: ImGui sees it, and the game gets it
+// only when the menu does not keep it (the releases, anything not mouse or keyboard).
+void OnMessage(MSG* msg)
+{
+    const HWND window = msg->hwnd;
+    const UINT message = msg->message;
     if (message == WM_INPUT)
     {
-        if (OnRawInput(window, lParam))
-            return DefSubclassProc(window, message, wParam, lParam);
-        return DefWindowProcW(window, message, wParam, lParam); // the system's part of WM_INPUT, not the game's
+        if (!OnRawInput(window, msg->lParam))
+        {
+            DefWindowProcW(window, message, msg->wParam, msg->lParam); // the system's part of WM_INPUT, not the game's
+            Swallow(msg);
+        }
+        return;
     }
     const bool mouse = MouseMessage(message);
     const bool keyboard = KeyboardMessage(message);
-    const bool focus = message == WM_SETFOCUS || message == WM_KILLFOCUS || message == WM_ACTIVATEAPP;
-    if (!mouse && !keyboard && !focus)
-        return DefSubclassProc(window, message, wParam, lParam);
-    if (message == WM_SETCURSOR)
-        return DefSubclassProc(window, message, wParam,
-                               lParam); // ImGui draws its own pointer; the cursor is the game's
+    if (!mouse && !keyboard)
+        return;
     const bool release = ReleaseMessage(message);
     if (mouse)
         g_mouseMessages.fetch_add(1, std::memory_order_relaxed);
     if (keyboard)
         g_keyMessages.fetch_add(1, std::memory_order_relaxed);
     if (mouse && g_rawMouse.load(std::memory_order_acquire))
-        return release ? DefSubclassProc(window, message, wParam, lParam) : 0; // the raw data said it already
+    {
+        if (!release)
+            Swallow(msg); // the raw data said it already
+        return;
+    }
 
-    // ImGui first, as in the example; then the message stays here, but for a release and the focus messages.
+    // ImGui first, as in the example; then the message stays here, but for a release.
     if (!MenuTryLock(message == WM_MOUSEMOVE ? 5 : 50))
-        return (mouse || keyboard) && !release ? 0 : DefSubclassProc(window, message, wParam, lParam);
-    const LPARAM scaled = mouse && message != WM_MOUSELEAVE ? ScaleMouse(window, lParam) : lParam;
-    const LRESULT handled = ImGui_ImplWin32_WndProcHandler(window, message, wParam, scaled);
+    {
+        if (!release)
+            SwallowKey(msg);
+        return;
+    }
+    const LPARAM scaled = mouse && message != WM_MOUSELEAVE ? ScaleMouse(window, msg->lParam) : msg->lParam;
+    const LRESULT handled = ImGui_ImplWin32_WndProcHandler(window, message, msg->wParam, scaled);
     const bool typing = ImGui::GetIO().WantTextInput; // a number is being typed: Esc and the menu key belong to the box
     MenuUnlock();
     if (handled != 0)
-        return handled;
+    {
+        SwallowKey(msg);
+        return;
+    }
 
     if (keyboard)
     {
         // Esc and the menu key close the menu from here, so that they work even when the game is not evaluating.
-        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && !typing && MenuKeyPressedInWindow(unsigned(wParam)))
-            return 0;
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && !typing &&
+            MenuKeyPressedInWindow(unsigned(msg->wParam)))
+        {
+            Swallow(msg);
+            return;
+        }
         if (message == WM_KEYUP || message == WM_SYSKEYUP)
         {
             unsigned menuKey = 0;
             MenuKeys(&menuKey);
-            if (wParam == VK_ESCAPE || (menuKey != 0 && wParam == menuKey))
-                return 0;
-            return DefSubclassProc(window, message, wParam, lParam);
+            if (msg->wParam == VK_ESCAPE || (menuKey != 0 && msg->wParam == menuKey))
+                Swallow(msg);
+            return;
         }
         if (message == WM_SYSKEYDOWN || message == WM_SYSCHAR || message == WM_SYSDEADCHAR)
-            return DefWindowProcW(window, message, wParam, lParam); // Alt+F4 and the like keep their meaning
-        return 0;
+        {
+            // Alt+F4 and the like keep their meaning, without the game seeing the keys.
+            if (message == WM_SYSKEYDOWN)
+                TranslateMessage(msg);
+            DefWindowProcW(window, message, msg->wParam, msg->lParam);
+            Swallow(msg);
+            return;
+        }
+        SwallowKey(msg);
+        return;
     }
-    if (mouse)
-        return release ? DefSubclassProc(window, message, wParam, lParam) : 0;
-    return DefSubclassProc(window, message, wParam, lParam);
+    if (!release)
+        Swallow(msg);
 }
 
-// On the window's thread, for the first message after MenuInputAttach from another thread.
-LRESULT CALLBACK StandIn(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+// WH_GETMESSAGE on the window's thread: every message it takes from its queue (GetMessage, or PeekMessage with
+// PM_REMOVE) passes here first, before the game's loop translates and dispatches it.
+LRESULT CALLBACK GetMessageHook(int code, WPARAM removal, LPARAM lParam)
 {
-    const WNDPROC original = g_original;
-    if (window == g_window && g_pending.exchange(false))
-    {
-        const LONG_PTR now =
-            g_unicode ? GetWindowLongPtrW(window, GWLP_WNDPROC) : GetWindowLongPtrA(window, GWLP_WNDPROC);
-        if (now == reinterpret_cast<LONG_PTR>(&StandIn))
-        {
-            if (g_unicode)
-                SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
-            else
-                SetWindowLongPtrA(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
-        }
-        if (SetWindowSubclass(window, &SubclassProc, kSubclassId, 0))
-        {
-            g_attached.store(true, std::memory_order_release);
-            g_state = "subclass on the window";
-        }
-        else
-            g_state = "SetWindowSubclass failed on the window's thread";
-        Log("menu: input: %s", g_state);
-    }
-    return g_unicode ? CallWindowProcW(original, window, message, wParam, lParam)
-                     : CallWindowProcA(original, window, message, wParam, lParam);
+    MSG* msg = reinterpret_cast<MSG*>(lParam);
+    if (code == HC_ACTION && removal == PM_REMOVE && msg != nullptr && msg->hwnd != nullptr &&
+        msg->hwnd == g_window.load(std::memory_order_acquire) && g_capture.load(std::memory_order_acquire))
+        OnMessage(msg);
+    return CallNextHookEx(nullptr, code, removal, lParam);
 }
 
 // The pointer starts where the cursor is, if that is in the window, else in the middle.
@@ -396,65 +403,58 @@ void StartCapture(HWND window)
         client.right, client.bottom, cursor.x, cursor.y, clip.left, clip.top, clip.right, clip.bottom);
     RegisterRaw(window);
 }
+
+// The focus messages are sent, not posted, so the hook never sees them: ImGui is told of a change each frame
+// instead (a key held when the user switches away is then let go).
+void FollowFocus()
+{
+    const int front = InFront() ? 1 : 0;
+    if (front != g_front && ImGui::GetCurrentContext() != nullptr)
+    {
+        g_front = front;
+        ImGui::GetIO().AddFocusEvent(front != 0);
+    }
+}
 } // namespace
 
 void MenuInputAttach(HWND window)
 {
     if (window == nullptr)
         return;
-    if (g_detachMessage == 0)
-        g_detachMessage = RegisterWindowMessageW(L"BananaZero.MenuInput.Detach");
-    if (g_window == window)
+    if (g_window.load(std::memory_order_relaxed) != window)
     {
-        if (!g_capture.exchange(true, std::memory_order_acq_rel))
-            StartCapture(window);
-        if (g_attached.load(std::memory_order_acquire) || g_pending.load(std::memory_order_acquire))
-            return;
+        MenuInputRelease();
+        g_window.store(window, std::memory_order_release);
+    }
+    FollowFocus();
+    if (g_capture.load(std::memory_order_acquire))
+        return;
+    StartCapture(window);
+    const DWORD thread = GetWindowThreadProcessId(window, nullptr);
+    g_capture.store(true, std::memory_order_release); // before the hook: its first message is already the menu's
+    g_hook = thread != 0 ? SetWindowsHookExW(WH_GETMESSAGE, &GetMessageHook, nullptr, thread) : nullptr;
+    if (g_hook != nullptr)
+    {
+        g_state = "message hook on the window's thread";
+        Log("menu: input: %s (window %p, thread %lu)", g_state, window, thread);
     }
     else
     {
-        // Another window: its own subclass. The one on the window before stays, inert, until that window goes.
-        MenuInputRelease();
-        g_attached.store(false, std::memory_order_release);
-        g_pending.store(false, std::memory_order_release);
-        g_window = window;
-        g_capture.store(true, std::memory_order_release);
-        StartCapture(window);
+        g_state = "SetWindowsHookEx failed";
+        Log("menu: input: %s (window %p, thread %lu, error %lu)", g_state, window, thread, GetLastError());
     }
-    g_unicode = IsWindowUnicode(window) != FALSE;
-    if (OnWindowThread(window))
-    {
-        if (SetWindowSubclass(window, &SubclassProc, kSubclassId, 0))
-        {
-            g_attached.store(true, std::memory_order_release);
-            g_state = "subclass on the window";
-        }
-        else
-            g_state = "SetWindowSubclass failed";
-        Log("menu: input: %s (window %p, this thread)", g_state, window);
-        return;
-    }
-    // Another thread owns the window: our stand-in takes its first message there and installs the subclass.
-    g_pending.store(true, std::memory_order_release);
-    const LONG_PTR previous = g_unicode ? SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&StandIn))
-                                        : SetWindowLongPtrA(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&StandIn));
-    if (previous == 0)
-    {
-        g_pending.store(false, std::memory_order_release);
-        g_state = "SetWindowLongPtr failed";
-        Log("menu: input: %s (error %lu)", g_state, GetLastError());
-        return;
-    }
-    g_original = reinterpret_cast<WNDPROC>(previous);
-    g_state = "waiting for the window's thread";
-    Log("menu: input: %s (window %p, thread %lu)", g_state, window, GetWindowThreadProcessId(window, nullptr));
-    PostMessageW(window, WM_NULL, 0, 0); // something for the stand-in to see now
 }
 
 void MenuInputRelease()
 {
     if (!g_capture.exchange(false, std::memory_order_acq_rel))
         return;
+    if (g_hook != nullptr)
+    {
+        UnhookWindowsHookEx(g_hook); // a message the window's thread is handling right now still finishes
+        g_hook = nullptr;
+        g_state = "released";
+    }
     RestoreRaw();
     Log("menu: input: released: %u raw mouse events, %u mouse messages, %u key messages",
         g_rawMouseEvents.load(std::memory_order_relaxed), g_mouseMessages.load(std::memory_order_relaxed),
@@ -464,35 +464,12 @@ void MenuInputRelease()
 void MenuInputDetach()
 {
     MenuInputRelease();
-    const HWND window = g_window;
+    const HWND window = g_window.exchange(nullptr, std::memory_order_acq_rel);
     if (window == nullptr)
         return;
-    if (g_pending.exchange(false))
-    {
-        // The stand-in never ran: put the original back ourselves (across threads, as it was set).
-        const LONG_PTR now =
-            g_unicode ? GetWindowLongPtrW(window, GWLP_WNDPROC) : GetWindowLongPtrA(window, GWLP_WNDPROC);
-        if (now == reinterpret_cast<LONG_PTR>(&StandIn))
-        {
-            if (g_unicode)
-                SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original));
-            else
-                SetWindowLongPtrA(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original));
-        }
-        g_state = "removed";
-    }
-    if (g_attached.load(std::memory_order_acquire))
-    {
-        if (OnWindowThread(window))
-        {
-            RemoveWindowSubclass(window, &SubclassProc, kSubclassId);
-            g_attached.store(false, std::memory_order_release);
-            g_state = "removed";
-        }
-        else
-            PostMessageW(window, g_detachMessage, 0, 0); // the subclass removes itself on the window's thread
-    }
     Log("menu: input: detached (window %p)", window);
+    g_front = -1;
+    g_state = "removed";
 }
 
 const char* MenuInputState() { return g_state; }

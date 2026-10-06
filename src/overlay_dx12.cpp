@@ -126,6 +126,8 @@ struct Overlay
     void** vtable = nullptr;
     void* realPresent = nullptr;
     void* realPresent1 = nullptr;
+    void* dxgiPresent = nullptr;  // realPresent when it is dxgi.dll's own, else null
+    void* dxgiPresent1 = nullptr; // the same for Present1
     bool patched = false;
     bool leftPatched = false; // another hook came after ours: our entries stay, passing through
     bool queueOffsetKnown = false;
@@ -299,12 +301,28 @@ struct Probe
     bool queueOffsetKnown;
     size_t queueOffset;
     ID3D12CommandQueue* queue;
+    const char* kind; // of chain, for the log
     const char* failure;
 };
 
 LRESULT CALLBACK ProbeProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     return DefWindowProcW(window, message, wParam, lParam);
+}
+
+// A hidden window for the probe's chain, when a composition chain cannot be had. Null when it cannot be made.
+HWND ProbeWindow()
+{
+    const HINSTANCE instance = reinterpret_cast<HINSTANCE>(&__ImageBase);
+    WNDCLASSEXW windowClass = {};
+    windowClass.cbSize = sizeof windowClass;
+    windowClass.lpfnWndProc = &ProbeProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = L"BananaZeroOverlayProbe";
+    if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return nullptr;
+    return CreateWindowExW(0, windowClass.lpszClassName, L"", WS_OVERLAPPED, 0, 0, 64, 64, nullptr, nullptr, instance,
+                           nullptr);
 }
 
 DWORD WINAPI ProbeThread(void* argument)
@@ -329,30 +347,12 @@ DWORD WINAPI ProbeThread(void* argument)
         return 0;
     }
 
-    const HINSTANCE instance = reinterpret_cast<HINSTANCE>(&__ImageBase);
-    WNDCLASSEXW windowClass = {};
-    windowClass.cbSize = sizeof windowClass;
-    windowClass.lpfnWndProc = &ProbeProc;
-    windowClass.hInstance = instance;
-    windowClass.lpszClassName = L"BananaZeroOverlayProbe";
-    if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-    {
-        p->failure = "RegisterClassEx failed";
-        return 0;
-    }
-    const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"", WS_OVERLAPPED, 0, 0, 64, 64, nullptr,
-                                        nullptr, instance, nullptr);
-    if (window == nullptr)
-    {
-        p->failure = "CreateWindowEx failed";
-        return 0;
-    }
-
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     ID3D12CommandQueue* queue = nullptr;
     IDXGIFactory2* factory = nullptr;
     IDXGISwapChain1* chain = nullptr;
+    HWND window = nullptr;
     if (FAILED(p->device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue))))
         p->failure = "CreateCommandQueue failed";
     else if (FAILED(createFactory(0, IID_PPV_ARGS(&factory))))
@@ -368,18 +368,36 @@ DWORD WINAPI ProbeThread(void* argument)
         desc.BufferCount = 2;
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        const HRESULT hr = factory->CreateSwapChainForHwnd(queue, window, &desc, nullptr, nullptr, &chain);
+        // A composition chain: dxgi.dll makes it from the same class as a window's (same table, its queue in the same
+        // place), and without a window or the factory's CreateSwapChainForHwnd. REFramework hooks that entry, and a
+        // chain made there makes it unhook D3D12 and hook it again over the table as it finds it: with our Present in
+        // the table, its present then called ours as the real one, ours called its, and it dropped every frame.
+        HRESULT hr = factory->CreateSwapChainForComposition(queue, &desc, nullptr, &chain);
+        p->kind = "a composition chain";
         if (FAILED(hr))
         {
-            Log("menu: CreateSwapChainForHwnd on the probe window -> 0x%08X", unsigned(hr));
-            p->failure = "CreateSwapChainForHwnd failed";
+            Log("menu: probe: CreateSwapChainForComposition -> 0x%08X; a chain on a window of ours instead",
+                unsigned(hr));
+            p->kind = "a chain on a window of ours";
+            window = ProbeWindow();
+            if (window == nullptr)
+                p->failure = "no window for the probe";
+            else
+            {
+                hr = factory->CreateSwapChainForHwnd(queue, window, &desc, nullptr, nullptr, &chain);
+                if (FAILED(hr))
+                {
+                    Log("menu: CreateSwapChainForHwnd on the probe window -> 0x%08X", unsigned(hr));
+                    p->failure = "CreateSwapChainForHwnd failed";
+                }
+            }
         }
     }
     if (chain != nullptr)
     {
         // Whose objects these are: a game's process may hand out wrappers even here (TLOU2 does).
         char names[3][64];
-        Log("menu: probe: CreateDXGIFactory2 in %s, the factory's table in %s, the chain's table in %s",
+        Log("menu: probe: %s; CreateDXGIFactory2 in %s, the factory's table in %s, the chain's table in %s", p->kind,
             ModuleName(reinterpret_cast<const void*>(createFactory), names[0], sizeof names[0]),
             ModuleName(*reinterpret_cast<void* const*>(factory), names[1], sizeof names[1]),
             ModuleName(*reinterpret_cast<void* const*>(chain), names[2], sizeof names[2]));
@@ -414,7 +432,8 @@ DWORD WINAPI ProbeThread(void* argument)
         chain->Release();
     }
     Release(&factory);
-    DestroyWindow(window);
+    if (window != nullptr)
+        DestroyWindow(window);
     if (p->failure == nullptr)
         p->queue = queue; // kept: ImGui's uploads
     else
@@ -452,11 +471,17 @@ bool ProbeOnce()
     g.vtable = probe.vtable;
     g.realPresent = probe.present;
     g.realPresent1 = probe.present1;
+    g.dxgiPresent = Within(probe.dxgi, probe.present) ? probe.present : nullptr;
+    g.dxgiPresent1 = Within(probe.dxgi, probe.present1) ? probe.present1 : nullptr;
     g.queueOffsetKnown = probe.queueOffsetKnown;
     g.queueOffset = probe.queueOffset;
     g.uploadQueue = probe.queue;
-    Log("menu: swap chain table at %p, Present %p, Present1 %p, queue at offset %s%zu", g.vtable, g.realPresent,
-        g.realPresent1, g.queueOffsetKnown ? "" : "unknown, would be ", g.queueOffset);
+    char presentModule[64];
+    char present1Module[64];
+    Log("menu: swap chain table at %p, Present %p in %s, Present1 %p in %s, queue at offset %s%zu", g.vtable,
+        g.realPresent, ModuleName(g.realPresent, presentModule, sizeof presentModule), g.realPresent1,
+        ModuleName(g.realPresent1, present1Module, sizeof present1Module),
+        g.queueOffsetKnown ? "" : "unknown, would be ", g.queueOffset);
     return true;
 }
 
@@ -506,7 +531,7 @@ bool OurWindow(HWND window)
 
 void DropChain()
 {
-    MenuInputRelease(); // the subclass stays: the next chain is most often on the same window
+    MenuInputRelease(); // the window is kept: the next chain is most often on the same window
     Release(&g.queue);
     if (g.nativeOwned)
         Release(&g.native);
@@ -941,7 +966,7 @@ void DrawLocked(IDXGISwapChain* chain)
             return;
         }
     }
-    MenuInputAttach(g.window); // the keyboard and mouse, for as long as the menu is open (a no-op once attached)
+    MenuInputAttach(g.window); // the keyboard and mouse, for as long as the menu is open (once per open)
     if (desc.BufferDesc.Width == 0 || desc.BufferDesc.Height == 0)
         return;
     if (g.format != desc.BufferDesc.Format || g.pipeline == nullptr)
@@ -967,8 +992,8 @@ void DrawLocked(IDXGISwapChain* chain)
     ChooseMode(g.native, s);
 
     // This frame's allocator, if the queue is done with the frame that used it kFrames draws ago. Never waited for:
-    // where the chain's queue only moves on as frames are presented (Resident Evil Requiem, frame generation and
-    // REFramework), a Present held up here held the queue up too, and the game crawled at a few frames a second.
+    // a wait here holds up the game's present, and where presents do not reach the screen (Resident Evil Requiem,
+    // while REFramework dropped them, see HookPresent) the queue never got there and the game crawled.
     Frame& frame = g.frame[g.frameIndex % kFrames];
     if (frame.fenceValue != 0 && g.fence->GetCompletedValue() < frame.fenceValue)
     {
@@ -1058,17 +1083,49 @@ void Draw(IDXGISwapChain* chain, UINT flags)
     MenuUnlock();
 }
 
+// How deep this thread is in our Present hooks. A hook that came after ours and takes the table's entry (ours) for
+// its original, while ours goes on to it, brings a present back into ours: the second time round goes straight to
+// dxgi.dll's own, and nothing is drawn twice.
+thread_local int t_presentDepth = 0;
+std::atomic<bool> g_saidLoop { false };
+
+void SayLoop(const void* next)
+{
+    if (g_saidLoop.exchange(true, std::memory_order_relaxed))
+        return;
+    char module[64];
+    Log("menu: a present came round to ours again through %s: from there it goes straight to dxgi.dll's own "
+        "(logged once)",
+        ModuleName(next, module, sizeof module));
+}
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* chain, UINT sync, UINT flags)
 {
+    if (t_presentDepth > 0 && g.dxgiPresent != nullptr)
+    {
+        SayLoop(g.realPresent);
+        return reinterpret_cast<PresentFn>(g.dxgiPresent)(chain, sync, flags);
+    }
+    ++t_presentDepth;
     Draw(chain, flags);
-    return reinterpret_cast<PresentFn>(g.realPresent)(chain, sync, flags);
+    const HRESULT result = reinterpret_cast<PresentFn>(g.realPresent)(chain, sync, flags);
+    --t_presentDepth;
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* chain, UINT sync, UINT flags,
                                        const DXGI_PRESENT_PARAMETERS* parameters)
 {
+    if (t_presentDepth > 0 && g.dxgiPresent1 != nullptr)
+    {
+        SayLoop(g.realPresent1);
+        return reinterpret_cast<Present1Fn>(g.dxgiPresent1)(chain, sync, flags, parameters);
+    }
+    ++t_presentDepth;
     Draw(chain, flags);
-    return reinterpret_cast<Present1Fn>(g.realPresent1)(chain, sync, flags, parameters);
+    const HRESULT result = reinterpret_cast<Present1Fn>(g.realPresent1)(chain, sync, flags, parameters);
+    --t_presentDepth;
+    return result;
 }
 
 // Under the lock.
