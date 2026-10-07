@@ -1,0 +1,79 @@
+# Builds Banana-Zero on a GitHub-hosted Windows machine from the commit that was pushed, runs the tests that need no
+# NVIDIA GPU, and keeps both DLLs as an artifact named after their build stamp. This is the automated build that code
+# signing will take its binaries from (docs/CODE_SIGNING_POLICY.md). Releases are still built and tested on a PC
+# (README, "Releasing") until signing is set up; then the release package will be made from this build's artifact,
+# after the GPU tests have run on it on a PC.
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the build stamp is git describe, which needs the tags
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        shell: pwsh
+        run: |
+          msbuild dlssnr.sln -p:Configuration=Release -p:Platform=x64 -m -v:minimal -nologo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $stamp = (git describe --always --dirty --abbrev=7).Trim()
+          foreach ($dll in 'dxgi.dll', 'banana.nvngx.dll') {
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("build\Release\$dll"))
+            if (-not $text.Contains($stamp)) { Write-Error "$dll does not carry the build stamp $stamp"; exit 1 }
+            $hash = (Get-FileHash "build\Release\$dll").Hash.ToLower()
+            "$dll $((Get-Item build\Release\$dll).Length) bytes, sha256 $hash, stamp $stamp" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+          "STAMP=$stamp" | Out-File -Append $env:GITHUB_ENV
+
+      # No NVIDIA GPU here: menutest and ngxtest need none. dxgitest and shadertest want a D3D12 device, which this
+      # machine has only in software (WARP), so their results are shown but do not fail the build; on the PC they
+      # are part of every release check, with nrprobe on the real model.
+      - name: Tests that need no GPU
+        shell: pwsh
+        run: |
+          $failed = 0
+          foreach ($test in 'menutest', 'ngxtest') {
+            & "build\Release\$test.exe" | Out-File "build\Release\$test.txt"
+            $code = $LASTEXITCODE
+            "$test exit $code" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            if ($code -ne 0) { Get-Content "build\Release\$test.txt" | Select-String 'FAIL'; $failed++ }
+          }
+          exit $failed
+
+      - name: Tests on the software D3D12 device (informational)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          foreach ($test in 'dxgitest', 'shadertest') {
+            & "build\Release\$test.exe" | Out-File "build\Release\$test.txt"
+            "$test exit $LASTEXITCODE (software device, informational)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Banana-Zero-${{ env.STAMP }}
+          path: |
+            build/Release/dxgi.dll
+            build/Release/banana.nvngx.dll
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-output-${{ github.run_id }}
+          path: build/Release/*test.txt
+          if-no-files-found: ignore

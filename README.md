@@ -413,6 +413,10 @@ Banana-Zero was built by one enthusiast and a lot of patience. Things we would l
 
 Pull requests are welcome. Please run the tests before sending one, and say what you tested on.
 
+## Code signing
+
+Who may sign Banana-Zero's releases, how they are built and what is signed: [Code signing policy](docs/CODE_SIGNING_POLICY.md).
+
 ## License and fine print
 
 Banana-Zero's code is MIT licensed, see [`LICENSE`](LICENSE). `dxgi.dll` includes Dear ImGui (MIT); see
