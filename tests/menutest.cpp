@@ -19,6 +19,13 @@
 //     right-click puts 100% back, a drag across and back moves in its steps, holds at its stops and finds every
 //     step one way or the other, the pass's model size and GPU time are drawn; closing the menu writes the file,
 //     and so does a second after a commit while it is open
+//   - menu_input.cpp, on a hidden window with a loop of its own on a thread of its own, as a game's: one hook on its
+//     thread, which sees our own message posted to the window; the raw mouse and keyboard data registered to a window
+//     of ours on a thread of ours, the mouse with no window messages (RIDEV_NOLEGACY), and reaching it (F24, which no
+//     keyboard has, and the mouse moved one count and back, sent with SendInput; skipped where Windows refuses it); a
+//     raw mouse registration the game makes while the menu is open found at the next frame and ours put back; the
+//     game's presses kept from it and its releases passed on; at the close no hook, the game's newest registration
+//     back, and the game's presses its own again
 
 #include <windows.h>
 
@@ -29,11 +36,15 @@
 #include <cstring>
 #include <initializer_list>
 
+#include <atomic>
+
+#include "backends/imgui_impl_win32.h"
 #include "freeze.h"
 #include "imgui.h"
 #include "keys.h"
 #include "log.h"
 #include "menu.h"
+#include "menu_input.h"
 #include "menu_model.h"
 #include "nr_dx12.h"
 #include "overlay_dx12.h"
@@ -743,6 +754,219 @@ void TestPanel()
 
     ImGui::DestroyContext();
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The menu's input (menu_input.cpp) on a window with a loop of its own on a thread of its own, as a game's.
+
+struct GameWindow
+{
+    HWND window;
+    HANDLE ready;
+    std::atomic<unsigned> keyDowns, keyUps, buttonDowns, buttonUps;
+};
+
+LRESULT CALLBACK GameProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (GameWindow* game = reinterpret_cast<GameWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA)))
+    {
+        if (message == WM_KEYDOWN)
+            ++game->keyDowns;
+        else if (message == WM_KEYUP)
+            ++game->keyUps;
+        else if (message == WM_LBUTTONDOWN)
+            ++game->buttonDowns;
+        else if (message == WM_LBUTTONUP)
+            ++game->buttonUps;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+DWORD WINAPI GameThread(void* context)
+{
+    GameWindow* game = static_cast<GameWindow*>(context);
+    WNDCLASSEXW windowClass = {};
+    windowClass.cbSize = sizeof windowClass;
+    windowClass.lpfnWndProc = &GameProc;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = L"BananaZeroMenutestGame";
+    RegisterClassExW(&windowClass);
+    // Never shown: the test takes no focus from whatever is in front.
+    game->window = CreateWindowExW(0, windowClass.lpszClassName, L"menutest", WS_OVERLAPPEDWINDOW, 0, 0, 640, 360,
+                                   nullptr, nullptr, windowClass.hInstance, nullptr);
+    if (game->window != nullptr)
+        SetWindowLongPtrW(game->window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(game));
+    SetEvent(game->ready);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return 0;
+}
+
+// Waits for `done` within `seconds`.
+template <typename F> bool Within(double seconds, F done)
+{
+    const double until = LogClock() + seconds;
+    while (!done())
+    {
+        if (LogClock() > until)
+            return false;
+        Sleep(10);
+    }
+    return true;
+}
+
+MenuInputStats Counts()
+{
+    MenuInputStats stats = {};
+    MenuInputCounts(&stats);
+    return stats;
+}
+
+// Who this process's raw mouse and keyboard data goes to: `count` registrations, the mouse's and the keyboard's, and
+// the mouse's flags.
+void Registered(UINT* count, HWND* mouse, HWND* keyboard, DWORD* mouseFlags = nullptr)
+{
+    *count = 0;
+    *mouse = *keyboard = nullptr;
+    RAWINPUTDEVICE devices[16];
+    UINT size = 16;
+    const UINT got = GetRegisteredRawInputDevices(devices, &size, sizeof(RAWINPUTDEVICE));
+    if (got == UINT(-1))
+        return;
+    *count = got;
+    for (UINT i = 0; i < got; ++i)
+    {
+        if (devices[i].usUsagePage == 1 && devices[i].usUsage == 2)
+        {
+            *mouse = devices[i].hwndTarget;
+            if (mouseFlags != nullptr)
+                *mouseFlags = devices[i].dwFlags;
+        }
+        if (devices[i].usUsagePage == 1 && devices[i].usUsage == 6)
+            *keyboard = devices[i].hwndTarget;
+    }
+}
+
+// Input sent with SendInput: F24, which no keyboard has, and the mouse one count to the right and back, which leaves
+// the cursor where it was. False if Windows refused it (no desktop of ours in front: a locked screen).
+bool SendHarmless(unsigned times)
+{
+    for (unsigned i = 0; i < times; ++i)
+    {
+        INPUT inputs[4] = {};
+        inputs[0].type = inputs[1].type = INPUT_KEYBOARD;
+        inputs[0].ki.wVk = inputs[1].ki.wVk = VK_F24;
+        inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs[2].type = inputs[3].type = INPUT_MOUSE;
+        inputs[2].mi.dwFlags = inputs[3].mi.dwFlags = MOUSEEVENTF_MOVE;
+        inputs[2].mi.dx = 1;
+        inputs[3].mi.dx = -1;
+        if (SendInput(4, inputs, sizeof(INPUT)) != 4)
+            return false;
+    }
+    return true;
+}
+
+void TestInput()
+{
+    UINT before = 0;
+    HWND mouse = nullptr, keyboard = nullptr;
+    Registered(&before, &mouse, &keyboard);
+
+    GameWindow game = {};
+    game.ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    DWORD gameThreadId = 0;
+    const HANDLE gameThread = CreateThread(nullptr, 0, &GameThread, &game, 0, &gameThreadId);
+    WaitForSingleObject(game.ready, 5000);
+    Check(game.window != nullptr, "input: a game window with a loop of its own");
+    if (game.window == nullptr)
+        return;
+
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(640.0f, 360.0f);
+    io.IniFilename = nullptr;
+    ImGui_ImplWin32_Init(game.window);
+
+    MenuLock();
+    MenuInputAttach(game.window);
+    MenuUnlock();
+    MenuInputStats s = Counts();
+    UINT count = 0;
+    DWORD mouseFlags = 0;
+    Registered(&count, &mouse, &keyboard, &mouseFlags);
+    Check(s.hooks == 1 && s.inputWindow != nullptr && s.registered && mouse == s.inputWindow &&
+              keyboard == s.inputWindow && GetWindowThreadProcessId(s.inputWindow, nullptr) != gameThreadId &&
+              GetWindowThreadProcessId(s.inputWindow, nullptr) != GetCurrentThreadId(),
+          "input: open: one hook, the raw mouse and keyboard to a window of ours on a thread of its own");
+    Check((mouseFlags & RIDEV_NOLEGACY) != 0, "input: open: the mouse makes no window messages (flags 0x%lX)",
+          mouseFlags);
+    Check(Within(2.0, [] { return Counts().probesSeen == 1; }), "input: the hook saw our own message to the window");
+
+    // The game registers its raw mouse again while the menu is open (Gears of War E-Day did, within a second or two):
+    // at the next frame ours is back, and at the close the game's newest is what goes back.
+    RAWINPUTDEVICE gameMouse = {};
+    gameMouse.usUsagePage = 1;
+    gameMouse.usUsage = 2;
+    gameMouse.hwndTarget = game.window;
+    Check(RegisterRawInputDevices(&gameMouse, 1, sizeof gameMouse) != FALSE,
+          "input: the game registers its raw mouse to its window");
+    MenuLock();
+    MenuInputAttach(game.window); // the next frame
+    MenuUnlock();
+    Registered(&count, &mouse, &keyboard, &mouseFlags);
+    Check(Counts().retaken == 1 && mouse == s.inputWindow && (mouseFlags & RIDEV_NOLEGACY) != 0,
+          "input: the game's own registration found over ours, and ours back at the next frame");
+
+    // The game's key and button presses go to the menu, the releases to the game as well.
+    PostMessageW(game.window, WM_KEYDOWN, 'A', 0x001E0001);
+    PostMessageW(game.window, WM_KEYUP, 'A', LPARAM(0xC01E0001));
+    PostMessageW(game.window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(20, 20));
+    PostMessageW(game.window, WM_LBUTTONUP, 0, MAKELPARAM(20, 20));
+    Check(Within(2.0, [&] { return game.keyUps == 1 && game.buttonUps == 1; }) && game.keyDowns == 0 &&
+              game.buttonDowns == 0,
+          "input: the presses stay with the menu, the releases reach the game");
+    s = Counts();
+    Check(s.keyMessages >= 2 && s.mouseMessages >= 2, "input: %u key and %u mouse messages through the hook",
+          s.keyMessages, s.mouseMessages);
+
+    // The raw data comes to our thread whatever the game's loop does.
+    if (SendHarmless(3))
+        Check(Within(2.0, [] { const MenuInputStats c = Counts(); return c.rawKeyEvents >= 6 && c.rawMouseEvents >= 6; }),
+              "input: the raw keyboard and mouse data reached our window (%u key, %u mouse events)",
+              Counts().rawKeyEvents, Counts().rawMouseEvents);
+    else
+        std::printf("skip  input: SendInput was refused (error %lu): no raw data sent\n", GetLastError());
+
+    MenuLock();
+    MenuInputRelease();
+    MenuUnlock();
+    UINT after = 0;
+    Registered(&after, &mouse, &keyboard, &mouseFlags);
+    s = Counts();
+    Check(s.hooks == 0 && !s.registered && after == before + 1 && mouse == game.window && mouseFlags == 0 &&
+              keyboard == nullptr,
+          "input: closed: no hook, the game's newest mouse registration back, no keyboard one (%u)", after);
+    gameMouse.dwFlags = RIDEV_REMOVE;
+    gameMouse.hwndTarget = nullptr;
+    RegisterRawInputDevices(&gameMouse, 1, sizeof gameMouse);
+    Registered(&after, &mouse, &keyboard);
+    Check(after == before && mouse == nullptr, "input: and none once the game removes its own");
+    PostMessageW(game.window, WM_KEYDOWN, 'A', 0x001E0001);
+    Check(Within(2.0, [&] { return game.keyDowns == 1; }), "input: after the close the game gets its presses");
+
+    MenuInputDetach();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    PostMessageW(game.window, WM_CLOSE, 0, 0);
+    PostThreadMessageW(gameThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(gameThread, 5000);
+    CloseHandle(gameThread);
+    CloseHandle(game.ready);
+}
 } // namespace
 
 int main()
@@ -765,6 +989,7 @@ int main()
     TestModelScaleSteps();
     TestModel();
     TestPanel();
+    TestInput();
 
     std::printf("%d checks, %d failed\n", g_checks, g_failed);
     if (g_log != INVALID_HANDLE_VALUE)

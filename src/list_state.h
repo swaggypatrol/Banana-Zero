@@ -11,7 +11,9 @@
 // pointed at us, for every list of that class: Reset and ClearState (after which the state is known: nothing bound),
 // SetDescriptorHeaps, SetPipelineState and SetPipelineState1, SetComputeRootSignature and the six compute root
 // argument setters, and ExecuteBundle (after which the list is unknown: a bundle's bindings stay in the list). A list
-// not reset since then is unknown, and the NR pass waits for the next frame.
+// not reset since then is unknown, and the NR pass waits for the next frame. Where lists come with tables of their
+// own (as Gears of War E-Day's did), each table is taken when a list with it first comes, and a list that was given
+// another table since its Reset is unknown.
 
 #include <windows.h>
 
@@ -47,6 +49,7 @@ struct ListState
     ListStateArg args[kListStateArgs];
     ListStateConstant constants[kListStateConstants];
     unsigned constantCount;
+    const void* table; // the list's function table at its last Reset
 };
 
 // Copies what the game has bound on `list` right now into `out`, the first call also installing the watch. False
