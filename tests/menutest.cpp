@@ -20,10 +20,12 @@
 //     step one way or the other, the pass's model size and GPU time are drawn; closing the menu writes the file,
 //     and so does a second after a commit while it is open
 //   - menu_input.cpp, on a hidden window with a loop of its own on a thread of its own, as a game's: one hook on its
-//     thread; the raw mouse and keyboard data registered to a window of ours on a thread of ours, and reaching it
-//     (F24, which no keyboard has, and the mouse moved one count and back, sent with SendInput; skipped where Windows
-//     refuses it); the game's presses kept from it and its releases passed on; at the close no hook, the raw input
-//     registration as it was, and the game's presses its own again
+//     thread, which sees our own message posted to the window; the raw mouse and keyboard data registered to a window
+//     of ours on a thread of ours, the mouse with no window messages (RIDEV_NOLEGACY), and reaching it (F24, which no
+//     keyboard has, and the mouse moved one count and back, sent with SendInput; skipped where Windows refuses it); a
+//     raw mouse registration the game makes while the menu is open found at the next frame and ours put back; the
+//     game's presses kept from it and its releases passed on; at the close no hook, the game's newest registration
+//     back, and the game's presses its own again
 
 #include <windows.h>
 
@@ -823,8 +825,9 @@ MenuInputStats Counts()
     return stats;
 }
 
-// Who this process's raw mouse and keyboard data goes to: `count` registrations, the mouse's and the keyboard's.
-void Registered(UINT* count, HWND* mouse, HWND* keyboard)
+// Who this process's raw mouse and keyboard data goes to: `count` registrations, the mouse's and the keyboard's, and
+// the mouse's flags.
+void Registered(UINT* count, HWND* mouse, HWND* keyboard, DWORD* mouseFlags = nullptr)
 {
     *count = 0;
     *mouse = *keyboard = nullptr;
@@ -837,7 +840,11 @@ void Registered(UINT* count, HWND* mouse, HWND* keyboard)
     for (UINT i = 0; i < got; ++i)
     {
         if (devices[i].usUsagePage == 1 && devices[i].usUsage == 2)
+        {
             *mouse = devices[i].hwndTarget;
+            if (mouseFlags != nullptr)
+                *mouseFlags = devices[i].dwFlags;
+        }
         if (devices[i].usUsagePage == 1 && devices[i].usUsage == 6)
             *keyboard = devices[i].hwndTarget;
     }
@@ -889,11 +896,30 @@ void TestInput()
     MenuUnlock();
     MenuInputStats s = Counts();
     UINT count = 0;
-    Registered(&count, &mouse, &keyboard);
+    DWORD mouseFlags = 0;
+    Registered(&count, &mouse, &keyboard, &mouseFlags);
     Check(s.hooks == 1 && s.inputWindow != nullptr && s.registered && mouse == s.inputWindow &&
               keyboard == s.inputWindow && GetWindowThreadProcessId(s.inputWindow, nullptr) != gameThreadId &&
               GetWindowThreadProcessId(s.inputWindow, nullptr) != GetCurrentThreadId(),
           "input: open: one hook, the raw mouse and keyboard to a window of ours on a thread of its own");
+    Check((mouseFlags & RIDEV_NOLEGACY) != 0, "input: open: the mouse makes no window messages (flags 0x%lX)",
+          mouseFlags);
+    Check(Within(2.0, [] { return Counts().probesSeen == 1; }), "input: the hook saw our own message to the window");
+
+    // The game registers its raw mouse again while the menu is open (Gears of War E-Day did, within a second or two):
+    // at the next frame ours is back, and at the close the game's newest is what goes back.
+    RAWINPUTDEVICE gameMouse = {};
+    gameMouse.usUsagePage = 1;
+    gameMouse.usUsage = 2;
+    gameMouse.hwndTarget = game.window;
+    Check(RegisterRawInputDevices(&gameMouse, 1, sizeof gameMouse) != FALSE,
+          "input: the game registers its raw mouse to its window");
+    MenuLock();
+    MenuInputAttach(game.window); // the next frame
+    MenuUnlock();
+    Registered(&count, &mouse, &keyboard, &mouseFlags);
+    Check(Counts().retaken == 1 && mouse == s.inputWindow && (mouseFlags & RIDEV_NOLEGACY) != 0,
+          "input: the game's own registration found over ours, and ours back at the next frame");
 
     // The game's key and button presses go to the menu, the releases to the game as well.
     PostMessageW(game.window, WM_KEYDOWN, 'A', 0x001E0001);
@@ -919,10 +945,16 @@ void TestInput()
     MenuInputRelease();
     MenuUnlock();
     UINT after = 0;
-    Registered(&after, &mouse, &keyboard);
+    Registered(&after, &mouse, &keyboard, &mouseFlags);
     s = Counts();
-    Check(s.hooks == 0 && !s.registered && after == before && mouse == nullptr && keyboard == nullptr,
-          "input: closed: no hook, and the raw input registration as it was (%u)", after);
+    Check(s.hooks == 0 && !s.registered && after == before + 1 && mouse == game.window && mouseFlags == 0 &&
+              keyboard == nullptr,
+          "input: closed: no hook, the game's newest mouse registration back, no keyboard one (%u)", after);
+    gameMouse.dwFlags = RIDEV_REMOVE;
+    gameMouse.hwndTarget = nullptr;
+    RegisterRawInputDevices(&gameMouse, 1, sizeof gameMouse);
+    Registered(&after, &mouse, &keyboard);
+    Check(after == before && mouse == nullptr, "input: and none once the game removes its own");
     PostMessageW(game.window, WM_KEYDOWN, 'A', 0x001E0001);
     Check(Within(2.0, [&] { return game.keyDowns == 1; }), "input: after the close the game gets its presses");
 

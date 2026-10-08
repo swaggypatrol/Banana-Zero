@@ -17,6 +17,12 @@
 // no click. On a thread of ours it comes whatever the game's loop does. Until raw data comes the window's mouse
 // messages serve, as in the example, and when neither comes the cursor and the buttons are read each frame.
 //
+// The mouse's raw data is registered with RIDEV_NOLEGACY: while the menu is open Windows makes no mouse messages for
+// the game's windows at all, so a click in the menu is never also the game's. In Gears of War E-Day, whose messages
+// never passed the hook, every click in the menu fired the gun, and the game registered its own raw input again
+// within a second or two of each open; ours is checked every frame and put back, so that the game's lasts a frame at
+// most.
+//
 // The keys: the window's key messages, through the hook, as typed (with their characters). Where the hooks see no
 // mouse or key message while the raw mouse data shows the mouse moving, the keys come from the raw data instead.
 
@@ -50,9 +56,8 @@ namespace
 constexpr USHORT kUsagePageGeneric = 0x01;
 constexpr USHORT kUsageMouse = 0x02;
 constexpr USHORT kUsageKeyboard = 0x06;
-constexpr unsigned kMaxHooks = 3;           // the window's thread, its root owner's, the one in front
-constexpr unsigned kRegistrationEvery = 10; // frames between looks at the raw input registration
-constexpr unsigned kRawMovesForKeys = 8;    // raw mouse events with no message before the keys come from raw data
+constexpr unsigned kMaxHooks = 3;        // the window's thread, its root owner's, the one in front
+constexpr unsigned kRawMovesForKeys = 8; // raw mouse events with no message before the keys come from raw data
 
 // Set on the drawing thread before the hooks go on and cleared after they are off, read by the hooks and the input
 // thread.
@@ -75,8 +80,12 @@ std::atomic<HWND> g_inputWindow { nullptr };
 bool g_registered = false;
 RAWINPUTDEVICE g_saved[2];
 unsigned g_savedCount = 0;
-unsigned g_frames = 0;  // since the open, on the drawing thread
 unsigned g_retaken = 0; // times the game registered over ours since the open
+
+// A message of our own, posted to the window at each open: whether the hook sees it says whether the game's thread
+// takes its messages where a hook can see them at all.
+UINT g_probeMessage = 0;
+std::atomic<unsigned> g_probesSeen { 0 };
 
 // Our pointer, in client pixels, packed so that the thread that draws can reset it while the input thread moves it.
 // Counts since the open, for the log.
@@ -458,12 +467,13 @@ HWND InputWindow()
     return g_inputWindow.load(std::memory_order_acquire);
 }
 
+// Ours: to our window, from the background too; the mouse without the messages Windows would make from it.
 RAWINPUTDEVICE Ours(USHORT usage, HWND target)
 {
     RAWINPUTDEVICE device = {};
     device.usUsagePage = kUsagePageGeneric;
     device.usUsage = usage;
-    device.dwFlags = RIDEV_INPUTSINK;
+    device.dwFlags = RIDEV_INPUTSINK | (usage == kUsageMouse ? RIDEV_NOLEGACY : 0);
     device.hwndTarget = target;
     return device;
 }
@@ -505,11 +515,12 @@ void RegisterRaw()
 }
 
 // A game may register its raw input again while the menu is open (a game switching its mouse mode), which takes the
-// raw data from us: ours goes back, and the game's newest is what goes back at the close. On the drawing thread.
+// raw data from us and gives it the mouse's messages back: ours goes back at the next frame, and the game's newest is
+// what goes back at the close. On the drawing thread, every frame.
 void KeepRaw()
 {
     const HWND target = g_inputWindow.load(std::memory_order_acquire);
-    if (!g_registered || target == nullptr || ++g_frames % kRegistrationEvery != 0)
+    if (!g_registered || target == nullptr)
         return;
     RAWINPUTDEVICE devices[64];
     UINT count = 64;
@@ -593,6 +604,12 @@ void SwallowKey(MSG* msg)
 void OnMessage(MSG* msg, HWND window)
 {
     const UINT message = msg->message;
+    if (message == g_probeMessage && g_probeMessage != 0)
+    {
+        g_probesSeen.fetch_add(1, std::memory_order_relaxed);
+        Swallow(msg);
+        return;
+    }
     if (message == WM_INPUT)
         return; // not the mouse's or the keyboard's while ours go to our window: the game's
     const bool mouse = MouseMessage(message);
@@ -729,7 +746,7 @@ void StartCapture(HWND window)
     g_mouseMessages.store(0, std::memory_order_relaxed);
     g_keyMessages.store(0, std::memory_order_relaxed);
     g_otherMessages.store(0, std::memory_order_relaxed);
-    g_frames = 0;
+    g_probesSeen.store(0, std::memory_order_relaxed);
     g_retaken = 0;
     g_polledClicks = 0;
     for (bool& down : g_polledDown)
@@ -835,6 +852,12 @@ void MenuInputAttach(HWND window)
     }
     else
         g_state = "SetWindowsHookEx failed";
+    // A message of ours behind whatever the window has queued: the close says whether a hook saw it. The game's window
+    // procedure, should it get it instead, leaves an unknown message alone.
+    if (g_probeMessage == 0)
+        g_probeMessage = RegisterWindowMessageW(L"BananaZeroInputProbe");
+    if (g_probeMessage != 0)
+        PostMessageW(window, g_probeMessage, 0, 0);
     Poll(window);
 }
 
@@ -848,11 +871,13 @@ void MenuInputRelease()
     g_state = "released";
     RestoreRaw();
     Log("menu: input: released: %u raw mouse events, %u raw key events; through the hooks %u mouse, %u key and %u "
-        "other messages; %u clicks read from the buttons%s",
+        "other messages, and our own %s; the game took its raw input back %u times; %u clicks read from the "
+        "buttons%s",
         g_rawMouseEvents.load(std::memory_order_relaxed), g_rawKeyEvents.load(std::memory_order_relaxed),
         g_mouseMessages.load(std::memory_order_relaxed), g_keyMessages.load(std::memory_order_relaxed),
-        g_otherMessages.load(std::memory_order_relaxed), g_polledClicks,
-        g_rawKeyboard.load(std::memory_order_relaxed) ? "; the keys came from the raw data" : "");
+        g_otherMessages.load(std::memory_order_relaxed),
+        g_probesSeen.load(std::memory_order_relaxed) != 0 ? "message seen" : "message never seen", g_retaken,
+        g_polledClicks, g_rawKeyboard.load(std::memory_order_relaxed) ? "; the keys came from the raw data" : "");
 }
 
 void MenuInputDetach()
@@ -875,6 +900,8 @@ void MenuInputCounts(MenuInputStats* out)
     out->mouseMessages = g_mouseMessages.load(std::memory_order_relaxed);
     out->keyMessages = g_keyMessages.load(std::memory_order_relaxed);
     out->otherMessages = g_otherMessages.load(std::memory_order_relaxed);
+    out->probesSeen = g_probesSeen.load(std::memory_order_relaxed);
+    out->retaken = g_retaken;
     out->hooks = g_hookCount;
     out->inputWindow = g_inputWindow.load(std::memory_order_acquire);
     out->registered = g_registered;

@@ -6,8 +6,8 @@
 // registration for the mouse and the keyboard is replaced by ours, to a window of ours on a thread of ours, for as
 // long as the menu is open (and put back when it closes): the raw mouse data moves a pointer of our own, which ImGui
 // draws, so that no cursor lock of the game's holds the menu's mouse still, and it reaches the menu whatever the
-// game's loop does. While the menu is open the game gets none of the window's mouse and keyboard messages that pass
-// the hooks, but the releases.
+// game's loop does. While the menu is open Windows makes no mouse messages for the game at all (RIDEV_NOLEGACY), and
+// the game gets none of the key messages that pass the hooks, but the releases.
 
 #include <windows.h>
 
@@ -32,7 +32,9 @@ struct MenuInputStats
     unsigned mouseMessages; // through the hooks
     unsigned keyMessages;
     unsigned otherMessages;
-    unsigned hooks;   // threads hooked
+    unsigned probesSeen; // our own message, posted to the window at the open, seen by a hook
+    unsigned retaken;    // times the game's raw registration was found over ours, and ours put back
+    unsigned hooks;      // threads hooked
     HWND inputWindow; // ours, that the raw data goes to
     bool registered;  // the raw data is registered to it
 };
