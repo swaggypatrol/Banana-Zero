@@ -37,8 +37,8 @@
       <ConformanceMode>true</ConformanceMode>
       <WarningLevel>Level4</WarningLevel>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;IMGUI_DISABLE_DEMO_WINDOWS;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <!-- The menu's own sources from src, and Dear ImGui without its backends: no GPU, no window. -->
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;IMGUI_DISABLE_DEMO_WINDOWS;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;IMGUI_IMPL_WIN32_DISABLE_GAMEPAD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- The menu's own sources from src, and Dear ImGui with its Win32 backend only (the input): no GPU. -->
       <AdditionalIncludeDirectories>$(RepoRoot)src;$(RepoRoot)third_party\imgui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
@@ -64,6 +64,7 @@
     <ClCompile Include="..\src\freeze.cpp" />
     <ClCompile Include="..\src\keys.cpp" />
     <ClCompile Include="..\src\menu.cpp" />
+    <ClCompile Include="..\src\menu_input.cpp" />
     <ClCompile Include="..\src\menu_model.cpp" />
     <ClCompile Include="..\src\menu_panel.cpp" />
     <ClCompile Include="..\src\menu_style.cpp" />
@@ -79,6 +80,9 @@
       <WarningLevel>Level1</WarningLevel>
     </ClCompile>
     <ClCompile Include="..\third_party\imgui\imgui_widgets.cpp">
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="..\third_party\imgui\backends\imgui_impl_win32.cpp">
       <WarningLevel>Level1</WarningLevel>
     </ClCompile>
   </ItemGroup>
