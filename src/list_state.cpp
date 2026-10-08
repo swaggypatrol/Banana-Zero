@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <iterator>
 
@@ -26,23 +27,34 @@ enum Index : unsigned
     kSetComputeRootConstantBufferView = 37,
     kSetComputeRootShaderResourceView = 39,
     kSetComputeRootUnorderedAccessView = 41,
-    kSetPipelineState1 = 75,
-    kEntries = 76
+    kSetPipelineState1 = 75
 };
 
-const Index kWatched[] = { kReset,
-                           kClearState,
-                           kSetPipelineState,
-                           kExecuteBundle,
-                           kSetDescriptorHeaps,
-                           kSetComputeRootSignature,
-                           kSetComputeRootDescriptorTable,
-                           kSetComputeRoot32BitConstant,
-                           kSetComputeRoot32BitConstants,
-                           kSetComputeRootConstantBufferView,
-                           kSetComputeRootShaderResourceView,
-                           kSetComputeRootUnorderedAccessView,
-                           kSetPipelineState1 };
+constexpr Index kWatched[] = { kReset,
+                               kClearState,
+                               kSetPipelineState,
+                               kExecuteBundle,
+                               kSetDescriptorHeaps,
+                               kSetComputeRootSignature,
+                               kSetComputeRootDescriptorTable,
+                               kSetComputeRoot32BitConstant,
+                               kSetComputeRoot32BitConstants,
+                               kSetComputeRootConstantBufferView,
+                               kSetComputeRootShaderResourceView,
+                               kSetComputeRootUnorderedAccessView,
+                               kSetPipelineState1 };
+constexpr unsigned kWatchedCount = unsigned(std::size(kWatched));
+
+// Where an entry's original is kept in a Table.
+constexpr unsigned Position(Index index)
+{
+    for (unsigned i = 0; i < kWatchedCount; ++i)
+    {
+        if (kWatched[i] == index)
+            return i;
+    }
+    return kWatchedCount;
+}
 
 enum ArgKind : uint8_t
 {
@@ -53,7 +65,13 @@ enum ArgKind : uint8_t
     kArgUav
 };
 
-constexpr unsigned kTables = 4;  // distinct list classes we watch
+// The function tables we watch. Most games have one per list class, in the D3D12 runtime. In Gears of War E-Day the
+// lists came with tables outside any module, a new one on each of the first four frames, and with room for four the
+// NR pass followed only the lists that happened to have one of those (941 of 37,719 frames). So they are kept in a
+// hash, as many as come.
+constexpr unsigned kTableBits = 12;
+constexpr unsigned kTableSlots = 1u << kTableBits;
+constexpr unsigned kTablesMax = kTableSlots / 4 * 3; // past this a list with a new table is not followed
 constexpr unsigned kSlotBits = 11;
 constexpr unsigned kSlots = 1u << kSlotBits; // lists followed; a slot is never given back
 
@@ -61,15 +79,38 @@ constexpr unsigned kSlots = 1u << kSlotBits; // lists followed; a slot is never 
 // one destroyed before carries none, so the old list's state, kept in the same slot, is not taken for its own.
 const GUID kSeen = { 0x6b616e61, 0x6e61, 0x4c69, { 0x73, 0x74, 0x53, 0x74, 0x61, 0x74, 0x65, 0x21 } };
 
-// One watched function table, and what its entries held before we took them.
+// One watched function table, and what its watched entries held before we took them. `vtable` is set last, once
+// `original` is complete; a slot is never given back.
 struct Table
 {
-    void** vtable;
-    void* original[kEntries];
+    std::atomic<void**> vtable;
+    void* original[kWatchedCount];
 };
 
-Table g_tables[kTables];
-std::atomic<unsigned> g_tableCount{ 0 }; // entries below it are complete
+Table g_tables[kTableSlots];
+std::atomic<const Table*> g_firstTable{ nullptr };
+unsigned g_tableCount = 0;   // under the NR lock, as everything Watch does
+unsigned g_tablesAstray = 0; // tables whose entries lead elsewhere than the first one's
+bool g_saidTablesFull = false;
+bool g_saidCopied = false;
+
+uint64_t TableHash(const void* vtable) { return (uint64_t(uintptr_t(vtable)) >> 3) * 0x9E3779B97F4A7C15ull; }
+
+// The watched table `vtable`, or null. Any thread: the hooks call it on every call they see.
+const Table* FindTable(void** vtable)
+{
+    const unsigned start = unsigned(TableHash(vtable) >> (64 - kTableBits));
+    for (unsigned i = 0; i < kTableSlots; ++i)
+    {
+        const Table& table = g_tables[(start + i) & (kTableSlots - 1)];
+        void** const held = table.vtable.load(std::memory_order_acquire);
+        if (held == vtable)
+            return &table;
+        if (held == nullptr)
+            return nullptr;
+    }
+    return nullptr;
+}
 
 // A list and what we know of it. The state is only touched by the thread recording that list (a list moves between
 // threads only through the game's own synchronisation), so it needs no atomics of its own.
@@ -84,19 +125,17 @@ std::atomic<bool> g_full{ false };
 // The reasons a list's state became unknown, each logged once.
 std::atomic<bool> g_saidBundle{ false };
 std::atomic<bool> g_saidOverflow{ false };
+std::atomic<bool> g_saidTableChanged{ false };
 
-template <typename F> F Original(ID3D12GraphicsCommandList* list, Index index)
+template <typename F, Index I> F Original(ID3D12GraphicsCommandList* list)
 {
-    void** const vtable = *reinterpret_cast<void***>(list);
-    const unsigned count = g_tableCount.load(std::memory_order_acquire);
-    for (unsigned i = 0; i < count; ++i)
-    {
-        if (g_tables[i].vtable == vtable)
-            return reinterpret_cast<F>(g_tables[i].original[index]);
-    }
+    static_assert(Position(I) < kWatchedCount, "not a watched entry");
+    const Table* table = FindTable(*reinterpret_cast<void***>(list));
     // Reached through a table we did not take (another hook copied our entry): the first table's functions are the
     // class's own as far as we know.
-    return reinterpret_cast<F>(g_tables[0].original[index]);
+    if (table == nullptr)
+        table = g_firstTable.load(std::memory_order_acquire);
+    return reinterpret_cast<F>(table->original[Position(I)]);
 }
 
 ListState* StateOf(ID3D12GraphicsCommandList* list, bool claim)
@@ -128,11 +167,12 @@ void Unknown(ListState* s, std::atomic<bool>* said, const char* why)
         Log("NR: a command list's state is not known after %s; NR waits for its next Reset (logged once)", why);
 }
 
-void Clean(ListState* s, ID3D12PipelineState* pipeline)
+void Clean(ListState* s, ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline)
 {
     *s = {};
     s->known = true;
     s->pipeline = pipeline;
+    s->table = *reinterpret_cast<void* const*>(list);
 }
 
 void SetArg(ID3D12GraphicsCommandList* list, UINT parameter, ArgKind kind, uint64_t value)
@@ -180,11 +220,11 @@ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* list, ID3D12Comma
 {
     typedef HRESULT(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*,
                                             ID3D12PipelineState*);
-    const HRESULT result = Original<Fn>(list, kReset)(list, allocator, pipeline);
+    const HRESULT result = Original<Fn, kReset>(list)(list, allocator, pipeline);
     if (SUCCEEDED(result))
     {
         if (ListState* s = StateOf(list, true))
-            Clean(s, pipeline);
+            Clean(s, list, pipeline);
     }
     return result;
 }
@@ -192,9 +232,9 @@ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* list, ID3D12Comma
 void STDMETHODCALLTYPE HookClearState(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline)
 {
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
-    Original<Fn>(list, kClearState)(list, pipeline);
+    Original<Fn, kClearState>(list)(list, pipeline);
     if (ListState* s = StateOf(list, true))
-        Clean(s, pipeline);
+        Clean(s, list, pipeline);
 }
 
 void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline)
@@ -205,7 +245,7 @@ void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* list, ID3
         s->pipeline = pipeline;
         s->stateObject = nullptr; // the two replace each other
     }
-    Original<Fn>(list, kSetPipelineState)(list, pipeline);
+    Original<Fn, kSetPipelineState>(list)(list, pipeline);
 }
 
 void STDMETHODCALLTYPE HookExecuteBundle(ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList* bundle)
@@ -214,7 +254,7 @@ void STDMETHODCALLTYPE HookExecuteBundle(ID3D12GraphicsCommandList* list, ID3D12
     // What the bundle binds stays bound in the list afterwards, and we do not follow bundles.
     if (ListState* s = StateOf(list, true))
         Unknown(s, &g_saidBundle, "ExecuteBundle");
-    Original<Fn>(list, kExecuteBundle)(list, bundle);
+    Original<Fn, kExecuteBundle>(list)(list, bundle);
 }
 
 void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* list, UINT count,
@@ -234,7 +274,7 @@ void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* list, U
             s->heaps[1] = count > 1 ? heaps[1] : nullptr;
         }
     }
-    Original<Fn>(list, kSetDescriptorHeaps)(list, count, heaps);
+    Original<Fn, kSetDescriptorHeaps>(list)(list, count, heaps);
 }
 
 void STDMETHODCALLTYPE HookSetComputeRootSignature(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root)
@@ -251,7 +291,7 @@ void STDMETHODCALLTYPE HookSetComputeRootSignature(ID3D12GraphicsCommandList* li
         }
         s->computeRoot = root;
     }
-    Original<Fn>(list, kSetComputeRootSignature)(list, root);
+    Original<Fn, kSetComputeRootSignature>(list)(list, root);
 }
 
 void STDMETHODCALLTYPE HookSetComputeRootDescriptorTable(ID3D12GraphicsCommandList* list, UINT parameter,
@@ -259,7 +299,7 @@ void STDMETHODCALLTYPE HookSetComputeRootDescriptorTable(ID3D12GraphicsCommandLi
 {
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
     SetArg(list, parameter, kArgTable, table.ptr);
-    Original<Fn>(list, kSetComputeRootDescriptorTable)(list, parameter, table);
+    Original<Fn, kSetComputeRootDescriptorTable>(list)(list, parameter, table);
 }
 
 void STDMETHODCALLTYPE HookSetComputeRoot32BitConstant(ID3D12GraphicsCommandList* list, UINT parameter, UINT value,
@@ -268,7 +308,7 @@ void STDMETHODCALLTYPE HookSetComputeRoot32BitConstant(ID3D12GraphicsCommandList
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
     if (ListState* s = StateOf(list, true))
         SetConstant(s, parameter, offset, value);
-    Original<Fn>(list, kSetComputeRoot32BitConstant)(list, parameter, value, offset);
+    Original<Fn, kSetComputeRoot32BitConstant>(list)(list, parameter, value, offset);
 }
 
 void STDMETHODCALLTYPE HookSetComputeRoot32BitConstants(ID3D12GraphicsCommandList* list, UINT parameter, UINT count,
@@ -288,7 +328,7 @@ void STDMETHODCALLTYPE HookSetComputeRoot32BitConstants(ID3D12GraphicsCommandLis
                 SetConstant(s, parameter, offset + i, dwords[i]);
         }
     }
-    Original<Fn>(list, kSetComputeRoot32BitConstants)(list, parameter, count, values, offset);
+    Original<Fn, kSetComputeRoot32BitConstants>(list)(list, parameter, count, values, offset);
 }
 
 void STDMETHODCALLTYPE HookSetComputeRootConstantBufferView(ID3D12GraphicsCommandList* list, UINT parameter,
@@ -296,7 +336,7 @@ void STDMETHODCALLTYPE HookSetComputeRootConstantBufferView(ID3D12GraphicsComman
 {
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
     SetArg(list, parameter, kArgCbv, address);
-    Original<Fn>(list, kSetComputeRootConstantBufferView)(list, parameter, address);
+    Original<Fn, kSetComputeRootConstantBufferView>(list)(list, parameter, address);
 }
 
 void STDMETHODCALLTYPE HookSetComputeRootShaderResourceView(ID3D12GraphicsCommandList* list, UINT parameter,
@@ -304,7 +344,7 @@ void STDMETHODCALLTYPE HookSetComputeRootShaderResourceView(ID3D12GraphicsComman
 {
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
     SetArg(list, parameter, kArgSrv, address);
-    Original<Fn>(list, kSetComputeRootShaderResourceView)(list, parameter, address);
+    Original<Fn, kSetComputeRootShaderResourceView>(list)(list, parameter, address);
 }
 
 void STDMETHODCALLTYPE HookSetComputeRootUnorderedAccessView(ID3D12GraphicsCommandList* list, UINT parameter,
@@ -312,7 +352,7 @@ void STDMETHODCALLTYPE HookSetComputeRootUnorderedAccessView(ID3D12GraphicsComma
 {
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
     SetArg(list, parameter, kArgUav, address);
-    Original<Fn>(list, kSetComputeRootUnorderedAccessView)(list, parameter, address);
+    Original<Fn, kSetComputeRootUnorderedAccessView>(list)(list, parameter, address);
 }
 
 void STDMETHODCALLTYPE HookSetPipelineState1(ID3D12GraphicsCommandList* list, ID3D12StateObject* stateObject)
@@ -323,7 +363,7 @@ void STDMETHODCALLTYPE HookSetPipelineState1(ID3D12GraphicsCommandList* list, ID
         s->stateObject = stateObject;
         s->pipeline = nullptr; // the two replace each other
     }
-    Original<Fn>(list, kSetPipelineState1)(list, stateObject);
+    Original<Fn, kSetPipelineState1>(list)(list, stateObject);
 }
 
 void* HookFor(Index index)
@@ -358,56 +398,162 @@ bool WriteEntry(void** entry, void* value)
     return true;
 }
 
+// The module holding `address` ("D3D12Core.dll"), with the offset in it when `offset` is given; else what memory it
+// is in. For the log.
+void Where(const void* address, bool offset, char* out, size_t size)
+{
+    HMODULE owner = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(address), &owner))
+    {
+        wchar_t path[MAX_PATH];
+        const DWORD length = GetModuleFileNameW(owner, path, MAX_PATH);
+        const wchar_t* name = L"a module without a name";
+        if (length != 0 && length < MAX_PATH)
+        {
+            const wchar_t* slash = wcsrchr(path, L'\\');
+            name = slash != nullptr ? slash + 1 : path;
+        }
+        if (offset)
+            std::snprintf(out, size, "%ls+0x%llX", name,
+                          static_cast<unsigned long long>(uintptr_t(address) - uintptr_t(owner)));
+        else
+            std::snprintf(out, size, "%ls", name);
+        return;
+    }
+    MEMORY_BASIC_INFORMATION info = {};
+    if (VirtualQuery(address, &info, sizeof info) != sizeof info)
+    {
+        std::snprintf(out, size, "no module (%p)", address);
+        return;
+    }
+    const char* type = info.Type == MEM_PRIVATE ? "private" : info.Type == MEM_MAPPED ? "mapped" : "image";
+    if (offset)
+        std::snprintf(out, size, "no module (%p, %s memory allocated at %p)", address, type, info.AllocationBase);
+    else
+        std::snprintf(out, size, "no module (%s memory)", type);
+}
+
+// Where a table's originals lead, module by module: "D3D12Core.dll 13". For the log.
+void DescribeOriginals(const Table& table, char* out, size_t size)
+{
+    char names[4][96] = {};
+    unsigned counts[4] = {};
+    unsigned distinct = 0, others = 0;
+    for (void* original : table.original)
+    {
+        char name[96];
+        Where(original, false, name, sizeof name);
+        unsigned i = 0;
+        while (i < distinct && std::strcmp(names[i], name) != 0)
+            ++i;
+        if (i == distinct && distinct == std::size(names))
+        {
+            ++others;
+            continue;
+        }
+        if (i == distinct)
+            std::snprintf(names[distinct++], sizeof names[0], "%s", name);
+        ++counts[i];
+    }
+    int at = 0;
+    for (unsigned i = 0; i < distinct && at >= 0 && size_t(at) < size; ++i)
+        at += std::snprintf(out + at, size - size_t(at), "%s%s %u", i != 0 ? ", " : "", names[i], counts[i]);
+    if (others != 0 && at >= 0 && size_t(at) < size)
+        std::snprintf(out + at, size - size_t(at), ", elsewhere %u", others);
+}
+
 // Takes the watched entries of `list`'s table, once per table. Callers hold the NR lock, so two never race here.
 bool Watch(ID3D12GraphicsCommandList* list)
 {
     void** const vtable = *reinterpret_cast<void***>(list);
-    const unsigned count = g_tableCount.load(std::memory_order_relaxed);
-    for (unsigned i = 0; i < count; ++i)
+    if (FindTable(vtable) != nullptr)
+        return true;
+    if (g_tableCount == kTablesMax)
     {
-        if (g_tables[i].vtable == vtable)
-            return true;
-    }
-    if (count == kTables)
+        if (!g_saidTablesFull)
+        {
+            g_saidTablesFull = true;
+            Log("NR: %u command list tables followed; a list with yet another one is not followed", kTablesMax);
+        }
         return false;
+    }
     // SetPipelineState1 is ID3D12GraphicsCommandList4's: a runtime without it has a shorter table.
     ID3D12GraphicsCommandList4* four = nullptr;
     if (FAILED(list->QueryInterface(IID_PPV_ARGS(&four))))
     {
-        Log("NR: the game's command list has no ID3D12GraphicsCommandList4; its state cannot be followed");
+        static bool said = false;
+        if (!said)
+            Log("NR: the game's command list has no ID3D12GraphicsCommandList4; its state cannot be followed");
+        said = true;
         return false;
     }
     four->Release();
-    Table& table = g_tables[count];
-    table.vtable = vtable;
-    for (unsigned i = 0; i < kEntries; ++i)
-        table.original[i] = vtable[i];
-    g_tableCount.store(count + 1, std::memory_order_release); // published before any list can reach our hooks
-
-    char module[MAX_PATH] = "unknown module";
-    uintptr_t offset = 0;
-    HMODULE owner = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(vtable), &owner))
+    Table* table = nullptr;
+    const unsigned start = unsigned(TableHash(vtable) >> (64 - kTableBits));
+    for (unsigned i = 0; i < kTableSlots && table == nullptr; ++i)
     {
-        wchar_t path[MAX_PATH];
-        const DWORD length = GetModuleFileNameW(owner, path, MAX_PATH);
-        if (length != 0 && length < MAX_PATH)
-        {
-            const wchar_t* slash = wcsrchr(path, L'\\');
-            std::snprintf(module, sizeof module, "%ls", slash != nullptr ? slash + 1 : path);
-        }
-        offset = uintptr_t(vtable) - uintptr_t(owner);
+        Table& candidate = g_tables[(start + i) & (kTableSlots - 1)];
+        if (candidate.vtable.load(std::memory_order_relaxed) == nullptr)
+            table = &candidate;
     }
+    if (table == nullptr)
+        return false; // not below kTablesMax
+
+    // An entry that is ours already: the table is a copy of one we took, made after we took it, and taking our entry
+    // for the original would call ourselves for ever. The first table's original is the class's own.
+    const Table* first = g_firstTable.load(std::memory_order_relaxed);
+    unsigned copied = 0;
+    bool astray = false;
+    for (unsigned i = 0; i < kWatchedCount; ++i)
+    {
+        void* entry = vtable[kWatched[i]];
+        if (entry == HookFor(kWatched[i]))
+        {
+            if (first == nullptr)
+                return false; // cannot be: our entries are only in tables we took
+            entry = first->original[i];
+            ++copied;
+        }
+        table->original[i] = entry;
+        astray = astray || (first != nullptr && entry != first->original[i]);
+    }
+    table->vtable.store(vtable, std::memory_order_release); // published before any list can reach our hooks
+    ++g_tableCount;
+    if (first == nullptr)
+        g_firstTable.store(table, std::memory_order_release);
+    if (astray)
+        ++g_tablesAstray;
+
     unsigned taken = 0;
     for (Index index : kWatched)
     {
-        if (WriteEntry(&vtable[index], HookFor(index)))
+        if (vtable[index] == HookFor(index) || WriteEntry(&vtable[index], HookFor(index)))
             ++taken;
     }
-    Log("NR: following the game's compute state: %u of %u entries of the command list table at %s+0x%llX", taken,
-        unsigned(std::size(kWatched)), module, static_cast<unsigned long long>(offset));
-    return taken == std::size(kWatched);
+    // The first four one by one, as before there were more, and where their entries lead; then every power of two.
+    if (g_tableCount <= 4)
+    {
+        char where[160];
+        char leads[400] = "";
+        Where(vtable, true, where, sizeof where);
+        DescribeOriginals(*table, leads, sizeof leads);
+        Log("NR: following the game's compute state: %u of %u entries of the command list table at %s; they led to "
+            "%s%s",
+            taken, kWatchedCount, where, leads, astray ? ", not all where the first table's did" : "");
+    }
+    else if ((g_tableCount & (g_tableCount - 1)) == 0)
+        Log("NR: following the game's compute state on %u command list tables; %u of them lead elsewhere than the "
+            "first",
+            g_tableCount, g_tablesAstray);
+    if (copied != 0 && !g_saidCopied)
+    {
+        g_saidCopied = true;
+        Log("NR: a command list table held %u of our entries already: a copy of one we took, its originals are the "
+            "first table's (logged once)",
+            copied);
+    }
+    return taken == kWatchedCount;
 }
 } // namespace
 
@@ -430,6 +576,12 @@ bool ListStateCapture(ID3D12GraphicsCommandList* list, ListState* out)
     }
     if (s == nullptr || !s->known)
         return false;
+    if (s->table != *reinterpret_cast<void* const*>(list))
+    {
+        // Given another table since its Reset (by some other hook): what went through that one we did not see.
+        Unknown(s, &g_saidTableChanged, "it was given another function table");
+        return false;
+    }
     *out = *s;
     return true;
 }

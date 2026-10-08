@@ -26,7 +26,9 @@
 //   - the motion vectors dilated by depth, at the render and at the display resolution, inside larger textures
 //   - Show sky's stripes in the composite, and every other pixel left as it was
 // And, first, the game's compute state dxgi.dll binds again after its pass (src/list_state.cpp), as it learns it
-// from this process's own lists on the D3D12 runtime the games use. Everything after runs through those hooks.
+// from this process's own lists on the D3D12 runtime the games use, and from lists given function tables of their
+// own on the heap, as Gears of War E-Day's came: more of them than four, one given another table after its Reset,
+// and a copy made after the class's table was taken. Everything after runs through those hooks.
 // The exit code is the number of failed checks.
 
 #include <windows.h>
@@ -2716,6 +2718,49 @@ bool Empty(const ListState& s, ID3D12PipelineState* pipeline)
     return SameState(s, empty);
 }
 
+// A copy of a command list's function table on the heap, outside any module, as Gears of War E-Day's lists came with.
+// 86 entries are ID3D12GraphicsCommandList10's; fewer if the table ends sooner. Never freed: list_state.cpp keeps
+// every table it took.
+void** CopyTable(void** from)
+{
+    constexpr size_t kCopy = 86;
+    size_t count = kCopy;
+    MEMORY_BASIC_INFORMATION info = {};
+    if (VirtualQuery(from, &info, sizeof info) == sizeof info)
+        count = std::min(kCopy, (uintptr_t(info.BaseAddress) + info.RegionSize - uintptr_t(from)) / sizeof(void*));
+    void** to = new void*[kCopy]();
+    std::memcpy(to, from, count * sizeof(void*));
+    return to;
+}
+
+// A list given a table of its own.
+struct OwnTable
+{
+    ID3D12CommandAllocator* allocator;
+    ID3D12GraphicsCommandList* list;
+    void** own;
+    void** classTable;
+};
+
+void MakeOwnTable(OwnTable* o)
+{
+    Must(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&o->allocator)),
+         "CreateCommandAllocator");
+    Must(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, o->allocator, nullptr, IID_PPV_ARGS(&o->list)),
+         "CreateCommandList");
+    o->classTable = *reinterpret_cast<void***>(o->list);
+    o->own = CopyTable(o->classTable);
+    *reinterpret_cast<void***>(o->list) = o->own;
+}
+
+void DropOwnTable(OwnTable* o)
+{
+    o->list->Close();
+    *reinterpret_cast<void***>(o->list) = o->classTable;
+    o->list->Release();
+    o->allocator->Release();
+}
+
 void TestListState()
 {
     auto makeHeap = [](D3D12_DESCRIPTOR_HEAP_TYPE type) {
@@ -2755,6 +2800,14 @@ void TestListState()
     blob->Release();
     if (errors != nullptr)
         errors->Release();
+
+    // Lists with tables of their own, more than the four list_state.cpp once had room for. Their copies are made
+    // before it takes any entry of the class's table, so they hold the class's own functions, as do `spare`'s.
+    constexpr unsigned kOwnTables = 6;
+    OwnTable own[kOwnTables] = {};
+    for (OwnTable& o : own)
+        MakeOwnTable(&o);
+    void** const spare = CopyTable(*reinterpret_cast<void***>(g.list));
 
     ListState s = {};
     Check(!ListStateCapture(g.list, &s), "list state: a list first seen is unknown");
@@ -2820,6 +2873,53 @@ void TestListState()
     other->Close();
     other->Release();
     otherAllocator->Release();
+
+    // Each list with a table of its own is followed: its table is taken when it first comes, its Reset goes
+    // through us, and what it binds after is known.
+    unsigned followed = 0, taken = 0;
+    for (OwnTable& o : own)
+    {
+        const bool firstSeen = ListStateCapture(o.list, &s);
+        taken += o.own[10] != spare[10] ? 1 : 0; // Reset
+        Must(o.list->Close(), "Close");
+        Must(o.list->Reset(o.allocator, nullptr), "Reset");
+        o.list->SetDescriptorHeaps(1, &gameHeap);
+        o.list->SetComputeRootSignature(gameRoot);
+        followed += !firstSeen && ListStateCapture(o.list, &s) && s.heapCount == 1 && s.heaps[0] == gameHeap &&
+                            s.computeRoot == gameRoot
+                        ? 1
+                        : 0;
+    }
+    Check(taken == kOwnTables && followed == kOwnTables,
+          "list state: %u lists with tables of their own: %u tables taken, %u lists followed", kOwnTables, taken,
+          followed);
+
+    // A list given another table since its Reset: what went through that one was not seen, so it is unknown until
+    // its next Reset, which goes through the new table.
+    own[0].list->SetComputeRootSignature(g.root);
+    *reinterpret_cast<void***>(own[0].list) = spare;
+    own[0].list->SetComputeRootSignature(gameRoot); // through `spare`, not taken yet: not seen
+    Check(!ListStateCapture(own[0].list, &s), "list state: a list given another table since its Reset is unknown");
+    Must(own[0].list->Close(), "Close");
+    Must(own[0].list->Reset(own[0].allocator, nullptr), "Reset");
+    Check(spare[10] == own[1].own[10] && ListStateCapture(own[0].list, &s) && Empty(s, nullptr),
+          "list state: and known again after a Reset through the new one, taken by then");
+    *reinterpret_cast<void***>(own[0].list) = own[0].own;
+
+    // A copy made after the class's table was taken holds our own entries: taken for the originals, they would call
+    // themselves for ever. The class's own functions are kept for them.
+    OwnTable late = {};
+    MakeOwnTable(&late);
+    Check(late.own[10] == own[1].own[10], "list state: a copy made now holds our entries");
+    Check(!ListStateCapture(late.list, &s), "list state: a list with such a copy starts unknown");
+    Must(late.list->Close(), "Close");
+    Must(late.list->Reset(late.allocator, nullptr), "Reset");
+    late.list->SetDescriptorHeaps(1, &ourHeap);
+    Check(ListStateCapture(late.list, &s) && s.heapCount == 1 && s.heaps[0] == ourHeap,
+          "list state: and is followed after its Reset, which reached the runtime's");
+    DropOwnTable(&late);
+    for (OwnTable& o : own)
+        DropOwnTable(&o);
     gameRoot->Release();
     gameHeap->Release();
     gameSampler->Release();
