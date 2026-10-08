@@ -33,7 +33,7 @@ It is NVIDIA's and not ours to hand out, so you bring your own, the way you brin
 | API | DirectX 12 |
 | Game must have | DLSS Super Resolution or Ray Reconstruction switched on |
 | Model | `nvngx_dlssnr.dll`, supplied by you |
-| Tested on | RTX 5090, driver 32.0.16.1714, Windows 11, model file 310.8 |
+| Tested on | RTX 5090, driver 32.0.16.1742, Windows 11, model file 310.8 |
 | Frequency response | One frame in, the same frame out |
 | Crossover point | Right after DLSS, before tone mapping, the HUD and frame generation |
 | Distortion | Each pixel moves at most 1 EV brighter or darker by default. Hard limit, not a suggestion |
@@ -45,6 +45,7 @@ It is NVIDIA's and not ours to hand out, so you bring your own, the way you brin
 | The Witcher 3 (Epic, DX12) | `<game folder>\bin\x64_dx12\`, next to `witcher3.exe` | Ray Reconstruction + Frame Generation, through Streamline |
 | The Last of Us Part II Remastered | The game's root folder, next to `tlou-ii.exe` | Super Resolution + Frame Generation, through Streamline |
 | Resident Evil Requiem (Steam) | The game's root folder, next to `re9.exe`, with [REFramework](#re-engine-games-and-reframework) | Ray Reconstruction + Frame Generation, through Streamline |
+| Gears of War E-Day | `<game folder>\FairlightConcept\Binaries\Win64\`, next to `GoWEDay-Steam.exe`. Ships EasyAntiCheat: see [Anti-cheat](#anti-cheat) | Super Resolution, plus Frame Generation through Streamline |
 
 Other DX12 games with DLSS should work the same way in principle. "In principle" is doing some heavy lifting in that
 sentence; please report back.
@@ -77,6 +78,12 @@ upgrade, right-click Style and the Model sliders to hand them back to the model.
 **Uninstalling:** delete `dxgi.dll`, `banana.nvngx.dll`, `dlssnr.ini`, `dlssnr.log` and `dlssnr.prev.log` from the
 game folder, and optionally `%LOCALAPPDATA%\Banana-Zero`. Banana-Zero never modifies a single file of the game.
 
+### Anti-cheat
+
+Banana-Zero's DLLs are not signed, and anti-cheat software may refuse them, or flag the account that loaded them.
+Gears of War E-Day ships EasyAntiCheat; Banana-Zero was tested in its campaign only. Never take Banana-Zero into an
+online mode, and don't use it in a game whose rules forbid it.
+
 ### Break-in period
 
 There is none. It sounds its best on day one. We just always wanted to write that.
@@ -86,7 +93,8 @@ There is none. It sounds its best on day one. We just always wanted to write tha
 Press **`End`**. The menu only opens while the game is actually running DLSS, so not in the main menu. Close it with
 `End` again, `Esc`, or the Close menu button.
 
-- While the menu is open the game gets no keyboard or mouse input, and gets it all back when the menu closes.
+- While the menu is open the game gets no mouse input, and in most games no keyboard input either (in Gears of War
+  E-Day the keys you press reach the game as well). It gets it all back when the menu closes.
 - **Sliders apply while you drag**: the picture follows the mouse, step by step. No Apply button. We trust you.
 - **Right-click a slider** to put it back to its default. `Ctrl`+click to type a number.
 - A **hollow slider** means "not set, the model uses its own default". Click or drag it to take over; right-click to
@@ -279,7 +287,7 @@ never saved.
 ## Known limitations
 
 - **DirectX 12 only.** Vulkan is the next milestone. DX11 is not planned.
-- **Tested in exactly three games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are
+- **Tested in exactly four games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are
   untested.
 - **It costs frame time.** About 7 ms per frame for the whole NR pass on an RTX 5090 at 4K output, nearly all of it
   inside the model. The Speed page shows what it costs on your machine, and its Model input size trades some of the
@@ -287,12 +295,14 @@ never saved.
 - **The model's knobs are undocumented.** `nrprobe --tuning` measured that they act and what their defaults are; what
   each one does to the picture is our best guess from its name.
 - Night scenes in Witcher 3, the pause menus and photo modes have not been tested specifically.
-- The menu keeps keyboard and mouse from the game, but not a gamepad.
+- The menu keeps the mouse from the game, and in most games the keyboard, but not a gamepad. In Gears of War E-Day
+  the keys pressed with the menu open reach the game too.
 
 ## Version history
 
 | Version | What changed |
 |---|---|
+| v0.1.5 | NR runs on every frame in games whose command lists each carry a function table of their own: in Gears of War E-Day v0.1.4 ran it on about 2.5% of the frames, v0.1.5 on 99.8%. The menu reads the mouse (and, where it has to, the keyboard) from raw input on a thread of its own, so it works in games whose window messages no hook sees, and while it is open Windows makes no mouse messages for the game, so a click in the menu is not also a click in the game. The picture is the same as v0.1.4 wherever NR ran before |
 | v0.1.4 | Resident Evil Requiem works, with [REFramework](#re-engine-games-and-reframework). The NR pass now puts back what the game had bound on its command list (some games, RE Engine among them, rely on it surviving the DLSS call, and crashed), and the menu opens, works and closes alongside REFramework's own hooks. `dlssnr.ini` is read next to the game's `.exe` first. The menu reads its input without touching the game's window procedure. The picture is the same as v0.1.3 |
 | v0.1.3 | The release candidate held up in play and is now the current release: [Speed (experimental)](#speed-experimental) and [Depth (experimental)](#depth-experimental) are in. New since the candidate: Model input size goes down to 33.3%, with notches at 33.3%, 50%, 66.7% and 80% and 1% steps between them. Leave both pages as they come and the picture is the same as v0.1.2 |
 | v0.1.3-rc.1 | A release candidate, published as a pre-release: v0.1.2 stays the current release until this one has seen more games. New: [Speed (experimental)](#speed-experimental), the model on a smaller copy of the frame for less GPU time, with the pass's GPU time on the page; [Depth (experimental)](#depth-experimental), motion vectors dilated by depth and the sky's own Local tone and Local structure. New for builders: `nrprobe --subrects`. Leave both pages as they come and the picture is the same as v0.1.2 |
@@ -317,8 +327,9 @@ never saved.
   a smaller part of its input and output.
 - The model only uses what the game already gives DLSS: colour, depth and motion vectors. No per-game patching.
 - The NR pass binds descriptor heaps, a compute root signature and pipelines of its own on the game's command list.
-  Banana-Zero follows what the game has bound (through the command list's function table) and binds it again when
-  the pass is done, because some games set it once and expect it to survive the DLSS call.
+  Banana-Zero follows what the game has bound (through the command list's function table, or each list's own where
+  every list carries one) and binds it again when the pass is done, because some games set it once and expect it to
+  survive the DLSS call.
 - **Why the bridge DLL?** The model only accepts callers whose file name contains `nvngx.dll`, and the driver's NGX
   runtime refuses to load the model itself because of its signature. So `dxgi.dll` calls it through
   `banana.nvngx.dll`, which knows no parameter names and just passes calls along.
@@ -349,8 +360,8 @@ Run these from the repository root after a build. The exit code is the number of
 |---|---|---|
 | `build\Release\dxgitest.exe` | nothing special | The export table matches the real `dxgi.dll`, every export reaches its real function, and a DXGI factory and D3D12 device can be made through ours |
 | `build\Release\ngxtest.exe` | nothing special | The five hooks against a fake NGX runtime and the bridge against a fake model |
-| `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back |
-| `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU, and checks that the game's compute state is followed and put back after the NR pass |
+| `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back. Then the menu's input on a hidden window with a message loop of its own: the hook, the raw input going to a thread of ours with the mouse's window messages off, and the game's own registration put back. It sends F24 and a one-count mouse move and back with `SendInput`, which leave your keyboard and cursor as they were |
+| `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU, and checks that the game's compute state is followed and put back after the NR pass, also on lists with function tables of their own |
 | `build\Release\nrprobe.exe [--model <path>]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll` |
 | `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along moving edges and thin bars, whether a control mask sets it per pixel, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
 | `build\Release\nrprobe.exe --subrects` | the same | Runs the model on smaller pictures inside a feature made for the full one, as Model input size does: that the result matches a feature made at the smaller size, that nothing outside the smaller picture is written, how long each size takes, and which motion-vector scale it wants then |
