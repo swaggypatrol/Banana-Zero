@@ -11,9 +11,12 @@
 // pointed at us, for every list of that class: Reset and ClearState (after which the state is known: nothing bound),
 // SetDescriptorHeaps, SetPipelineState and SetPipelineState1, SetComputeRootSignature and the six compute root
 // argument setters, and ExecuteBundle (after which the list is unknown: a bundle's bindings stay in the list). A list
-// not reset since then is unknown, and the NR pass waits for the next frame. Where lists come with tables of their
-// own (as Gears of War E-Day's did), each table is taken when a list with it first comes, and a list that was given
-// another table since its Reset is unknown.
+// not reset since then is unknown, and the NR pass waits for the next frame; a list reset since then is known at its
+// first NR pass (GTA V records DLSS on lists of a pool of about a thousand), and so is one the device makes since then
+// on a table followed by then (its CreateCommandList is taken with the first table: such a list starts recording
+// without a Reset). A Reset counts only on a table whose entries are all ours by then. Where lists come with tables
+// of their own (as Gears of War E-Day's did), each table is taken when a list with it first comes, and a list that was
+// given another table since its Reset is unknown.
 
 #include <windows.h>
 
@@ -50,11 +53,22 @@ struct ListState
     ListStateConstant constants[kListStateConstants];
     unsigned constantCount;
     const void* table; // the list's function table at its last Reset
+    const char* lost;  // why it is not known since that Reset (a call we cannot follow), for the log; else null
 };
 
 // Copies what the game has bound on `list` right now into `out`, the first call also installing the watch. False
-// while it is not known: the caller then records nothing into the list. Only on the thread recording `list`.
-bool ListStateCapture(ID3D12GraphicsCommandList* list, ListState* out);
+// while it is not known, with `*why` (when given) saying why, for the log: the caller then records nothing into the
+// list. Only on the thread recording `list`.
+bool ListStateCapture(ID3D12GraphicsCommandList* list, ListState* out, const char** why = nullptr);
+
+// How much is followed, for the log's periodic lines. Any thread.
+struct ListStateCounts
+{
+    unsigned lists;  // command lists with a slot of their own
+    uint64_t resets; // Resets and ClearStates that went through us
+    uint64_t made;   // lists the device made on a table we follow, known from their birth
+};
+void ListStateCount(ListStateCounts* out);
 
 // Binds `state` on `list` again, after the NR pass bound its own: heaps, root signature, its arguments, pipeline.
 // Graphics state is left alone: the NR pass binds none.

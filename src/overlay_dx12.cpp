@@ -1015,7 +1015,7 @@ void DrawLocked(IDXGISwapChain* chain)
     // The ImGui frame.
     ScaleStyle(float(g.height) / 1080.0f);
     ImGui_ImplDX12_NewFrame();
-    ImGui_ImplWin32_NewFrame();
+    MenuInputNewFrame(&ImGui_ImplWin32_NewFrame); // the backend's, with our pointer for the system cursor's position
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(float(g.width), float(g.height)); // the frame, not the window's client area
     ImGui::NewFrame();
