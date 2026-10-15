@@ -11,17 +11,37 @@
 // The mouse: a game in play keeps the cursor hidden and often held still (clipped to a point, or put back to the
 // centre every frame), so the cursor's position says nothing. While the menu is open the raw mouse and keyboard data
 // (WM_INPUT) is registered to a message-only window of ours, on a thread of ours, and it moves a pointer of our own,
-// told to ImGui as the mouse messages the backend understands; ImGui draws that pointer. The game's own registration,
-// if any, is put back when the menu closes. The raw data used to go to the game's window, through the hook; in Gears
-// of War E-Day the hook on that window's thread saw no message at all, raw or not, in five openings, and the menu took
-// no click. On a thread of ours it comes whatever the game's loop does. Until raw data comes the window's mouse
-// messages serve, as in the example, and when neither comes the cursor and the buttons are read each frame.
+// told to ImGui as its mouse events; ImGui draws that pointer. The game's own registration, if any, is put back when
+// the menu closes. The raw data used to go to the game's window, through the hook; in Gears of War E-Day the hook on
+// that window's thread saw no message at all, raw or not, in five openings, and the menu took no click. On a thread
+// of ours it comes whatever the game's loop does. Until raw data comes the window's mouse messages serve, as in the
+// example, and when neither comes the cursor and the buttons are read each frame.
 //
-// The mouse's raw data is registered with RIDEV_NOLEGACY: while the menu is open Windows makes no mouse messages for
-// the game's windows at all, so a click in the menu is never also the game's. In Gears of War E-Day, whose messages
-// never passed the hook, every click in the menu fired the gun, and the game registered its own raw input again
-// within a second or two of each open; ours is checked every frame and put back, so that the game's lasts a frame at
-// most.
+// The mouse never goes through the Win32 backend's mouse messages, from any thread: for those the backend takes and
+// releases the mouse capture (SetCapture at a press, ReleaseCapture when the last button goes up) and asks Windows for
+// WM_MOUSELEAVE (TrackMouseEvent) on the window it is given, the game's. On the game's thread that capture is the
+// game's own: GTA V holds its window's, and v0.1.3, which ran the backend there, released it at every click in the
+// menu, after which the game took no mouse. From a thread of ours the capture calls do nothing, but TrackMouseEvent
+// still reaches the game's window. The backend's NewFrame tells ImGui where the system cursor is while it has seen no
+// mouse message; that position is taken out of ImGui's queue again and our pointer told instead (MenuInputNewFrame).
+// Told after it, ours made two positions in every frame, and ImGui's input trickling held a wheel notch back a frame
+// for each, so the wheel, and the clicks behind it, fell further and further behind.
+//
+// The mouse's raw data is registered with RIDEV_NOLEGACY: once it is ours Windows makes no mouse messages for the
+// game's windows at all, so a click in the menu is not also the game's. In Gears of War E-Day, whose messages never
+// passed the hook, every click in the menu fired the gun, and the game registered its own raw input again within a
+// second or two of each open; ours is checked every frame and put back, so that the game's lasts a frame at most.
+//
+// A device's raw data becomes ours only once what of it was held at the open is let go (ten seconds at most): what
+// the game saw go down must come up for the game too, and with ours registered the release would come to us. GTA V,
+// which takes its keys from the raw data, would keep walking, or keep a weapon wheel open on Tab and turn the mouse
+// with it. The key that opened the menu is one of them: the keyboard becomes ours when it is let go. Until a device
+// is ours its raw data, presses included, is the game's; a key still held after the ten seconds stays pressed for such
+// a game until it is pressed again. What is held is read once, at the open, and only those keys after it: reading
+// every key over and over is what a key logger does, and security software stopped a test that did it for a few
+// seconds. At the close the game's registration is put back and read back; if ours is still there (the game's could
+// not be put back, its window gone), ours is removed, since the mouse's RIDEV_NOLEGACY left behind would leave the
+// game no mouse at all.
 //
 // The keys: the window's key messages, through the hook, as typed (with their characters). Where the hooks see no
 // mouse or key message while the raw mouse data shows the mouse moving, the keys come from the raw data instead.
@@ -36,6 +56,7 @@
 #include <initializer_list>
 
 #include "imgui.h"
+#include "imgui_internal.h" // the input queue, for MenuInputNewFrame
 #include "log.h"
 #include "menu.h"
 #include "overlay_dx12.h"
@@ -58,6 +79,8 @@ constexpr USHORT kUsageMouse = 0x02;
 constexpr USHORT kUsageKeyboard = 0x06;
 constexpr unsigned kMaxHooks = 3;        // the window's thread, its root owner's, the one in front
 constexpr unsigned kRawMovesForKeys = 8; // raw mouse events with no message before the keys come from raw data
+constexpr double kHeldWait = 10.0;       // seconds a device's raw data waits for what was held at the open
+constexpr int kPolledButtons[5] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 };
 
 // Set on the drawing thread before the hooks go on and cleared after they are off, read by the hooks and the input
 // thread.
@@ -76,10 +99,22 @@ HANDLE g_inputThread = nullptr;
 HANDLE g_inputReady = nullptr;
 std::atomic<HWND> g_inputWindow { nullptr };
 
-// Raw input: what the game had registered for the mouse and the keyboard, ours in its place while capturing.
-bool g_registered = false;
-RAWINPUTDEVICE g_saved[2];
-unsigned g_savedCount = 0;
+// Raw input, per device: ours in the game's place while capturing, once the device has nothing held, and what the
+// game had registered, to put back. Under the menu's lock: taken and kept on the drawing thread, put back wherever the
+// menu closes (Esc and the menu key close it from the hooks and from our input thread too).
+struct RawDevice
+{
+    USHORT usage;
+    bool taken;  // ours is registered
+    bool given;  // not to be tried again before the next open: ours failed, or the game's could not be read
+    bool waited; // something was held when the menu opened (logged once)
+    bool saved;  // the game had a registration of its own: `game`
+    RAWINPUTDEVICE game;
+    BYTE held[8]; // the keys or buttons held at the open
+    unsigned heldCount;
+};
+RawDevice g_raw[2] = { { kUsageMouse }, { kUsageKeyboard } };
+double g_openedAt = 0.0;
 unsigned g_retaken = 0; // times the game registered over ours since the open
 
 // A message of our own, posted to the window at each open: whether the hook sees it says whether the game's thread
@@ -168,6 +203,74 @@ void TellModifiers(ImGuiIO& io)
     io.AddKeyEvent(ImGuiMod_Shift, AsyncDown(VK_SHIFT));
     io.AddKeyEvent(ImGuiMod_Alt, AsyncDown(VK_MENU));
     io.AddKeyEvent(ImGuiMod_Super, AsyncDown(VK_LWIN) || AsyncDown(VK_RWIN));
+}
+
+// The mouse as ImGui's own events, not the backend's messages (see the top). Under the menu's lock.
+void TellPointer(ImGuiIO& io, HWND window, POINT p) // in the window's client pixels
+{
+    const LPARAM at = ScaleMouse(window, MAKELPARAM(p.x, p.y));
+    io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+    io.AddMousePosEvent(float(GET_X_LPARAM(at)), float(GET_Y_LPARAM(at)));
+}
+
+void TellButton(ImGuiIO& io, int button, bool down)
+{
+    io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+    io.AddMouseButtonEvent(button, down);
+}
+
+// In notches, as the backend tells WM_MOUSEWHEEL (up is positive) and WM_MOUSEHWHEEL (right is negative).
+void TellWheel(ImGuiIO& io, float x, float y)
+{
+    io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+    io.AddMouseWheelEvent(x, y);
+}
+
+// A mouse message one of the game's threads took, for ImGui. Its position is in the window's client pixels, but for
+// WM_NCMOUSEMOVE's, which is on the screen as Windows gives it. Messages ImGui has no use for (WM_MOUSELEAVE, ...) say
+// nothing.
+void TellMouseMessage(ImGuiIO& io, HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    POINT p = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    switch (message)
+    {
+    case WM_NCMOUSEMOVE:
+        if (!ScreenToClient(window, &p))
+            return;
+        [[fallthrough]];
+    case WM_MOUSEMOVE:
+        StorePointer(p); // told again after the backend's NewFrame
+        TellPointer(io, window, p);
+        return;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_LBUTTONUP:
+        TellButton(io, 0, message != WM_LBUTTONUP);
+        return;
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONDBLCLK:
+    case WM_RBUTTONUP:
+        TellButton(io, 1, message != WM_RBUTTONUP);
+        return;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONDBLCLK:
+    case WM_MBUTTONUP:
+        TellButton(io, 2, message != WM_MBUTTONUP);
+        return;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONDBLCLK:
+    case WM_XBUTTONUP:
+        TellButton(io, GET_XBUTTON_WPARAM(wParam) == XBUTTON1 ? 3 : 4, message != WM_XBUTTONUP);
+        return;
+    case WM_MOUSEWHEEL:
+        TellWheel(io, 0.0f, float(GET_WHEEL_DELTA_WPARAM(wParam)) / float(WHEEL_DELTA));
+        return;
+    case WM_MOUSEHWHEEL:
+        TellWheel(io, -float(GET_WHEEL_DELTA_WPARAM(wParam)) / float(WHEEL_DELTA), 0.0f);
+        return;
+    default:
+        return;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -304,35 +407,34 @@ void OnRawMouse(HWND window, const RAWMOUSE& m)
         MenuUnlock(); // closed while we waited
         return;
     }
-    const LPARAM at = ScaleMouse(window, MAKELPARAM(pointer.x, pointer.y));
+    ImGuiIO& io = ImGui::GetIO();
     if (moved || first)
-        ImGui_ImplWin32_WndProcHandler(window, WM_MOUSEMOVE, 0, at);
+        TellPointer(io, window, pointer);
     if (m.usButtonFlags != 0)
-        TellModifiers(ImGui::GetIO()); // a Ctrl+click needs Ctrl as it is now, whoever saw the key
+        TellModifiers(io); // a Ctrl+click needs Ctrl as it is now, whoever saw the key
     struct Button
     {
         USHORT down, up;
-        UINT downMessage, upMessage;
-        WPARAM wParam;
+        int button;
     };
     static const Button kButtons[] = {
-        { RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, WM_LBUTTONDOWN, WM_LBUTTONUP, 0 },
-        { RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, WM_RBUTTONDOWN, WM_RBUTTONUP, 0 },
-        { RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, WM_MBUTTONDOWN, WM_MBUTTONUP, 0 },
-        { RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, WM_XBUTTONDOWN, WM_XBUTTONUP, MAKEWPARAM(0, XBUTTON1) },
-        { RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, WM_XBUTTONDOWN, WM_XBUTTONUP, MAKEWPARAM(0, XBUTTON2) },
+        { RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, 0 },
+        { RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, 1 },
+        { RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, 2 },
+        { RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, 3 },
+        { RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, 4 },
     };
     for (const Button& b : kButtons)
     {
         if ((m.usButtonFlags & b.down) != 0)
-            ImGui_ImplWin32_WndProcHandler(window, b.downMessage, b.wParam, at);
+            TellButton(io, b.button, true);
         if ((m.usButtonFlags & b.up) != 0)
-            ImGui_ImplWin32_WndProcHandler(window, b.upMessage, b.wParam, at);
+            TellButton(io, b.button, false);
     }
     if ((m.usButtonFlags & RI_MOUSE_WHEEL) != 0)
-        ImGui_ImplWin32_WndProcHandler(window, WM_MOUSEWHEEL, MAKEWPARAM(0, SHORT(m.usButtonData)), at);
+        TellWheel(io, 0.0f, float(SHORT(m.usButtonData)) / float(WHEEL_DELTA));
     if ((m.usButtonFlags & RI_MOUSE_HWHEEL) != 0)
-        ImGui_ImplWin32_WndProcHandler(window, WM_MOUSEHWHEEL, MAKEWPARAM(0, SHORT(m.usButtonData)), at);
+        TellWheel(io, -float(SHORT(m.usButtonData)) / float(WHEEL_DELTA), 0.0f);
     MenuUnlock();
 }
 
@@ -478,40 +580,113 @@ RAWINPUTDEVICE Ours(USHORT usage, HWND target)
     return device;
 }
 
-// The mouse's and the keyboard's raw data to our window, the game's registration kept to put back.
-void RegisterRaw()
+// This process's raw registration for `usage` now: 1 and `out`, 0 for none, -1 if it cannot be read.
+int Registration(USHORT usage, RAWINPUTDEVICE* out)
 {
-    if (g_registered)
-        return;
-    const HWND target = InputWindow();
-    if (target == nullptr)
-        return;
-    g_savedCount = 0;
-    UINT count = 0;
-    GetRegisteredRawInputDevices(nullptr, &count, sizeof(RAWINPUTDEVICE)); // -1 and the count, by design
-    if (count > 0 && count <= 64)
+    RAWINPUTDEVICE devices[64];
+    UINT count = 64;
+    const UINT got = GetRegisteredRawInputDevices(devices, &count, sizeof(RAWINPUTDEVICE));
+    if (got == UINT(-1))
+        return -1;
+    for (UINT i = 0; i < got; ++i)
+        if (devices[i].usUsagePage == kUsagePageGeneric && devices[i].usUsage == usage)
+        {
+            *out = devices[i];
+            return 1;
+        }
+    return 0;
+}
+
+// Keys whose state says nothing of a key the game saw go down: VK_PACKET (characters typed by SendInput), the IME's
+// own (Kana or Hangul, Kanji or Hanja, the process key), and the gamepad's, which some drivers keep reading as held.
+bool Ignored(int vk)
+{
+    return vk == VK_PACKET || vk == VK_PROCESSKEY || vk == VK_KANA || vk == VK_KANJI || (vk >= 0xC3 && vk <= 0xDA);
+}
+
+// What of the device is held at the open: the mouse's five buttons, or any other key. Read once (see the top).
+void ReadHeld(RawDevice& d)
+{
+    d.heldCount = 0;
+    for (int vk = 1; vk < 0xFF && d.heldCount < sizeof d.held; ++vk)
     {
-        RAWINPUTDEVICE devices[64];
-        const UINT got = GetRegisteredRawInputDevices(devices, &count, sizeof(RAWINPUTDEVICE));
-        for (UINT i = 0; got != UINT(-1) && i < got && g_savedCount < 2; ++i)
-            if (devices[i].usUsagePage == kUsagePageGeneric &&
-                (devices[i].usUsage == kUsageMouse || devices[i].usUsage == kUsageKeyboard))
-                g_saved[g_savedCount++] = devices[i];
+        const bool button =
+            vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+        if (button == (d.usage == kUsageMouse) && !Ignored(vk) && AsyncDown(vk))
+            d.held[d.heldCount++] = BYTE(vk);
     }
-    char had[160] = "no registration of its own";
-    if (g_savedCount != 0)
+}
+
+// The first key or button held at the open that is still held now, or 0.
+int StillHeld(const RawDevice& d)
+{
+    for (unsigned i = 0; i < d.heldCount; ++i)
+        if (AsyncDown(d.held[i]))
+            return d.held[i];
+    return 0;
+}
+
+// Ours in the game's place, the game's registration kept to put back, for each device that has nothing held, or has
+// waited long enough (see the top). On the drawing thread, at the open and at each frame after it until both are
+// ours.
+void TakeRaw()
+{
+    const HWND target = g_inputWindow.load(std::memory_order_acquire);
+    if (target == nullptr || ((g_raw[0].taken || g_raw[0].given) && (g_raw[1].taken || g_raw[1].given)))
+        return;
+    const double waited = LogClock() - g_openedAt;
+    char names[32] = "";
+    char had[192] = "";
+    int named = 0, at = 0;
+    bool letGo = false; // one of them waited for a release
+    for (RawDevice& d : g_raw)
     {
-        int at = 0;
-        for (unsigned i = 0; i < g_savedCount; ++i)
-            at += snprintf(had + at, sizeof had - size_t(at), "%s%s -> window %p, flags 0x%lX", i != 0 ? ", " : "",
-                           UsageName(g_saved[i].usUsage), g_saved[i].hwndTarget, g_saved[i].dwFlags);
+        if (d.taken || d.given)
+            continue;
+        const int held = StillHeld(d);
+        if (held != 0 && waited < kHeldWait)
+        {
+            if (!d.waited)
+                Log("menu: input: the raw %s data stays the game's until what was held at the open is let go "
+                    "(key 0x%02X)",
+                    UsageName(d.usage), held);
+            d.waited = true;
+            continue;
+        }
+        RAWINPUTDEVICE game = {};
+        const int found = Registration(d.usage, &game);
+        if (found < 0)
+        {
+            d.given = true; // nothing to put back by: the game's stays
+            Log("menu: input: the raw registrations could not be read (error %lu): the %s data stays the game's",
+                GetLastError(), UsageName(d.usage));
+            continue;
+        }
+        const RAWINPUTDEVICE ours = Ours(d.usage, target);
+        if (!RegisterRawInputDevices(&ours, 1, sizeof ours))
+        {
+            d.given = true;
+            Log("menu: input: RegisterRawInputDevices failed for the %s (error %lu)", UsageName(d.usage),
+                GetLastError());
+            continue;
+        }
+        d.taken = true;
+        d.saved = found > 0;
+        d.game = game;
+        letGo = letGo || (d.waited && held == 0);
+        named += snprintf(names + named, sizeof names - size_t(named), "%s%s", named != 0 ? " and " : "",
+                          UsageName(d.usage));
+        if (d.saved)
+            at += snprintf(had + at, sizeof had - size_t(at), "%s%s -> window %p, flags 0x%lX", at != 0 ? ", " : "",
+                           UsageName(d.usage), game.hwndTarget, game.dwFlags);
+        if (held != 0)
+            Log("menu: input: key 0x%02X is still held %.1f s after the open: the raw %s data is ours all the same, "
+                "and a game that reads it from the raw data keeps it pressed until it is pressed again",
+                held, waited, UsageName(d.usage));
     }
-    const RAWINPUTDEVICE ours[2] = { Ours(kUsageMouse, target), Ours(kUsageKeyboard, target) };
-    g_registered = RegisterRawInputDevices(ours, 2, sizeof(RAWINPUTDEVICE)) != FALSE;
-    if (g_registered)
-        Log("menu: input: raw mouse and keyboard registered to our window %p; the game had %s", target, had);
-    else
-        Log("menu: input: RegisterRawInputDevices failed (error %lu); the game had %s", GetLastError(), had);
+    if (named != 0)
+        Log("menu: input: raw %s registered to our window %p%s; the game had %s", names, target,
+            letGo ? " once let go" : "", at != 0 ? had : "no registration of its own");
 }
 
 // A game may register its raw input again while the menu is open (a game switching its mouse mode), which takes the
@@ -520,59 +695,80 @@ void RegisterRaw()
 void KeepRaw()
 {
     const HWND target = g_inputWindow.load(std::memory_order_acquire);
-    if (!g_registered || target == nullptr)
+    if ((!g_raw[0].taken && !g_raw[1].taken) || target == nullptr)
         return;
     RAWINPUTDEVICE devices[64];
     UINT count = 64;
     const UINT got = GetRegisteredRawInputDevices(devices, &count, sizeof(RAWINPUTDEVICE));
     if (got == UINT(-1))
         return;
-    for (const USHORT usage : { kUsageMouse, kUsageKeyboard })
+    for (RawDevice& d : g_raw)
     {
+        if (!d.taken)
+            continue;
         const RAWINPUTDEVICE* now = nullptr;
         for (UINT i = 0; i < got; ++i)
-            if (devices[i].usUsagePage == kUsagePageGeneric && devices[i].usUsage == usage)
+            if (devices[i].usUsagePage == kUsagePageGeneric && devices[i].usUsage == d.usage)
                 now = &devices[i];
         if (now != nullptr && now->hwndTarget == target)
             continue;
         // The game's newest, or none if it removed the registration.
-        unsigned keep = 0;
-        for (unsigned i = 0; i < g_savedCount; ++i)
-            if (g_saved[i].usUsage != usage)
-                g_saved[keep++] = g_saved[i];
-        g_savedCount = keep;
-        if (now != nullptr && g_savedCount < 2)
-            g_saved[g_savedCount++] = *now;
-        const RAWINPUTDEVICE ours = Ours(usage, target);
+        d.saved = now != nullptr;
+        if (now != nullptr)
+            d.game = *now;
+        const RAWINPUTDEVICE ours = Ours(d.usage, target);
         const bool back = RegisterRawInputDevices(&ours, 1, sizeof ours) != FALSE;
         if (g_retaken++ == 0)
             Log("menu: input: the game registered its raw %s input again while the menu was open (%s); ours is %s",
-                UsageName(usage), now != nullptr ? "to its window" : "removed", back ? "back" : "lost");
+                UsageName(d.usage), now != nullptr ? "to its window" : "removed", back ? "back" : "lost");
     }
 }
 
+// The game's registrations back, and read back: ours must not outlive the menu (see the top).
 void RestoreRaw()
 {
-    if (!g_registered)
-        return;
-    g_registered = false;
+    bool any = false;
     bool ok = true;
-    for (unsigned u = 0; u < 2; ++u)
+    for (RawDevice& d : g_raw)
     {
-        const USHORT usage = u == 0 ? kUsageMouse : kUsageKeyboard;
+        if (!d.taken)
+            continue;
+        any = true;
+        d.taken = false;
         RAWINPUTDEVICE back = {};
         back.usUsagePage = kUsagePageGeneric;
-        back.usUsage = usage;
+        back.usUsage = d.usage;
         back.dwFlags = RIDEV_REMOVE; // the game had none: ours goes
-        for (unsigned i = 0; i < g_savedCount; ++i)
-            if (g_saved[i].usUsage == usage)
-                back = g_saved[i];
+        if (d.saved)
+            back = d.game;
         if (!RegisterRawInputDevices(&back, 1, sizeof(RAWINPUTDEVICE)))
         {
             ok = false;
-            Log("menu: input: the game's %s registration could not be put back (error %lu)", UsageName(usage),
+            Log("menu: input: the game's %s registration could not be put back (error %lu)", UsageName(d.usage),
                 GetLastError());
         }
+    }
+    if (!any)
+        return;
+    const HWND ours = g_inputWindow.load(std::memory_order_acquire);
+    for (const RawDevice& d : g_raw)
+    {
+        RAWINPUTDEVICE now = {};
+        if (ours == nullptr || Registration(d.usage, &now) <= 0 || now.hwndTarget != ours)
+            continue;
+        RAWINPUTDEVICE remove = {};
+        remove.usUsagePage = kUsagePageGeneric;
+        remove.usUsage = d.usage;
+        remove.dwFlags = RIDEV_REMOVE;
+        ok = false;
+        if (RegisterRawInputDevices(&remove, 1, sizeof remove))
+            Log("menu: input: ours was still the raw %s registration after the close: removed, the game has none "
+                "until it registers again",
+                UsageName(d.usage));
+        else
+            Log("menu: input: ours is still the raw %s registration after the close and could not be removed "
+                "(error %lu)",
+                UsageName(d.usage), GetLastError());
     }
     if (ok)
         Log("menu: input: the game's raw input registration is back");
@@ -652,8 +848,12 @@ void OnMessage(MSG* msg, HWND window)
         MenuUnlock(); // closed while we waited: the game's
         return;
     }
-    const LPARAM scaled = mouse && message != WM_MOUSELEAVE ? ScaleMouse(window, lParam) : lParam;
-    const LRESULT handled = ImGui_ImplWin32_WndProcHandler(window, message, msg->wParam, scaled);
+    // The mouse as ImGui's events: the backend's handler would take and release the game's capture (see the top).
+    LRESULT handled = 0;
+    if (mouse)
+        TellMouseMessage(ImGui::GetIO(), window, message, msg->wParam, lParam);
+    else
+        handled = ImGui_ImplWin32_WndProcHandler(window, message, msg->wParam, lParam);
     const bool typing = ImGui::GetIO().WantTextInput; // a number is being typed: Esc and the menu key belong to the box
     MenuUnlock();
     if (handled != 0)
@@ -736,6 +936,13 @@ DWORD OurThread(HWND window)
     return process == GetCurrentProcessId() ? thread : 0;
 }
 
+// The key for ImGui's mouse button `i` as GetAsyncKeyState sees the buttons: as they are, not as Windows swaps them for
+// a left-handed mouse.
+int PolledButton(int i)
+{
+    return GetSystemMetrics(SM_SWAPBUTTON) != 0 && i < 2 ? kPolledButtons[1 - i] : kPolledButtons[i];
+}
+
 // The pointer starts where the cursor is, if that is in the window, else in the middle.
 void StartCapture(HWND window)
 {
@@ -749,8 +956,8 @@ void StartCapture(HWND window)
     g_probesSeen.store(0, std::memory_order_relaxed);
     g_retaken = 0;
     g_polledClicks = 0;
-    for (bool& down : g_polledDown)
-        down = false;
+    for (int i = 0; i < 5; ++i)
+        g_polledDown[i] = AsyncDown(PolledButton(i)); // a button already held is no click
     RECT client = { 0, 0, 0, 0 };
     GetClientRect(window, &client);
     POINT cursor = { 0, 0 };
@@ -769,7 +976,15 @@ void StartCapture(HWND window)
         g_described = true;
         DescribeWindows(window);
     }
-    RegisterRaw();
+    const HWND input = InputWindow(); // at the first open our thread and its window are made, which can take a while
+    g_openedAt = LogClock();
+    for (RawDevice& d : g_raw)
+    {
+        d.given = d.waited = false; // `taken` went at the last close
+        ReadHeld(d);
+    }
+    if (input != nullptr)
+        TakeRaw();
 }
 
 // When neither the raw data nor a window message has brought the mouse since the open, the cursor and the buttons are
@@ -784,15 +999,11 @@ void Poll(HWND window)
     if (GetCursorPos(&cursor) && ScreenToClient(window, &cursor))
     {
         StorePointer(cursor);
-        const LPARAM at = ScaleMouse(window, MAKELPARAM(cursor.x, cursor.y));
-        io.AddMousePosEvent(float(GET_X_LPARAM(at)), float(GET_Y_LPARAM(at)));
+        TellPointer(io, window, cursor);
     }
-    // GetAsyncKeyState sees the buttons as they are, not as Windows swaps them for a left-handed mouse.
-    const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
-    static const int kButtons[5] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 };
     for (int i = 0; i < 5; ++i)
     {
-        const bool down = AsyncDown(swapped && i < 2 ? kButtons[1 - i] : kButtons[i]);
+        const bool down = AsyncDown(PolledButton(i));
         if (down == g_polledDown[i])
             continue;
         g_polledDown[i] = down;
@@ -815,6 +1026,21 @@ void FollowFocus()
         ImGui::GetIO().AddFocusEvent(front != 0);
     }
 }
+
+// At the open nothing ImGui was told before it is kept. A button or key the menu saw go down before the last close
+// came up after it, for the game (a slider dragged as End closed the menu stayed grabbed, and followed the pointer at
+// the next open until a click), and events still queued at the close would come in at the next open.
+void ForgetInput()
+{
+    if (ImGui::GetCurrentContext() == nullptr)
+        return;
+    ImGuiIO& io = ImGui::GetIO();
+    io.ClearEventsQueue();
+    io.ClearInputMouse();
+    io.ClearInputKeys();
+    g_front = -1; // the focus is told again: the queue it was told in is gone
+    FollowFocus();
+}
 } // namespace
 
 void MenuInputAttach(HWND window)
@@ -829,11 +1055,13 @@ void MenuInputAttach(HWND window)
     FollowFocus();
     if (g_capture.load(std::memory_order_acquire))
     {
+        TakeRaw();
         KeepRaw();
         Poll(window);
         return;
     }
     StartCapture(window);
+    ForgetInput();
     g_capture.store(true, std::memory_order_release); // before the hooks: their first message is already the menu's
     // The window's thread, its root owner's and the one in front, where they are this process's: the window the
     // game takes its input on need not be the one it presents to.
@@ -859,6 +1087,25 @@ void MenuInputAttach(HWND window)
     if (g_probeMessage != 0)
         PostMessageW(window, g_probeMessage, 0, 0);
     Poll(window);
+}
+
+void MenuInputNewFrame(void (*backendNewFrame)())
+{
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    const HWND window = g_window.load(std::memory_order_acquire);
+    if (context == nullptr || window == nullptr || !g_capture.load(std::memory_order_acquire))
+    {
+        backendNewFrame();
+        return;
+    }
+    // Nothing else can queue an event meanwhile: the hooks and the input thread take the menu's lock first.
+    ImVector<ImGuiInputEvent>& queue = context->InputEventsQueue;
+    const int before = queue.Size;
+    backendNewFrame();
+    for (int i = queue.Size - 1; i >= before; --i)
+        if (queue[i].Type == ImGuiInputEventType_MousePos)
+            queue.erase(queue.Data + i);
+    TellPointer(ImGui::GetIO(), window, LoadPointer()); // nothing queued when it is where ImGui has it already
 }
 
 void MenuInputRelease()
@@ -904,5 +1151,5 @@ void MenuInputCounts(MenuInputStats* out)
     out->retaken = g_retaken;
     out->hooks = g_hookCount;
     out->inputWindow = g_inputWindow.load(std::memory_order_acquire);
-    out->registered = g_registered;
+    out->registered = g_raw[0].taken || g_raw[1].taken;
 }
