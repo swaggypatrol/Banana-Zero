@@ -15,8 +15,9 @@
 // written at both ends show the copy has landed (no fence, no wait). While the menu shows the preview, the
 // preview picture is rendered after 6 and the statistics run whenever the last copy has landed.
 //
-// While the menu is open, timestamps around the pass and around the model are resolved into a readback ring the
-// same way, for its GPU time; a slot is read when it comes round again, kRing frames later.
+// At every frame, timestamps around the pass and around the model are resolved into a readback ring the same way,
+// for its GPU time (the menu shows it, the log's periodic lines carry it); a slot is read when it comes round again,
+// kRing frames later.
 //
 // Nothing else reads back, waits or allocates per frame; the descriptors come from a ring, the constants are root
 // constants. One lock guards the whole state and is only ever tried, never waited for, on the evaluate path: a
@@ -73,8 +74,7 @@ constexpr unsigned kPreviewWidth = 768;       // the preview picture's width to 
 constexpr double kPreviewHold = 0.5;          // seconds the preview is kept after the menu last asked for it
 constexpr unsigned kTimestamps = 4;           // per frame: the pass begins, the model begins, the model ends, the
                                               // pass ends
-constexpr unsigned kTimingSamples = 16;       // the menu is shown the median of the last this many frames
-constexpr double kTimingHold = 0.5;           // seconds the pass is timed after the menu last asked
+constexpr unsigned kTimingSamples = 16;       // the menu and the log get the median of the last this many
 constexpr uint64_t kModelSizeSettle = 60;     // frames a new model size holds before it is logged (ModelScale)
 static_assert(kNrPreviewBins == NR_HIST_BINS && kNrPreviewEvMin == NR_HIST_EV_MIN &&
                   kNrPreviewBinsPerEv == NR_HIST_PER_EV,
@@ -118,7 +118,7 @@ template <typename Function> Function Proc(HMODULE module, const char* name)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Why a frame was not run. Each reason is counted, and logged the first time it happens.
+// Why a frame was not run. Each reason is counted, and logged the first 20 times, then at every power of two (Logged).
 
 enum Skip
 {
@@ -154,6 +154,25 @@ const char* const kSkipText[kSkipCount] = {
     "a rebuild is due but the last creation was fewer than 30 evaluations ago",
     "the GPU cannot load the Output's format through a UAV (typed UAV load), which the in-place composite needs",
     "what the game has bound on this command list is not known yet, so it could not be bound again afterwards",
+};
+
+// The same, short, for the counts in the log's evaluation lines: a reason logged once may still come every few
+// seconds, and a skipped frame is one without NR, which shows.
+const char* const kSkipShort[kSkipCount] = {
+    "",
+    "off",
+    "disabled",
+    "no parameters",
+    "no Output",
+    "no Depth",
+    "no motion vectors",
+    "geometry",
+    "another handle",
+    "busy",
+    "feature created",
+    "waiting",
+    "typed load",
+    "list state unknown",
 };
 
 const char* ResultName(int result)
@@ -559,6 +578,10 @@ struct Nr
     std::atomic<uint64_t> failed { 0 };
     std::atomic<uint64_t> skipped[kSkipCount] = {};
     std::atomic<bool> said[kSkipCount] = {};
+    std::atomic<uint64_t> resetsAsked[5] = {}; // the model's history reset asked for, per ResetWhy (NoteReset)
+    std::atomic<uint64_t> gameResets { 0 };    // the game's Reset flag on a frame NR ran (NoteGameReset)
+    std::atomic<uint64_t> resetsApplied { 0 }; // frames the model was given Reset, for whichever reasons
+    std::atomic<const char*> lastSkipDetail { nullptr }; // the last list-state reason logged (CountSkip)
     std::atomic<bool> coreGone { false };
 
     // Set by the background thread, taken by the render thread.
@@ -568,11 +591,9 @@ struct Nr
 
     // Set by the menu (NrPreview): LogClock() of its last call.
     std::atomic<double> previewAskedAt { -1.0e9 };
-    // Set by the menu (NrStatus): LogClock() of its last call. The pass is timed on the GPU while it keeps asking.
-    std::atomic<double> timingAskedAt { -1.0e9 };
-
     // The rest is under g_lock.
     bool settingsLoaded = false;
+    bool wasDisabled = false; // Enabled=0 or A/B left the model's history stale: reset when NR is back
     bool ready = false;
     wchar_t directory[MAX_PATH] = {}; // where dxgi.dll is, with the trailing backslash
     wchar_t dataPath[MAX_PATH] = {};  // what the model's Init_Ext accepted
@@ -702,12 +723,71 @@ void Off(const char* reason)
     Log("NR off for the rest of this process: %s", reason);
 }
 
-void CountSkip(Skip skip, const NrSource& source)
+// Whether the nth event of a kind is logged: the first twenty one by one, then the 32nd, 64th, 128th ..., so that one
+// that comes every frame adds a line now and then, not one a frame.
+bool Logged(uint64_t n) { return n <= 20 || (n & (n - 1)) == 0; }
+
+// Each skip is a frame without NR, which shows: where NR darkens bright surfaces, the game's own picture flashes
+// brighter between NR's (GTA V, every few seconds, when each command list's first pass was skipped). So each is
+// logged (Logged), with what is known of the list when its state was the reason; the reporter's lines count them by
+// reason. `detail` is a string that outlives the call.
+void CountSkip(Skip skip, const NrSource& source, ID3D12GraphicsCommandList* list = nullptr,
+               const char* detail = nullptr)
 {
-    g_nr.skipped[skip].fetch_add(1, std::memory_order_relaxed);
-    if (!g_nr.said[skip].load(std::memory_order_relaxed) && !g_nr.said[skip].exchange(true))
-        Log("NR skipped for %s #%u: %s (logged once per reason)", source.feature == 13 ? "RR 13" : "SR 1", source.id,
-            kSkipText[skip]);
+    const uint64_t n = g_nr.skipped[skip].fetch_add(1, std::memory_order_relaxed) + 1;
+    g_nr.said[skip].store(true, std::memory_order_relaxed);
+    // A list-state reason other than the last one logged is logged at once, however many came before it.
+    const bool newDetail =
+        detail != nullptr && g_nr.lastSkipDetail.exchange(detail, std::memory_order_relaxed) != detail;
+    if (!Logged(n) && !newDetail)
+        return;
+    char where[400] = "";
+    if (detail != nullptr)
+        snprintf(where, sizeof where, "list %p: %s; ", static_cast<void*>(list), detail);
+    Log("NR skipped for %s #%u: %s (%s%llu for this reason so far)", source.feature == 13 ? "RR 13" : "SR 1", source.id,
+        kSkipText[skip], where, static_cast<unsigned long long>(n));
+}
+
+// Why the model's history is thrown away at its next frame: what it shows then starts afresh, which can show too.
+enum ResetWhy : unsigned
+{
+    kResetHandle,
+    kResetFeature,
+    kResetModelSize,
+    kResetEncode,
+    kResetBackOn,
+    kResetCount
+};
+
+const char* const kResetText[kResetCount] = {
+    "a new DLSS handle to follow",
+    "a new feature of the model",
+    "the model's input size changed (ModelScale)",
+    "what the model is given changed: input type, white point, WhiteEV, Shoulder or the card",
+    "NR is back after Enabled=0 or A/B",
+};
+static_assert(kResetCount == 5, "Nr::resetsAsked holds one counter per ResetWhy");
+
+// Each reason is counted and logged apart (Logged), so that a slider dragged through a hundred steps does not hide a
+// reset of another kind; the frames that were actually reset are counted where Run gives the model its Reset. Under
+// the lock.
+void NoteReset(ResetWhy why)
+{
+    g_nr.resetNext = true;
+    const uint64_t n = g_nr.resetsAsked[why].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (Logged(n))
+        Log("NR: the model's history is reset at its next frame: %s (%llu times for this reason so far)",
+            kResetText[why], static_cast<unsigned long long>(n));
+}
+
+// The game's own Reset flag on its DLSS evaluation (a camera cut, a teleport, a loading screen), passed on to the
+// model. Under the lock.
+void NoteGameReset(uint64_t frame)
+{
+    const uint64_t n = g_nr.gameResets.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (Logged(n))
+        Log("NR: the game reset DLSS's history at frame %llu (%llu so far)", static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(n));
 }
 
 // The model's own log lines, through the logging callback of the FeatureCommonInfo we hand its Init_Ext. Capped:
@@ -1423,7 +1503,7 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Frame& f, const ModelS
     g_nr.createdWidth = f.width;
     g_nr.createdHeight = f.height;
     g_nr.createdAt = g_nr.evaluatesSeen;
-    g_nr.resetNext = true;
+    NoteReset(kResetFeature);
     return true;
 }
 
@@ -1715,7 +1795,7 @@ void NoteModelSize(const Frame& f, unsigned width, unsigned height, uint64_t fra
     if (width != g_nr.modelWidth || height != g_nr.modelHeight)
     {
         if (g_nr.modelWidth != 0)
-            g_nr.resetNext = true;
+            NoteReset(kResetModelSize);
         g_nr.modelWidth = width;
         g_nr.modelHeight = height;
         g_nr.modelSizeFrame = frameIndex;
@@ -1739,9 +1819,8 @@ void NoteModelSize(const Frame& f, unsigned width, unsigned height, uint64_t fra
 // ---------------------------------------------------------------------------------------------------------------
 // The pass's GPU time for the menu (NrStatus): timestamps where the pass begins, around the model and where the
 // pass ends, resolved into a readback slot that is looked at when the ring comes round to it again, kRing frames
-// later, long after the GPU has run the frame. Only while the menu keeps asking.
-
-bool TimingWanted() { return LogClock() - g_nr.timingAskedAt.load(std::memory_order_relaxed) < kTimingHold; }
+// later, long after the GPU has run the frame. Every frame, for the log's periodic lines too: four timestamps and a
+// small copy a frame (it used to be only while the menu asked).
 
 // The query heap and the readback ring, and the ticks' frequency: the queue's, so a queue of the list's own type,
 // made only to ask. Once; should any of it fail, there is no GPU time to show.
@@ -1768,7 +1847,9 @@ bool EnsureTiming(ID3D12GraphicsCommandList* list)
     }
     if (frequency == 0)
     {
-        Log("NR: no timestamp frequency for the game's command list (type %d); the menu shows no GPU time", int(type));
+        Log("NR: no timestamp frequency for the game's command list (type %d); neither the menu nor the log shows GPU "
+            "time",
+            int(type));
         return false;
     }
     D3D12_QUERY_HEAP_DESC heap = {};
@@ -1778,7 +1859,8 @@ bool EnsureTiming(ID3D12GraphicsCommandList* list)
     if (FAILED(hr))
     {
         g_nr.queries = nullptr;
-        Log("NR: CreateQueryHeap failed 0x%08lX; the menu shows no GPU time", static_cast<unsigned long>(hr));
+        Log("NR: CreateQueryHeap failed 0x%08lX; neither the menu nor the log shows GPU time",
+            static_cast<unsigned long>(hr));
         return false;
     }
     if (!MakeBuffer(&g_nr.timingReadback, D3D12_HEAP_TYPE_READBACK, uint64_t(kRing) * kTimestamps * 8,
@@ -1830,7 +1912,7 @@ void CollectTiming(unsigned slot)
     g_nr.modelMs = Median(g_nr.modelSamples, g_nr.samples);
 }
 
-// The menu stopped asking: what was measured goes, so that it starts afresh next time.
+// The timing could not be set up for a frame: what was measured goes, so that it starts afresh.
 void StopTiming()
 {
     if (g_nr.samples == 0 && g_nr.nextSample == 0)
@@ -2204,10 +2286,9 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const unsigned fitTable = base + 7 * kTable;
     const DXGI_FORMAT outputView = ViewFormat(f.outputDesc.Format);
 
-    // The GPU time while the menu asks: this frame's timestamps go where the frame kRing back left its own, which are
-    // looked at first.
+    // The GPU time: this frame's timestamps go where the frame kRing back left its own, which are looked at first.
     const unsigned timingSlot = unsigned(frameIndex % kRing);
-    const bool timing = TimingWanted() && EnsureTiming(list);
+    const bool timing = EnsureTiming(list);
     if (timing)
     {
         CollectTiming(timingSlot);
@@ -2249,7 +2330,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     // What the model sees changes all at once when the encode's settings do.
     const EncodeKey key = { s.inputType, source, s.whiteEV, s.shoulder, s.card, s.cardCorner };
     if (g_nr.haveEncodeKey && !(key == g_nr.encodeKey))
-        g_nr.resetNext = true;
+        NoteReset(kResetEncode);
     g_nr.encodeKey = key;
     g_nr.haveEncodeKey = true;
 
@@ -2438,8 +2519,12 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     }
 
     // 4: the model.
+    if (f.reset != 0)
+        NoteGameReset(frameIndex);
     const unsigned reset = g_nr.resetNext || f.reset != 0 ? 1u : 0u;
     g_nr.resetNext = false;
+    if (reset != 0)
+        g_nr.resetsApplied.fetch_add(1, std::memory_order_relaxed);
     FillEvaluate(g_nr.evalParams, f, modelWidth, modelHeight, depth, depthBaseX, depthBaseY, motion, motionBaseX,
                  motionBaseY, reset);
     FillMask(g_nr.evalParams, sky ? &g_nr.mask : nullptr);
@@ -2969,7 +3054,7 @@ void PublishStatus()
 // `game` is filled with what the game has bound on `list` before anything is recorded into it, and `*captured` set;
 // the caller binds it again afterwards.
 Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, const NrSource& source, ListState* game,
-              bool* captured)
+              bool* captured, const char** detail)
 {
     if (g_nr.off.load(std::memory_order_relaxed))
         return kSkipOff; // turned off between the caller's check and its lock (the game shutting the core down)
@@ -3005,7 +3090,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     }
     NoteFrame(frame, source.feature);
     // Everything below may record into the game's list and bind state of its own (ours, the model's).
-    if (!ListStateCapture(list, game))
+    if (!ListStateCapture(list, game, detail))
         return kSkipState;
     *captured = true;
     // The frozen frame (M3, freeze.h) goes first, NR on or off: with NR off the frozen picture still replaces the
@@ -3013,8 +3098,13 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     FreezeApply(list, &frame);
     if (!s->enabled)
     {
-        g_nr.resetNext = true; // the model's history is stale by the time NR is back
+        g_nr.wasDisabled = true; // the model's history is stale by the time NR is back
         return kSkipDisabled;
+    }
+    if (g_nr.wasDisabled)
+    {
+        g_nr.wasDisabled = false;
+        NoteReset(kResetBackOn);
     }
 
     g_nr.attempted.store(true, std::memory_order_relaxed);
@@ -3039,7 +3129,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     {
         g_nr.sourceId.store(source.id, std::memory_order_relaxed);
         g_nr.bound.store(true, std::memory_order_relaxed);
-        g_nr.resetNext = true;
+        NoteReset(kResetHandle);
     }
 
     ReleaseParked();
@@ -3083,14 +3173,15 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
     }
     static ListState game; // under g_lock
     bool captured = false;
-    const Skip skip = Evaluate(list, params, source, &game, &captured);
+    const char* detail = nullptr; // why the list's state is not known, when that is the reason
+    const Skip skip = Evaluate(list, params, source, &game, &captured, &detail);
     if (captured)
         ListStateRestore(list, game);
     if (g_nr.attempted.load(std::memory_order_relaxed))
         PublishStatus();
     ReleaseSRWLockExclusive(&g_lock);
     if (skip != kSkipNone)
-        CountSkip(skip, source);
+        CountSkip(skip, source, list, skip == kSkipState ? detail : nullptr);
 }
 
 void NrSourceReleased(unsigned id)
@@ -3214,7 +3305,9 @@ void NrCoreGone()
 
 size_t NrDescribe(char* out, size_t size)
 {
-    if (!g_nr.attempted.load(std::memory_order_relaxed))
+    // Not attempted, but frames whose textures were all there skipped for the list's state: those are counted too.
+    if (!g_nr.attempted.load(std::memory_order_relaxed) &&
+        g_nr.skipped[kSkipState].load(std::memory_order_relaxed) == 0)
     {
         const uint64_t disabled = g_nr.skipped[kSkipDisabled].load(std::memory_order_relaxed);
         if (disabled == 0)
@@ -3224,20 +3317,92 @@ size_t NrDescribe(char* out, size_t size)
         return written > 0 ? (size_t(written) < size ? size_t(written) : size - 1) : 0;
     }
     uint64_t skipped = 0;
+    char reasons[320] = "";
+    int at = 0;
     for (unsigned i = 1; i < kSkipCount; ++i)
-        skipped += g_nr.skipped[i].load(std::memory_order_relaxed);
+    {
+        const uint64_t count = g_nr.skipped[i].load(std::memory_order_relaxed);
+        skipped += count;
+        if (count != 0 && at >= 0 && size_t(at) < sizeof reasons)
+            at += snprintf(reasons + at, sizeof reasons - size_t(at), "%s%llu %s", at != 0 ? ", " : " (",
+                           static_cast<unsigned long long>(count), kSkipShort[i]);
+    }
     const char* reason = g_nr.offReason.load(std::memory_order_relaxed);
-    const int written = snprintf(out, size, "NR %llu frames, %llu skipped, %llu failed%s%s",
+    const int written = snprintf(out, size, "NR %llu frames, %llu skipped%s%s, %llu failed%s%s",
                                  static_cast<unsigned long long>(g_nr.frames.load(std::memory_order_relaxed)),
-                                 static_cast<unsigned long long>(skipped),
+                                 static_cast<unsigned long long>(skipped), reasons, at != 0 ? ")" : "",
                                  static_cast<unsigned long long>(g_nr.failed.load(std::memory_order_relaxed)),
                                  reason != nullptr ? "; off: " : "", reason != nullptr ? reason : "");
     return written > 0 ? (size_t(written) < size ? size_t(written) : size - 1) : 0;
 }
 
+size_t NrDescribeInterval(char* out, size_t size)
+{
+    if (size == 0 || (!g_nr.attempted.load(std::memory_order_relaxed) &&
+                      g_nr.skipped[kSkipState].load(std::memory_order_relaxed) == 0))
+        return 0;
+    // Only the reporter thread calls this: what it counted at its last call.
+    static uint64_t lastFrames = 0;
+    static uint64_t lastSkipped[kSkipCount] = {};
+    static uint64_t lastApplied = 0;
+    static uint64_t lastGameResets = 0;
+    static uint64_t lastListResets = 0;
+    static uint64_t lastMade = 0;
+    size_t length = 0;
+    auto add = [&](const char* format, auto... args) {
+        if (length + 1 < size)
+        {
+            const int written = snprintf(out + length, size - length, format, args...);
+            if (written > 0)
+                length += size_t(written) < size - length ? size_t(written) : size - length - 1;
+        }
+    };
+    const uint64_t frames = g_nr.frames.load(std::memory_order_relaxed);
+    uint64_t skipped = 0;
+    uint64_t now[kSkipCount] = {};
+    for (unsigned i = 1; i < kSkipCount; ++i)
+    {
+        now[i] = g_nr.skipped[i].load(std::memory_order_relaxed);
+        skipped += now[i] - lastSkipped[i];
+    }
+    add("NR in that time: %llu frames, %llu skipped", static_cast<unsigned long long>(frames - lastFrames),
+        static_cast<unsigned long long>(skipped));
+    bool first = true;
+    for (unsigned i = 1; i < kSkipCount; ++i)
+    {
+        if (now[i] == lastSkipped[i])
+            continue;
+        add("%s%llu %s", first ? " (" : ", ", static_cast<unsigned long long>(now[i] - lastSkipped[i]), kSkipShort[i]);
+        first = false;
+        lastSkipped[i] = now[i];
+    }
+    if (!first)
+        add(")");
+    const uint64_t applied = g_nr.resetsApplied.load(std::memory_order_relaxed);
+    const uint64_t gameResets = g_nr.gameResets.load(std::memory_order_relaxed);
+    add(", the model's history reset %llu times (%llu at the game's request)",
+        static_cast<unsigned long long>(applied - lastApplied),
+        static_cast<unsigned long long>(gameResets - lastGameResets));
+    NrStatusState status;
+    NrStatus(&status);
+    if (status.haveTiming && frames != lastFrames)
+        add(", the pass %.2f ms on the GPU, the median of its last 16 (the model %.2f ms)", double(status.gpuMs),
+            double(status.modelMs));
+    ListStateCounts lists = {};
+    ListStateCount(&lists);
+    add(", %u command lists followed, %llu Resets through us, %llu lists made", lists.lists,
+        static_cast<unsigned long long>(lists.resets - lastListResets),
+        static_cast<unsigned long long>(lists.made - lastMade));
+    lastFrames = frames;
+    lastApplied = applied;
+    lastMade = lists.made;
+    lastGameResets = gameResets;
+    lastListResets = lists.resets;
+    return length;
+}
+
 bool NrStatus(NrStatusState* out)
 {
-    g_nr.timingAskedAt.store(LogClock(), std::memory_order_relaxed);
     AcquireSRWLockShared(&g_statusLock);
     *out = g_status;
     ReleaseSRWLockShared(&g_statusLock);

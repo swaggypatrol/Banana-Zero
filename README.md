@@ -194,7 +194,8 @@ renders and upscales exactly as before, and only the model's own copy of the fra
 | **Model input size** | 33.3% to 100%, default 100% | The model looks at a copy of the frame this big on each side. What it changes is carried back to the full frame along the full frame's own edges, so outlines stay sharp; what thins out is the finest of the model's own detail. 100% is the model on the whole frame, as before. The slider has notches at 33.3%, 50%, 66.7% and 80%: it clicks into one and stays there for a little more mouse travel, so they are easy to hit. Between them it moves in 1% steps. A notch holds on to the grab, so the step just past it is reached by coming back from the other side. Applies while you drag; each new size restarts the model's memory of earlier frames, so the picture looks a touch rougher for a frame or two |
 
 Under the slider: the size the model actually gets, and **NR on the GPU**, the whole pass and the model's share of it in
-milliseconds, measured on the GPU while the menu is open (the median of the last 16 frames).
+milliseconds, measured on the GPU at every frame (the median of the last 16 frames; the log's 10-second lines carry it
+too).
 
 `nrprobe` timed the model alone on an RTX 5090 at 4K: 7.1 ms at 100%, 4.4 at 75%, 3.8 at 66.7%, 2.9 at 50%, and 2.4 for
 a 1280x720 picture, which is 33.3%. The slider stops at a third because about 1.7 ms of the model's time does not
@@ -265,7 +266,7 @@ writes it for you; this is for people who like to open the back panel.
 | `SkyStructure` | 0 to 2 | 1 | Sky local structure |
 | `ShowSky` | 1 / 0 | 0 | Show what counts as sky; the menu never saves it |
 | `ModelScale` | 33.3 to 100, read as the nearest of the slider's steps | 100 | Model input size |
-| `StatsLog` | seconds, 0 = off | 0 | file only; a statistics line in the log every N seconds (`tools/bzstats.py` reads them) |
+| `StatsLog` | seconds, 0 = off | 10 | file only; a statistics line in the log every N seconds (`tools/bzstats.py` reads them); on by default while Banana-Zero is being developed |
 | `DumpEvery` | seconds, 0 = off | 0 | file only; a frame dump to `%LOCALAPPDATA%\Banana-Zero\dumps` every N seconds, at most 16 (`tools/bzdump.py` turns them into pictures) |
 
 The file accepts wider ranges than the menu's sliders. Freeze, the calibration card, the sky's stripes and A/B are
