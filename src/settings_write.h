@@ -14,9 +14,11 @@ struct Settings;
 // out of memory.
 char* SettingsMergeIni(const char* text, const Settings& settings, size_t* length);
 
-// Reads the file at `path`, merges, writes it back in one go (a temporary file beside it, then a replace, so a crash
-// mid-write leaves the old file whole). False with the Win32 error in *error when it could not.
-bool SettingsWriteIni(const wchar_t* path, const Settings& settings, unsigned long* error);
+// Reads the file at `from` (nullptr: `path` itself), merges, writes the result to `path` in one go (a temporary file
+// beside it, then a replace, so a crash mid-write leaves the old file whole). False with the Win32 error in *error
+// when it could not, and in *step where it stopped ("at the read", "at the write", "at the replace") for the log.
+bool SettingsWriteIni(const wchar_t* path, const Settings& settings, unsigned long* error,
+                      const wchar_t* from = nullptr, const char** step = nullptr);
 
 // "Intensity (model default) -> 0.8, WhiteEV 0 -> 1" for the log: every key the menu owns whose value differs
 // between the two, in the file's spelling. Returns the length written; 0 when nothing differs.

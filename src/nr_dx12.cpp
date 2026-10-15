@@ -849,7 +849,7 @@ bool FileExists(const wchar_t* path)
 // Where dlssnr.ini is: beside the game's exe, else beside this DLL. The two are one folder unless a loader runs the
 // DLLs from elsewhere: REFramework runs every DLL of the game's folder from copies in a _storage_ folder, where an
 // ini put in the game's folder was not seen. With the file in neither, beside the exe, where the menu then writes it.
-bool IniPath(wchar_t* out, size_t size)
+bool IniBeside(wchar_t* out, size_t size)
 {
     wchar_t directory[MAX_PATH];
     wchar_t beside[MAX_PATH];
@@ -867,6 +867,19 @@ bool IniPath(wchar_t* out, size_t size)
         (!haveExe || FileExists(beside)))
         return wcscpy_s(out, size, beside) == 0;
     return haveExe;
+}
+
+// The file to read: the one above, or the menu's own copy when the menu could not write that one and wrote the copy
+// after it (settings.h, SettingsUserPath).
+bool IniPath(wchar_t* out, size_t size)
+{
+    const bool beside = IniBeside(out, size);
+    wchar_t copy[MAX_PATH];
+    if (!SettingsUserPath(copy, MAX_PATH, false) || !SettingsPreferCopy(beside ? out : nullptr, copy))
+        return beside;
+    if (beside)
+        Log("the menu's copy %ls was written after %ls, so it is the one read", copy, out);
+    return wcscpy_s(out, size, copy) == 0;
 }
 
 // %LOCALAPPDATA%\Banana-Zero\<name>, created if need be. False if it cannot be made.

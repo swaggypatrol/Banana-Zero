@@ -8,7 +8,9 @@
 //   - keys.cpp: names and codes both ways, the hex fallback, unknown names
 //   - settings_write.cpp: a file with comments, unknown keys and StatsLog keeps every line it should; a model
 //     parameter set back to the model's default loses its line; a new file gets its header; what was written reads
-//     back the same; the sky's stripes are never written
+//     back the same; the sky's stripes are never written; a file someone else holds open is replaced when they let
+//     it be deleted, and left whole with error 32 when they do not; a read-only file gives error 5 at the replace;
+//     a file written from another keeps the other's lines
 //   - settings.cpp: ModelScale's steps (a third, whole percent, two thirds), and the file's value read as the nearest
 //   - menu_model.cpp: the draft, A/B, when the file is due, a reload behind the menu
 //   - the panel: a slider dragged with the mouse publishes every step at once and logs the drag once, when the mouse
@@ -33,6 +35,9 @@
 //     system cursor's position and a key event, a wheel notch in every frame is taken in its frame and every frame
 //     ends at our pointer; at the close the game's registrations are back as they were, a button ImGui had down is up
 //     at the next open, and where the game's registration cannot be put back (its window gone) ours is removed
+//   - the menu's own copy (settings.cpp, menu.cpp), with %LOCALAPPDATA% pointed at the test's directory: its path;
+//     a file the menu cannot write is left as it was and the copy gets its lines and the menu's change; the next
+//     write goes straight to the copy; the newer of the two is the one to read
 
 #include <windows.h>
 
@@ -125,19 +130,23 @@ bool WriteAll(const wchar_t* path, const char* text)
     return true;
 }
 
-// Waits for the writer thread: the file holds `needle` within `seconds`.
-bool FileHas(const char* needle, double seconds)
+// Waits for the writer thread: the file at `path` holds `needle` within `seconds`.
+bool FileHasAt(const wchar_t* path, const char* needle, double seconds)
 {
     const double until = LogClock() + seconds;
     do
     {
         char text[8192];
-        if (ReadAll(g_ini, text, sizeof text) && strstr(text, needle) != nullptr)
+        if (ReadAll(path, text, sizeof text) && strstr(text, needle) != nullptr)
             return true;
         Sleep(20);
     } while (LogClock() < until);
     return false;
 }
+
+bool FileHas(const char* needle, double seconds) { return FileHasAt(g_ini, needle, seconds); }
+
+bool Exists(const wchar_t* path) { return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
 
 bool Near(float a, float b, float tolerance) { return std::fabs(a - b) <= tolerance; }
 
@@ -291,6 +300,43 @@ void TestWrite()
           double(loaded->modelScale));
     Check(!loaded->showSky && !FileHas("ShowSky", 0.0), "write: the sky's stripes are never written");
     Check(loaded->enabled && Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog still 2, Enabled back to 1");
+
+    // The replace with the file held by someone else, as an editor, a virus scanner or our own reload thread does.
+    wchar_t temporary[MAX_PATH];
+    swprintf_s(temporary, MAX_PATH, L"%s.new", g_ini);
+    const char* step = nullptr;
+    HANDLE held = CreateFileW(g_ini, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    full.shoulder = 0.75f;
+    bool ok = SettingsWriteIni(g_ini, full, &error);
+    CloseHandle(held);
+    Check(held != INVALID_HANDLE_VALUE && ok && FileHas("Shoulder = 0.75", 0.0),
+          "write: a file held open by someone who lets it be deleted is replaced all the same (error %lu)", error);
+    held = CreateFileW(g_ini, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    full.shoulder = 0.6f;
+    ok = SettingsWriteIni(g_ini, full, &error, nullptr, &step);
+    CloseHandle(held);
+    Check(held != INVALID_HANDLE_VALUE && !ok && error == ERROR_SHARING_VIOLATION &&
+              strcmp(step, "at the replace") == 0,
+          "write: a file held open by someone who does not: error 32 at the replace (error %lu %s)", error, step);
+    Check(FileHas("Shoulder = 0.75", 0.0) && !Exists(temporary), "write: the file as it was, no dlssnr.ini.new left");
+    SetFileAttributesW(g_ini, FILE_ATTRIBUTE_READONLY);
+    ok = SettingsWriteIni(g_ini, full, &error, nullptr, &step);
+    SetFileAttributesW(g_ini, FILE_ATTRIBUTE_NORMAL);
+    Check(!ok && error == ERROR_ACCESS_DENIED && strcmp(step, "at the replace") == 0 && FileHas("Shoulder = 0.75", 0.0),
+          "write: a read-only file: error 5 at the replace, the file as it was (error %lu %s)", error, step);
+
+    // Written to another file from this one: this one's lines come along, this one is not touched.
+    wchar_t other[MAX_PATH];
+    swprintf_s(other, MAX_PATH, L"%sother.ini", g_directory);
+    DeleteFileW(other);
+    full.shoulder = 0.55f;
+    ok = SettingsWriteIni(other, full, &error, g_ini);
+    Check(ok && FileHasAt(other, "Shoulder = 0.55", 0.0) && FileHasAt(other, "; my notes", 0.0) &&
+              FileHasAt(other, "Foo = bar", 0.0) && FileHasAt(other, "StatsLog = 2", 0.0),
+          "write: written from another file, its comments and unknown keys come along (error %lu)", error);
+    Check(FileHas("Shoulder = 0.75", 0.0), "write: the file it came from not touched");
+    DeleteFileW(other);
 }
 
 // ModelScale's steps: a third, each whole percent from 34, two thirds in place of 67; anything else goes to the
@@ -1280,6 +1326,59 @@ void TestInputGame()
     CloseHandle(gameThread);
     CloseHandle(game.ready);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The menu's own copy, for a game whose folder it cannot write. %LOCALAPPDATA% is the test's directory (main). Last:
+// once the menu has gone to its copy, it stays there for the rest of the process.
+
+void TestCopy()
+{
+    wchar_t copy[MAX_PATH];
+    wchar_t expected[MAX_PATH];
+    swprintf_s(expected, MAX_PATH, L"%sBanana-Zero\\menutest\\dlssnr.ini", g_directory);
+    Check(SettingsUserPath(copy, MAX_PATH, false) && _wcsicmp(copy, expected) == 0,
+          "copy: %%LOCALAPPDATA%%\\Banana-Zero\\menutest\\dlssnr.ini (%ls)", copy);
+    DeleteFileW(copy);
+    Check(!SettingsPreferCopy(g_ini, copy), "copy: none yet, the file beside the game is the one to read");
+
+    // The file the menu starts from, made read-only: the menu may read it but not write it.
+    WriteAll(g_ini, "; mine\r\nShoulder = 0.8\r\nStatsLog = 0\r\n");
+    SettingsLoad(g_ini);
+    MenuOnEvaluate(nullptr); // the menu follows the file
+    SetFileAttributesW(g_ini, FILE_ATTRIBUTE_READONLY);
+    const int failed = LogCount("menu: could not write");
+    MenuSetOpen(true);
+    MenuLock();
+    MenuModelLocked().draft.whiteEV = 1.5f;
+    MenuCommitLocked("test");
+    MenuUnlock();
+    MenuSetOpen(false);
+    Check(FileHasAt(copy, "WhiteEV = 1.5", 5.0), "copy: closing the menu wrote its change to the copy");
+    Check(FileHasAt(copy, "; mine", 0.0) && FileHasAt(copy, "Shoulder = 0.8", 0.0) &&
+              FileHasAt(copy, "StatsLog = 0", 0.0),
+          "copy: with the lines of the file the menu read");
+    Check(!FileHas("WhiteEV", 0.0), "copy: the file beside the game as it was");
+    Check(LogCount("menu: could not write") == failed + 1 && LogCount("instead; the next start reads it") == 1,
+          "copy: the log says the file could not be written and names the copy");
+
+    // The next write goes straight to the copy.
+    MenuSetOpen(true);
+    MenuLock();
+    MenuModelLocked().draft.whiteEV = -0.5f;
+    MenuCommitLocked("test");
+    MenuUnlock();
+    MenuSetOpen(false);
+    Check(FileHasAt(copy, "WhiteEV = -0.5", 5.0) && LogCount("menu: could not write") == failed + 1,
+          "copy: the next write goes straight to the copy, no second try at the file");
+    SetFileAttributesW(g_ini, FILE_ATTRIBUTE_NORMAL);
+
+    // Which one the next start reads: the newer.
+    Check(SettingsPreferCopy(g_ini, copy), "copy: written after the file beside the game, so the one to read");
+    Check(SettingsPreferCopy(nullptr, copy), "copy: no file beside the game, the copy is the one to read");
+    Sleep(20);
+    WriteAll(g_ini, "; mine, edited by hand\r\nShoulder = 0.7\r\n");
+    Check(!SettingsPreferCopy(g_ini, copy), "copy: the file beside the game edited by hand since, that one to read");
+}
 } // namespace
 
 int main()
@@ -1296,6 +1395,11 @@ int main()
     swprintf_s(g_logPath, MAX_PATH, L"%smenutest.log", g_directory);
     LogOpen(g_logPath);
     std::printf("menutest: files under %ls\n", g_directory);
+    // The menu's own copy goes under %LOCALAPPDATA%: here, in the test's directory (without its last backslash).
+    wchar_t local[MAX_PATH];
+    wcscpy_s(local, MAX_PATH, g_directory);
+    local[wcslen(local) - 1] = L'\0';
+    SetEnvironmentVariableW(L"LOCALAPPDATA", local);
 
     TestKeys();
     TestWrite();
@@ -1304,6 +1408,7 @@ int main()
     TestPanel();
     TestInput();
     TestInputGame();
+    TestCopy();
 
     std::printf("%d checks, %d failed\n", g_checks, g_failed);
     if (g_log != INVALID_HANDLE_VALUE)

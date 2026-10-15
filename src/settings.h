@@ -3,8 +3,9 @@
 // Settings: one immutable snapshot, published through an atomic pointer, read once per
 // evaluation without a lock. dlssnr.ini beside the game's exe (else beside the DLL, see IniPath in nr_dx12.cpp) is
 // read at the first Neural Rendering evaluation, and read again whenever it changes (M4). The menu (M3) publishes a new snapshot at every step of a dragged slider
-// and writes the changed keys back to the file (settings_write.h). Keys the file does not name keep their defaults;
-// for the model's own parameters, that is the model's own default.
+// and writes the changed keys back to the file (settings_write.h), or to its own copy when the file cannot be written
+// (SettingsUserPath); the newer of the two is the one read at the next start. Keys the file does not name keep their
+// defaults; for the model's own parameters, that is the model's own default.
 
 #include <cstddef>
 
@@ -163,6 +164,16 @@ void SettingsNoteWritten();
 
 // The path SettingsLoad was given, empty until then. Where the menu writes.
 const wchar_t* SettingsPath();
+
+// The menu's own copy of the file, for when it cannot write the one beside the game (a folder the game may not write
+// to, a file another program holds, a guard that stops the game replacing files): %LOCALAPPDATA%\Banana-Zero\<the
+// game's exe name, without .exe>\dlssnr.ini. With `create` the folders are made if need be. False when there is none.
+bool SettingsUserPath(wchar_t* out, size_t size, bool create);
+
+// Whether to read the copy rather than the file beside the game (`beside`, nullptr when there is none): the copy
+// exists and was written after it. The menu writes the copy only when it cannot write the file beside the game, and
+// starts it from that file, so the newer of the two holds the last settings, made in the menu or by hand.
+bool SettingsPreferCopy(const wchar_t* beside, const wchar_t* copy);
 
 // "Enabled 1, Badge 3.0 s; HDR InputType auto, ..." for the log.
 void SettingsDescribe(const Settings& settings, char* out, size_t size);

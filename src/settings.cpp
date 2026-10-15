@@ -550,3 +550,39 @@ void SettingsNoteWritten()
 }
 
 const wchar_t* SettingsPath() { return g_path; }
+
+bool SettingsUserPath(wchar_t* out, size_t size, bool create)
+{
+    wchar_t exe[MAX_PATH];
+    const DWORD exeLength = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (exeLength == 0 || exeLength >= MAX_PATH)
+        return false;
+    wchar_t* name = wcsrchr(exe, L'\\');
+    name = name != nullptr ? name + 1 : exe;
+    if (wchar_t* dot = wcsrchr(name, L'.'))
+        *dot = L'\0';
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", out, DWORD(size));
+    const size_t total = length + wcslen(L"\\Banana-Zero\\") + wcslen(name) + wcslen(L"\\dlssnr.ini");
+    if (*name == L'\0' || length == 0 || total >= size)
+        return false;
+    wcscat_s(out, size, L"\\Banana-Zero");
+    if (create)
+        CreateDirectoryW(out, nullptr);
+    wcscat_s(out, size, L"\\");
+    wcscat_s(out, size, name);
+    if (create)
+        CreateDirectoryW(out, nullptr);
+    wcscat_s(out, size, L"\\dlssnr.ini");
+    return true;
+}
+
+bool SettingsPreferCopy(const wchar_t* beside, const wchar_t* copy)
+{
+    FILETIME copyStamp = {}, besideStamp = {};
+    ULONGLONG size = 0;
+    if (!Stat(copy, &copyStamp, &size))
+        return false;
+    if (beside == nullptr || !Stat(beside, &besideStamp, &size))
+        return true;
+    return CompareFileTime(&copyStamp, &besideStamp) > 0;
+}

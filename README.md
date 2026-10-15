@@ -101,7 +101,8 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
   hand it back.
 - Everything is saved to `dlssnr.ini` next to `dxgi.dll`, a second after the last change and when the menu closes.
   Only the keys you changed are written; your own comments and lines in the file stay put. Edit the file by hand while
-  the game runs and it is picked up too.
+  the game runs and it is picked up too. If the game may not write that folder, the menu saves a copy in
+  `%LOCALAPPDATA%\Banana-Zero` instead (see [dlssnr.ini](#dlssnrini)).
 - The status line at the top reads like `3840x2160 RR HDR  frames N  failed N  model builds N`: resolution, which DLSS
   the game uses, HDR or not, frames processed, failures, and how many times the model was built.
 
@@ -272,6 +273,12 @@ writes it for you; this is for people who like to open the back panel.
 The file accepts wider ranges than the menu's sliders. Freeze, the calibration card, the sky's stripes and A/B are
 never saved.
 
+When the menu cannot write the file next to the game (a read-only folder, the file held open by another program, or a
+security tool that stops the game replacing files), it writes its own copy, the file it read plus your changes, to
+`%LOCALAPPDATA%\Banana-Zero\<the game's exe name>\dlssnr.ini`, for example `...\Banana-Zero\GTA5_Enhanced\dlssnr.ini`.
+At the next start the newer of the two is read: whichever was changed last, in the menu or by hand, counts.
+`dlssnr.log` names the file it read and the one it wrote. Delete the copy to go back to the file next to the game.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -283,6 +290,7 @@ never saved.
 | Halos, noise, white fringes | Lower Max gain (EV), then Strength |
 | Colours look off | Lower Colour |
 | Menu too dark or washed out in HDR | Set Menu colour by hand and adjust Menu brightness |
+| Menu changes are gone after a restart | Read `dlssnr.log`: `could not write ... (error 5 at the replace)` means Windows or a security tool refused the game the file. The menu then saves its own copy (see [dlssnr.ini](#dlssnrini)); to keep the file next to the game, allow the game's `.exe` in that tool |
 | Something failed | Any failure means "no NR on this frame" and the game carries on as normal. `dlssnr.log` and `dlssnr.prev.log` (the previous session) have the details. Attach them to an issue |
 
 ## Known limitations
@@ -399,7 +407,7 @@ Every build compares the new `dxgi.dll` with the local `System32\dxgi.dll` and w
 | `src/ngx_hook.*` | The five NGX hooks |
 | `src/nr_dx12.*`, `src/nr_frame.h` | The NR pass: bridge, model, parameters, build and rebuild, encode, model, composite |
 | `src/nr.hlsl`, `src/nr_stats.hlsl`, `src/nr_common.hlsli`, `src/nr_shared.h` | The compute shaders and the maths they share |
-| `src/settings*` | `dlssnr.ini`: reading, hot reload, the menu's write-back |
+| `src/settings*` | `dlssnr.ini`: reading, hot reload, the menu's write-back and its own copy |
 | `src/menu*`, `src/overlay_dx12.*`, `src/keys.*`, `src/freeze.*` | The menu, drawn with Dear ImGui on the game's swap chain |
 | `src/dxgi.def`, `src/dxgi_stubs.asm`, `src/dxgi_exports.h` | Generated export forwarding |
 | `bridge/` | `banana.nvngx.dll` |
