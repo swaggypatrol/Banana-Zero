@@ -1,8 +1,9 @@
 #pragma once
 
 // dlssnr.log, beside the DLL. Written at start-up, when the core is patched, at feature creation, release and
-// failure, and by the reporter thread (ngx_hook.cpp) -- never on the evaluate path. Each line starts with the seconds
-// since the log was opened.
+// failure, by the reporter thread (ngx_hook.cpp) with the per-frame counts, and on the evaluate path only for rare or
+// rate-limited events (a skipped frame, a reset of the model's history: nr_dx12.cpp's Logged). Each line starts with
+// the seconds since the log was opened.
 //
 // Written with WriteFile under a lock of our own rather than through a CRT FILE. When the game exits, Windows ends
 // every other thread before DllMain(DLL_PROCESS_DETACH) runs; a thread ended inside the CRT's stream or low-level file
@@ -57,7 +58,7 @@ inline void LogV(bool wait, const char* format, va_list args)
         return;
     const DWORD lastError = GetLastError();
 
-    char line[1024];
+    char line[2048]; // the reporter's lines carry NR's counts for their interval and the totals
     int length = snprintf(line, sizeof line, "%9.3f  ", LogClock());
     const int text = vsnprintf(line + length, sizeof line - length - 1, format, args);
     if (text > 0)

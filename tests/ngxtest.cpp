@@ -633,7 +633,7 @@ int wmain(int argc, wchar_t** argv)
         CheckLog(lines, "core Shutdown1 -> 0x00000001, from ngxtest.exe+");
         // The NR pass saw the SR evaluations, read the parameters and stood down before touching anything.
         CheckLog(lines, "settings: ");
-        CheckLog(lines, "NR skipped for SR 1 #100: no Output in the parameters (logged once per reason)");
+        CheckLog(lines, "NR skipped for SR 1 #100: no Output in the parameters (1 for this reason so far)");
         CheckLog(lines, "process ending; totals: SR 1: 2 created, 7 evaluations, 2 failed; FG 11: 1 created, 2 "
                         "evaluations, 0 failed; unknown handles: 1 evaluations");
         CheckLog(lines, "could not", 0);
@@ -650,7 +650,7 @@ int wmain(int argc, wchar_t** argv)
         CheckLog(lines, "CreateFeature(RR 13)", 0);
         CheckLog(lines, "EvaluateFeature on a handle we did not see created");
         CheckLog(lines, "ReleaseFeature of a handle we did not see created");
-        CheckLog(lines, "NR skipped for SR 1 #100: no parameters (logged once per reason)");
+        CheckLog(lines, "NR skipped for SR 1 #100: no parameters (1 for this reason so far)");
         CheckLog(lines, "process ending; totals: SR 1: 1 created, 1 evaluations, 0 failed; unknown handles: 1 "
                         "evaluations");
         CheckLog(lines, "could not", 0);

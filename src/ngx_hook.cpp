@@ -274,10 +274,12 @@ size_t UntrackAll()
 // ---------------------------------------------------------------------------------------------------------------
 // The reporter: one line with how many evaluations of each feature there were since its last line, and how many
 // failed, then the totals since start (a game that exits without DLL_PROCESS_DETACH, as TLOU2 does, never writes
-// the totals line, so every report line carries them). It is its own thread so that the evaluate path never writes
-// to the log; it only starts once the game creates a feature, and writes nothing while nothing is evaluated. Every
-// 5 s at first, so a short scripted run shows the rate; from the fifth line on the interval doubles, up to 5
-// minutes, so a long session adds a dozen lines an hour, not a line every few seconds.
+// the totals line, so every report line carries them). It is its own thread so that the evaluate path writes no
+// per-frame counts to the log (only rare, rate-limited events); it only starts once the game creates a feature, and
+// writes nothing while nothing is evaluated. Every
+// 5 s at first, so a short scripted run shows the rate; from the fifth line on every 10 s. (It used to double up to
+// 5 minutes; while Banana-Zero is being developed a long session is worth 360 lines an hour, each with NR's own
+// counts for its interval, so that something that comes every few seconds shows when it started and how often.)
 
 // "SR 1: 2 created, 7 evaluations, 2 failed; FG 11: ...; unknown handles: 1 evaluations; NR 1200 frames, ...".
 // Returns 0 if there is nothing to say.
@@ -300,14 +302,14 @@ size_t DescribeTotals(char* out, size_t size)
     if (unknown != 0)
         Append(out, size, &length, "%sunknown handles: %llu evaluations", length == 0 ? "" : "; ",
                static_cast<unsigned long long>(unknown));
-    char nr[256];
+    char nr[512];
     if (NrDescribe(nr, sizeof nr) != 0)
         Append(out, size, &length, "%s%s", length == 0 ? "" : "; ", nr);
     return length;
 }
 
 constexpr DWORD kReportMilliseconds = 5000;
-constexpr DWORD kReportMaxMilliseconds = 300000;
+constexpr DWORD kReportMaxMilliseconds = 10000;
 constexpr unsigned kReportsBeforeBackoff = 4;
 
 DWORD WINAPI Report(void*)
@@ -354,15 +356,23 @@ DWORD WINAPI Report(void*)
 
         if (length != 0)
         {
+            char nr[640];
+            const size_t nrLength = NrDescribeInterval(nr, sizeof nr);
             char totals[768];
             DescribeTotals(totals, sizeof totals);
-            Log("evaluations in the last %.1f s: %s; totals: %s", seconds, line, totals);
+            Log("evaluations in the last %.1f s: %s%s%s; totals: %s", seconds, line, nrLength != 0 ? "; " : "",
+                nrLength != 0 ? nr : "", totals);
             quiet = false;
         }
-        else if (!quiet)
+        else
         {
-            Log("no evaluations in the last %.1f s", seconds);
-            quiet = true;
+            char nr[640];
+            NrDescribeInterval(nr, sizeof nr); // so that the next line counts from here, not from before the quiet
+            if (!quiet)
+            {
+                Log("no evaluations in the last %.1f s", seconds);
+                quiet = true;
+            }
         }
     }
 }

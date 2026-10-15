@@ -64,19 +64,26 @@ struct NrStatusState
     double lastEvaluateAt;  // LogClock() of the last evaluation that reached the pass
     unsigned modelWidth, modelHeight; // the model's picture (ModelScale): the frame's size, or smaller; 0 until the
                                       // model's first evaluation
-    bool haveTiming;        // gpuMs and modelMs hold a measurement (only while NrStatus keeps being called)
+    bool haveTiming;                  // gpuMs and modelMs hold a measurement
     float gpuMs;            // the whole pass on the GPU, encode to composite: the median of the last 16 frames
     float modelMs;          // of which the model itself
 };
 
 // Copies the latest state out; false (and zeroes) while nothing has reached the pass yet. Any thread; waits at most
-// for the render thread's copy in. While these calls keep coming (the menu is open), the pass also times itself on
-// the GPU, for haveTiming; half a second after they stop it no longer does.
+// for the render thread's copy in. The pass times itself on the GPU at every frame, for haveTiming.
 bool NrStatus(NrStatusState* out);
 
-// "NR 1200 frames, 3 skipped, 0 failed" or the reason it is off, for the reporter's line and the totals at exit.
-// Returns 0, writing nothing, while NR has never been attempted (so a game without DLSS textures logs nothing new).
+// "NR 1200 frames, 3 skipped (3 list state unknown), 0 failed" or the reason it is off, for the reporter's line and
+// the totals at exit. Returns 0, writing nothing, while NR has never been attempted and no frame with its textures was
+// skipped for its command list's state (so a game without DLSS textures logs nothing new); with Enabled=0 only,
+// "NR disabled (Enabled=0), N evaluations passed by".
 size_t NrDescribe(char* out, size_t size);
+
+// What changed since the last call: "NR in that time: 598 frames, 2 skipped (2 list state unknown), the model's
+// history reset 0 times (0 at the game's request), the pass 3.21 ms on the GPU, the median of its last 16 (the model
+// 2.87 ms), 1043 command lists followed, 1180 Resets through us, 0 lists made". The GPU time only when NR ran in that
+// time. For the reporter's line; only its thread calls it. 0 under the same conditions as NrDescribe.
+size_t NrDescribeInterval(char* out, size_t size);
 
 // The preview for the menu to show: what the model sees (Preview = input: the proxy, with
 // the zebra stripes when Zebra is on) or what it made (Preview = output: its output, before the composite), reduced to

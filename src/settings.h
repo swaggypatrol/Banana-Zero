@@ -105,10 +105,12 @@ struct Settings
 
     // Three switches only the file can set.
     bool card = false;          // Card: the calibration card on the live frame (the menu will not store it)
-    // Both off since the defaults were measured; StatsLog 2 and DumpEvery 60 measure again (tools/bzstats.py and
-    // tools/bzdump.py read what they write).
-    float statsSeconds = 0.0f; // StatsLog: a statistics line every this many seconds; 0 = never
-    float dumpSeconds = 0.0f;  // DumpEvery: a frame dump every this many seconds, at most 16; 0 = never
+    // DumpEvery off since the defaults were measured (DumpEvery 60 measures again; tools/bzdump.py reads the dumps).
+    // StatsLog on while Banana-Zero is being developed: a line every 10 s with the white point, the exposure and the
+    // picture's levels, for what the log says about a picture that looks wrong (tools/bzstats.py reads them); the
+    // statistics are taken on that one frame only.
+    float statsSeconds = 10.0f; // StatsLog: a statistics line every this many seconds; 0 = never
+    float dumpSeconds = 0.0f;   // DumpEvery: a frame dump every this many seconds, at most 16; 0 = never
 
     // The menu (M3), after M4's fields, which stay as they are.
     bool compare = false;                      // Compare: split screen, the original on the left, NR on the right
