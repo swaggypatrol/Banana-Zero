@@ -46,6 +46,7 @@ It is NVIDIA's and not ours to hand out, so you bring your own, the way you brin
 | The Last of Us Part II Remastered | The game's root folder, next to `tlou-ii.exe` | Super Resolution + Frame Generation, through Streamline |
 | Resident Evil Requiem (Steam) | The game's root folder, next to `re9.exe`, with [REFramework](#re-engine-games-and-reframework) | Ray Reconstruction + Frame Generation, through Streamline |
 | Gears of War E-Day | `<game folder>\FairlightConcept\Binaries\Win64\`, next to `GoWEDay-Steam.exe`. Ships EasyAntiCheat: see [Anti-cheat](#anti-cheat) | Super Resolution, plus Frame Generation through Streamline |
+| Grand Theft Auto V Enhanced | The game's root folder, next to `GTA5_Enhanced.exe`. Ships BattlEye: see [Anti-cheat](#anti-cheat) | Super Resolution + Frame Generation, through Streamline |
 
 Other DX12 games with DLSS should work the same way in principle. "In principle" is doing some heavy lifting in that
 sentence; please report back.
@@ -76,13 +77,16 @@ did nothing. From v0.1.2 they work, and those old settings take effect. If the p
 upgrade, right-click Style and the Model sliders to hand them back to the model.
 
 **Uninstalling:** delete `dxgi.dll`, `banana.nvngx.dll`, `dlssnr.ini`, `dlssnr.log` and `dlssnr.prev.log` from the
-game folder, and optionally `%LOCALAPPDATA%\Banana-Zero`. Banana-Zero never modifies a single file of the game.
+game folder, and `%LOCALAPPDATA%\Banana-Zero\<the game's exe name>` if it is there (the menu's own copy of
+`dlssnr.ini`, which a later install would read); the rest of `%LOCALAPPDATA%\Banana-Zero` optionally. Banana-Zero
+never modifies a single file of the game.
 
 ### Anti-cheat
 
 Banana-Zero's DLLs are not signed, and anti-cheat software may refuse them, or flag the account that loaded them.
-Gears of War E-Day ships EasyAntiCheat; Banana-Zero was tested in its campaign only. Never take Banana-Zero into an
-online mode, and don't use it in a game whose rules forbid it.
+Gears of War E-Day ships EasyAntiCheat; Banana-Zero was tested in its campaign only. Grand Theft Auto V Enhanced ships
+BattlEye. Never take Banana-Zero into an online mode, GTA Online included, and don't use it in a game whose rules
+forbid it.
 
 ### Break-in period
 
@@ -95,14 +99,18 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
 
 - While the menu is open the game gets no mouse input, and in most games no keyboard input either (in Gears of War
   E-Day the keys you press reach the game as well). It gets it all back when the menu closes.
+- Holding a key or a mouse button as the menu opens (`End` itself counts)? That device stays the game's until you let
+  go, so the game sees the release and you don't keep walking. After ten seconds the menu takes it anyway, and a game
+  that reads raw input, like GTA V, may then treat that key as held until you press it again.
 - **Sliders apply while you drag**: the picture follows the mouse, step by step. No Apply button. We trust you.
 - **Right-click a slider** to put it back to its default. `Ctrl`+click to type a number.
 - A **hollow slider** means "not set, the model uses its own default". Click or drag it to take over; right-click to
   hand it back.
 - Everything is saved to `dlssnr.ini` next to `dxgi.dll`, a second after the last change and when the menu closes.
   Only the keys you changed are written; your own comments and lines in the file stay put. Edit the file by hand while
-  the game runs and it is picked up too. If the game may not write that folder, the menu saves a copy in
-  `%LOCALAPPDATA%\Banana-Zero` instead (see [dlssnr.ini](#dlssnrini)).
+  the game runs and it is picked up too. If the menu cannot write that file (in GTA V something holds it open while
+  the game runs), it saves a copy in `%LOCALAPPDATA%\Banana-Zero` instead, and from the next start on that copy is
+  the file to edit (see [dlssnr.ini](#dlssnrini)).
 - The status line at the top reads like `3840x2160 RR HDR  frames N  failed N  model builds N`: resolution, which DLSS
   the game uses, HDR or not, frames processed, failures, and how many times the model was built.
 
@@ -140,13 +148,14 @@ frame or two after you let go.
 | **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else. Greyed out while a sky slider (Depth page) is away from 1: handed our map of the picture, the model switches its own off |
 | **Skin structure** | follows local structure, or 0 to 1.5 | Texture on skin. Only does anything with Auto mask on (greyed out otherwise). Turn it down for less texture on faces |
 
-*HDR encode.* Both tested games hand DLSS linear HDR values with no upper limit, even with Windows in SDR mode, but
-the model expects a finished-looking picture. So Banana-Zero shows it a stand-in: the frame divided by a **white
-point**, encoded like a display would, with highlights above the white point folded into a smooth **shoulder**.
+*HDR encode.* The Witcher 3 and TLOU2 hand DLSS linear HDR values with no upper limit, even with Windows in SDR mode
+(GTA V hands it linear HDR too), but the model expects a finished-looking picture. So Banana-Zero shows it a
+stand-in: the frame divided by a **white point**, encoded like a display would, with highlights above the white point
+folded into a smooth **shoulder**.
 
 | Control | Range | What it does |
 |---|---|---|
-| **White point from** | Auto, Game exposure, Manual, Scene meter | What counts as "white". Auto (default) uses the game's exposure when the game provides it (TLOU2 does) and meters the scene when it does not (Witcher 3) |
+| **White point from** | Auto, Game exposure, Manual, Scene meter | What counts as "white". Auto (default) uses the game's exposure when the game provides it (TLOU2 and GTA V do) and meters the scene when it does not (Witcher 3). It decides every frame: GTA V provides none on some of its own screens, such as around its pause menu and when you quit, so Auto meters those frames. Each switch restarts the model's memory of earlier frames, once |
 | **White point (EV)** | -2 to +2, default 0 | Shifts the white point. +1 hands the model a picture one stop darker |
 | **Highlight shoulder** | 0.50 to 0.90, default 0.70 | Where highlight compression starts, as a fraction of the white point |
 
@@ -276,7 +285,9 @@ never saved.
 When the menu cannot write the file next to the game (a read-only folder, the file held open by another program, or a
 security tool that stops the game replacing files), it writes its own copy, the file it read plus your changes, to
 `%LOCALAPPDATA%\Banana-Zero\<the game's exe name>\dlssnr.ini`, for example `...\Banana-Zero\GTA5_Enhanced\dlssnr.ini`.
-At the next start the newer of the two is read: whichever was changed last, in the menu or by hand, counts.
+At the next start the newer of the two is read: whichever was changed last, in the menu or by hand, counts. While the
+game runs, only the file that was read is followed: once the copy is the one read, edit the copy by hand, not the
+file next to the game (that one is not picked up then, and the menu's next save makes the copy the newer again).
 `dlssnr.log` names the file it read and the one it wrote. Delete the copy to go back to the file next to the game.
 
 ## Troubleshooting
@@ -290,13 +301,13 @@ At the next start the newer of the two is read: whichever was changed last, in t
 | Halos, noise, white fringes | Lower Max gain (EV), then Strength |
 | Colours look off | Lower Colour |
 | Menu too dark or washed out in HDR | Set Menu colour by hand and adjust Menu brightness |
-| Menu changes are gone after a restart | Read `dlssnr.log`: `could not write ... (error 5 at the replace)` means Windows or a security tool refused the game the file. The menu then saves its own copy (see [dlssnr.ini](#dlssnrini)); to keep the file next to the game, allow the game's `.exe` in that tool |
+| Menu changes do not reach `dlssnr.ini` next to the game, or are gone after a restart | Read `dlssnr.log`. `could not write ... (error 5 at the replace)` means the file is read-only, or Windows or a security tool refused the game the file; `(error 5 at the write)` means the game may not write that folder; `(error 32 at the replace)` means another program holds the file open (in GTA V something does while the game runs). In each case the menu saves its own copy instead, and the next start reads it (see [dlssnr.ini](#dlssnrini)). To keep the file next to the game after error 5 from a security tool, allow the game's `.exe` in that tool. `could not write ... either` means the copy failed too, and the changes are lost |
 | Something failed | Any failure means "no NR on this frame" and the game carries on as normal. `dlssnr.log` and `dlssnr.prev.log` (the previous session) have the details. Attach them to an issue |
 
 ## Known limitations
 
 - **DirectX 12 only.** Vulkan is the next milestone. DX11 is not planned.
-- **Tested in exactly four games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are
+- **Tested in exactly five games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are
   untested.
 - **It costs frame time.** About 7 ms per frame for the whole NR pass on an RTX 5090 at 4K output, nearly all of it
   inside the model. The Speed page shows what it costs on your machine, and its Model input size trades some of the
@@ -305,12 +316,14 @@ At the next start the newer of the two is read: whichever was changed last, in t
   each one does to the picture is our best guess from its name.
 - Night scenes in Witcher 3, the pause menus and photo modes have not been tested specifically.
 - The menu keeps the mouse from the game, and in most games the keyboard, but not a gamepad. In Gears of War E-Day
-  the keys pressed with the menu open reach the game too.
+  the keys pressed with the menu open reach the game too. A key held as the menu opens and still held ten seconds later
+  can stay held for a game that reads raw input (see [The in-game menu](#the-in-game-menu)).
 
 ## Version history
 
 | Version | What changed |
 |---|---|
+| v0.1.6 | Grand Theft Auto V Enhanced works. The mouse works in the game after the menu closes: the menu's mouse no longer goes through Dear ImGui's Win32 backend, which took and released the mouse capture on GTA V's window at a click in the menu (v0.1.3 did at every click; v0.1.5 still could before the first raw mouse data). A key or mouse button held as the menu opens keeps its device the game's until it is let go, ten seconds at most. NR no longer skips a frame at each command list's first pass: GTA V records DLSS on many different command lists, so v0.1.5 skipped 1,001 of 19,707 frames there, most of them in the first minute and then one every few seconds, seen as walls and pale surfaces flashing brighter; v0.1.6 skipped 2 of 33,960, both before NR had run once. When the menu cannot replace `dlssnr.ini` next to the game (in GTA V something holds it open while the game runs), it saves a copy in `%LOCALAPPDATA%\Banana-Zero`, and the newer of the two is read at the next start. The log says much more while Banana-Zero is being developed: why NR skipped a frame and why Banana-Zero restarted the model's memory (the first 20 times for each reason, then the 32nd, 64th and so on), a line every 10 seconds that counts them all, and `StatsLog` on by default. The picture is the same as v0.1.5 wherever NR ran before |
 | v0.1.5 | NR runs on every frame in games whose command lists each carry a function table of their own: in Gears of War E-Day v0.1.4 ran it on about 2.5% of the frames, v0.1.5 on 99.8%. The menu reads the mouse (and, where it has to, the keyboard) from raw input on a thread of its own, so it works in games whose window messages no hook sees, and while it is open Windows makes no mouse messages for the game, so a click in the menu is not also a click in the game. The picture is the same as v0.1.4 wherever NR ran before |
 | v0.1.4 | Resident Evil Requiem works, with [REFramework](#re-engine-games-and-reframework). The NR pass now puts back what the game had bound on its command list (some games, RE Engine among them, rely on it surviving the DLSS call, and crashed), and the menu opens, works and closes alongside REFramework's own hooks. `dlssnr.ini` is read next to the game's `.exe` first. The menu reads its input without touching the game's window procedure. The picture is the same as v0.1.3 |
 | v0.1.3 | The release candidate held up in play and is now the current release: [Speed (experimental)](#speed-experimental) and [Depth (experimental)](#depth-experimental) are in. New since the candidate: Model input size goes down to 33.3%, with notches at 33.3%, 50%, 66.7% and 80% and 1% steps between them. Leave both pages as they come and the picture is the same as v0.1.2 |
@@ -338,7 +351,9 @@ At the next start the newer of the two is read: whichever was changed last, in t
 - The NR pass binds descriptor heaps, a compute root signature and pipelines of its own on the game's command list.
   Banana-Zero follows what the game has bound (through the command list's function table, or each list's own where
   every list carries one) and binds it again when the pass is done, because some games set it once and expect it to
-  survive the DLSS call.
+  survive the DLSS call. It follows lists from the first DLSS frame it sees, before NR's own first frame, and knows
+  each one from its creation (for that it also takes the device's CreateCommandList entry) or its last Reset after
+  that; a list it saw neither of (one already recording at that first frame) gets no NR on that one frame.
 - **Why the bridge DLL?** The model only accepts callers whose file name contains `nvngx.dll`, and the driver's NGX
   runtime refuses to load the model itself because of its signature. So `dxgi.dll` calls it through
   `banana.nvngx.dll`, which knows no parameter names and just passes calls along.
@@ -369,8 +384,8 @@ Run these from the repository root after a build. The exit code is the number of
 |---|---|---|
 | `build\Release\dxgitest.exe` | nothing special | The export table matches the real `dxgi.dll`, every export reaches its real function, and a DXGI factory and D3D12 device can be made through ours |
 | `build\Release\ngxtest.exe` | nothing special | The five hooks against a fake NGX runtime and the bridge against a fake model |
-| `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back. Then the menu's input on a hidden window with a message loop of its own: the hook, the raw input going to a thread of ours with the mouse's window messages off, and the game's own registration put back. It sends F24 and a one-count mouse move and back with `SendInput`, which leave your keyboard and cursor as they were |
-| `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU, and checks that the game's compute state is followed and put back after the NR pass, also on lists with function tables of their own |
+| `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back. Then the menu's input on a hidden window with a message loop of its own: the hook, the raw input going to a thread of ours with the mouse's window messages off, and the game's own registration put back. Then a game that registers its raw input as GTA V does (no window, no flags), its window holding the mouse capture: a click in the menu leaves the capture alone and asks the game's window for no `WM_MOUSELEAVE`, a key held at the open keeps the keyboard the game's until it is let go, and a wheel notch in every frame is taken in that frame, every frame ending at the menu's own pointer. Then the menu's own copy when a file cannot be replaced (a read-only one), with `%LOCALAPPDATA%` pointed at the test's own folder under `%TEMP%`. It sends F24 and a one-count mouse move and back with `SendInput`, which leave your keyboard and cursor as they were |
+| `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU, and checks that the game's compute state is followed and put back after the NR pass, also on lists with function tables of their own, and that a list made or reset after Banana-Zero began following lists is known at its first pass |
 | `build\Release\nrprobe.exe [--model <path>]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll` |
 | `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along moving edges and thin bars, whether a control mask sets it per pixel, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
 | `build\Release\nrprobe.exe --subrects` | the same | Runs the model on smaller pictures inside a feature made for the full one, as Model input size does: that the result matches a feature made at the smaller size, that nothing outside the smaller picture is written, how long each size takes, and which motion-vector scale it wants then |
