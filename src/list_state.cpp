@@ -75,16 +75,23 @@ constexpr unsigned kTablesMax = kTableSlots / 4 * 3; // past this a list with a 
 constexpr unsigned kSlotBits = 11;
 constexpr unsigned kSlots = 1u << kSlotBits; // lists followed; a slot is never given back
 
-// {6B616E61-6E61-4C69-7374-537461746521}: on a list once the NR pass has seen it. A list created at the address of
-// one destroyed before carries none, so the old list's state, kept in the same slot, is not taken for its own.
+// {6B616E61-6E61-4C69-7374-537461746521}: on a list once a Reset or ClearState of it went through us, from when its
+// slot's state is its own. A list created at the address of one destroyed before carries none until its own Reset, so
+// the old list's state, kept in the same slot, is not taken for its own. It used to be set at the list's first NR
+// pass, which was then skipped: GTA V records DLSS on lists of a pool of about a thousand (1,000 passes skipped in
+// eight minutes, fewer as they went), and each skip was a frame of the game's own picture between NR's, brighter on
+// walls and pale surfaces: a flash every few seconds.
 const GUID kSeen = { 0x6b616e61, 0x6e61, 0x4c69, { 0x73, 0x74, 0x53, 0x74, 0x61, 0x74, 0x65, 0x21 } };
 
 // One watched function table, and what its watched entries held before we took them. `vtable` is set last, once
-// `original` is complete; a slot is never given back.
+// `original` is complete; a slot is never given back. `complete` once every watched entry is ours: the entries are
+// written one by one (two VirtualProtect calls each, up to 0.1 ms in all), and a Reset that reaches us before the
+// binding entries are ours vouches for nothing (the binds right after it are not seen).
 struct Table
 {
     std::atomic<void**> vtable;
     void* original[kWatchedCount];
+    std::atomic<bool> complete;
 };
 
 Table g_tables[kTableSlots];
@@ -122,10 +129,15 @@ struct Slot
 
 Slot g_slots[kSlots];
 std::atomic<bool> g_full{ false };
+std::atomic<unsigned> g_slotsTaken{ 0 }; // for the log
+std::atomic<uint64_t> g_resets{ 0 }; // Resets and ClearStates through our hooks
+std::atomic<uint64_t> g_made{ 0 };   // lists the device made, cleaned at their birth
 // The reasons a list's state became unknown, each logged once.
 std::atomic<bool> g_saidBundle{ false };
 std::atomic<bool> g_saidOverflow{ false };
 std::atomic<bool> g_saidTableChanged{ false };
+std::atomic<bool> g_saidBadHeaps{ false };
+std::atomic<bool> g_saidBadConstants{ false };
 
 template <typename F, Index I> F Original(ID3D12GraphicsCommandList* list)
 {
@@ -152,7 +164,12 @@ ListState* StateOf(ID3D12GraphicsCommandList* list, bool claim)
             continue;
         if (!claim)
             return nullptr;
-        if (slot.list.compare_exchange_strong(held, list, std::memory_order_acq_rel) || held == list)
+        if (slot.list.compare_exchange_strong(held, list, std::memory_order_acq_rel))
+        {
+            g_slotsTaken.fetch_add(1, std::memory_order_relaxed);
+            return &slot.state;
+        }
+        if (held == list)
             return &slot.state;
     }
     if (claim && !g_full.exchange(true, std::memory_order_relaxed))
@@ -163,16 +180,40 @@ ListState* StateOf(ID3D12GraphicsCommandList* list, bool claim)
 void Unknown(ListState* s, std::atomic<bool>* said, const char* why)
 {
     s->known = false;
+    s->lost = why;
     if (said != nullptr && !said->exchange(true, std::memory_order_relaxed))
-        Log("NR: a command list's state is not known after %s; NR waits for its next Reset (logged once)", why);
+        Log("NR: a command list's state is not known: %s; NR waits for its next Reset (logged once)", why);
 }
 
-void Clean(ListState* s, ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline)
+// Whether `list` carries our mark for itself: the mark holds the list's own pointer, as its slot is keyed by it, so a
+// mark written through a wrapper or the object inside one vouches for nothing on the other.
+bool Seen(ID3D12GraphicsCommandList* list)
+{
+    void* marked = nullptr;
+    UINT size = sizeof marked;
+    return SUCCEEDED(list->GetPrivateData(kSeen, &size, &marked)) && size == sizeof marked && marked == list;
+}
+
+// After a Reset or ClearState (or the list's creation): nothing bound but `pipeline`, and the list marked (about
+// 11 ns when it is already, against some 65 us for a Close and Reset). Known only on a table that is all ours: the
+// runtime's Reset also puts a list back on its class's table, which may not be taken yet, and while a table is being
+// taken its binding entries are still the runtime's.
+void Clean(ListState* s, ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline, bool made = false)
 {
     *s = {};
-    s->known = true;
+    void** const vtable = *reinterpret_cast<void** const*>(list);
+    const Table* table = FindTable(vtable);
+    s->known = table != nullptr && table->complete.load(std::memory_order_acquire);
+    if (!s->known)
+        s->lost = made ? "it was made on a function table not (yet) all ours, so what it bound after was not all seen"
+                       : "it was reset on a function table not (yet) all ours, so what it bound after was not all seen";
     s->pipeline = pipeline;
-    s->table = *reinterpret_cast<void* const*>(list);
+    s->table = vtable;
+    if (!Seen(list))
+    {
+        const void* const self = list;
+        list->SetPrivateData(kSeen, sizeof self, &self);
+    }
 }
 
 void SetArg(ID3D12GraphicsCommandList* list, UINT parameter, ArgKind kind, uint64_t value)
@@ -182,7 +223,7 @@ void SetArg(ID3D12GraphicsCommandList* list, UINT parameter, ArgKind kind, uint6
         return;
     if (parameter >= kListStateArgs)
     {
-        Unknown(s, &g_saidOverflow, "a root parameter beyond 64");
+        Unknown(s, &g_saidOverflow, "a root parameter beyond 64 was set");
         return;
     }
     s->args[parameter] = { kind, value };
@@ -192,7 +233,7 @@ void SetConstant(ListState* s, UINT parameter, UINT offset, uint32_t value)
 {
     if (parameter >= kListStateArgs || offset >= kListStateConstants)
     {
-        Unknown(s, &g_saidOverflow, "a root constant beyond 64");
+        Unknown(s, &g_saidOverflow, "a root constant beyond 64 was set");
         return;
     }
     for (unsigned i = 0; i < s->constantCount; ++i)
@@ -206,7 +247,7 @@ void SetConstant(ListState* s, UINT parameter, UINT offset, uint32_t value)
     }
     if (s->constantCount == kListStateConstants)
     {
-        Unknown(s, &g_saidOverflow, "more than 64 root constants");
+        Unknown(s, &g_saidOverflow, "more than 64 root constants were set");
         return;
     }
     s->constants[s->constantCount++] = { uint8_t(parameter), uint8_t(offset), value };
@@ -223,6 +264,7 @@ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* list, ID3D12Comma
     const HRESULT result = Original<Fn, kReset>(list)(list, allocator, pipeline);
     if (SUCCEEDED(result))
     {
+        g_resets.fetch_add(1, std::memory_order_relaxed);
         if (ListState* s = StateOf(list, true))
             Clean(s, list, pipeline);
     }
@@ -233,6 +275,7 @@ void STDMETHODCALLTYPE HookClearState(ID3D12GraphicsCommandList* list, ID3D12Pip
 {
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
     Original<Fn, kClearState>(list)(list, pipeline);
+    g_resets.fetch_add(1, std::memory_order_relaxed);
     if (ListState* s = StateOf(list, true))
         Clean(s, list, pipeline);
 }
@@ -253,7 +296,7 @@ void STDMETHODCALLTYPE HookExecuteBundle(ID3D12GraphicsCommandList* list, ID3D12
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, ID3D12GraphicsCommandList*);
     // What the bundle binds stays bound in the list afterwards, and we do not follow bundles.
     if (ListState* s = StateOf(list, true))
-        Unknown(s, &g_saidBundle, "ExecuteBundle");
+        Unknown(s, &g_saidBundle, "a bundle was executed on it (ExecuteBundle)");
     Original<Fn, kExecuteBundle>(list)(list, bundle);
 }
 
@@ -265,7 +308,8 @@ void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* list, U
     {
         if (count > 2 || (count != 0 && heaps == nullptr))
         {
-            Unknown(s, nullptr, nullptr); // not a call that succeeds; the heaps are now anyone's guess
+            // Not a call that succeeds; the heaps are now anyone's guess.
+            Unknown(s, &g_saidBadHeaps, "SetDescriptorHeaps was given more than two heaps, or none");
         }
         else
         {
@@ -319,7 +363,7 @@ void STDMETHODCALLTYPE HookSetComputeRoot32BitConstants(ID3D12GraphicsCommandLis
     {
         if (count != 0 && values == nullptr)
         {
-            Unknown(s, nullptr, nullptr);
+            Unknown(s, &g_saidBadConstants, "SetComputeRoot32BitConstants was given no values");
         }
         else
         {
@@ -463,12 +507,79 @@ void DescribeOriginals(const Table& table, char* out, size_t size)
         std::snprintf(out + at, size - size_t(at), ", elsewhere %u", others);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Lists made in the recording state. CreateCommandList hands back a list already recording, as after a Reset with its
+// initial pipeline but without one, so such a list was unknown at its first NR pass: a frame without NR. GTA V brought
+// new lists all through a session, a skipped frame every few seconds even after its pool of about a thousand had all
+// been seen. The device's CreateCommandList is taken with the first table, and a list it makes is cleaned and marked at
+// once (its state is known from its birth). CreateCommandList1 makes closed lists, which need a Reset anyway.
+
+constexpr unsigned kCreateCommandList = 12; // in ID3D12Device's table: IUnknown's 3, ID3D12Object's 4, then 5 more
+std::atomic<void*> g_createOriginal{ nullptr };
+
+HRESULT STDMETHODCALLTYPE HookCreateCommandList(ID3D12Device* device, UINT nodeMask, D3D12_COMMAND_LIST_TYPE type,
+                                                ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial,
+                                                REFIID riid, void** made)
+{
+    typedef HRESULT(STDMETHODCALLTYPE * Fn)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*,
+                                            ID3D12PipelineState*, REFIID, void**);
+    const HRESULT result = reinterpret_cast<Fn>(g_createOriginal.load(std::memory_order_acquire))(
+        device, nodeMask, type, allocator, initial, riid, made);
+    if (SUCCEEDED(result) && made != nullptr && *made != nullptr &&
+        (type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE))
+    {
+        ID3D12GraphicsCommandList* list = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*made)->QueryInterface(IID_PPV_ARGS(&list))))
+        {
+            // Only on a table we follow in full: a list on another (D3D12Core gives COMPUTE lists a table of their
+            // own, taken only once one carries DLSS) would be unknown all the same, and is not worth a slot.
+            const Table* table = FindTable(*reinterpret_cast<void***>(list));
+            if (table != nullptr && table->complete.load(std::memory_order_acquire))
+            {
+                g_made.fetch_add(1, std::memory_order_relaxed);
+                if (ListState* s = StateOf(list, true))
+                    Clean(s, list, initial, true);
+            }
+            list->Release();
+        }
+    }
+    return result;
+}
+
+// Once, with the first table, under the NR lock.
+void WatchCreation(ID3D12GraphicsCommandList* list)
+{
+    ID3D12Device* device = nullptr;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    {
+        Log("NR: the command list gave no device; lists made from now on are not followed from their creation");
+        return;
+    }
+    void** const table = *reinterpret_cast<void***>(device);
+    void* const entry = table[kCreateCommandList];
+    char where[160];
+    Where(entry, true, where, sizeof where);
+    if (entry != reinterpret_cast<void*>(&HookCreateCommandList))
+    {
+        g_createOriginal.store(entry, std::memory_order_release); // before any call can reach the hook
+        if (WriteEntry(&table[kCreateCommandList], reinterpret_cast<void*>(&HookCreateCommandList)))
+            Log("NR: command lists made from now on are followed from their creation (the device's CreateCommandList, "
+                "%s)",
+                where);
+        else
+            Log("NR: the device's CreateCommandList (%s) could not be taken (error %lu); a list made in the recording "
+                "state is not known until its first Reset",
+                where, GetLastError());
+    }
+    device->Release();
+}
+
 // Takes the watched entries of `list`'s table, once per table. Callers hold the NR lock, so two never race here.
 bool Watch(ID3D12GraphicsCommandList* list)
 {
     void** const vtable = *reinterpret_cast<void***>(list);
-    if (FindTable(vtable) != nullptr)
-        return true;
+    if (const Table* known = FindTable(vtable))
+        return known->complete.load(std::memory_order_acquire);
     if (g_tableCount == kTablesMax)
     {
         if (!g_saidTablesFull)
@@ -531,6 +642,9 @@ bool Watch(ID3D12GraphicsCommandList* list)
         if (vtable[index] == HookFor(index) || WriteEntry(&vtable[index], HookFor(index)))
             ++taken;
     }
+    table->complete.store(taken == kWatchedCount, std::memory_order_release);
+    if (first == nullptr)
+        WatchCreation(list);
     // The first four one by one, as before there were more, and where their entries lead; then every power of two.
     if (g_tableCount <= 4)
     {
@@ -557,33 +671,59 @@ bool Watch(ID3D12GraphicsCommandList* list)
 }
 } // namespace
 
-bool ListStateCapture(ID3D12GraphicsCommandList* list, ListState* out)
+bool ListStateCapture(ID3D12GraphicsCommandList* list, ListState* out, const char** why)
 {
+    const char* unused = nullptr;
+    const char*& reason = why != nullptr ? *why : unused;
     out->known = false;
-    if (list == nullptr || !Watch(list))
+    reason = "no command list";
+    if (list == nullptr)
         return false;
-    ListState* s = StateOf(list, false);
-    UINT one = 1;
-    UINT size = sizeof one;
-    if (FAILED(list->GetPrivateData(kSeen, &size, &one)))
+    if (!Watch(list))
     {
-        // New to us, or born where a list we saw died: what the slot says may be the old list's.
-        one = 1;
-        list->SetPrivateData(kSeen, sizeof one, &one);
-        if (s != nullptr)
-            s->known = false;
+        reason = "its function table is not followed (see the log above)";
         return false;
     }
-    if (s == nullptr || !s->known)
+    ListState* s = StateOf(list, false);
+    if (s == nullptr)
+    {
+        reason = g_full.load(std::memory_order_relaxed)
+                     ? "it has no slot: more command lists than are followed"
+                     : "no Reset of it went through us yet: recording since before the watch, made in the recording "
+                       "state, or born where a followed list died";
         return false;
+    }
+    if (!Seen(list))
+    {
+        // No Reset of it went through us: recording since before we watched, made in the recording state, or born
+        // where a list we saw died, and what the slot says may be the old list's.
+        reason = "no Reset of it went through us yet: recording since before the watch, made in the recording state, "
+                 "or born where a followed list died";
+        s->known = false;
+        return false;
+    }
+    if (!s->known)
+    {
+        reason = s->lost != nullptr ? s->lost : "not known since its last Reset";
+        return false;
+    }
     if (s->table != *reinterpret_cast<void* const*>(list))
     {
         // Given another table since its Reset (by some other hook): what went through that one we did not see.
-        Unknown(s, &g_saidTableChanged, "it was given another function table");
+        Unknown(s, &g_saidTableChanged, "it was given another function table since its Reset");
+        reason = s->lost;
         return false;
     }
     *out = *s;
+    reason = nullptr;
     return true;
+}
+
+void ListStateCount(ListStateCounts* out)
+{
+    out->lists = g_slotsTaken.load(std::memory_order_relaxed);
+    out->resets = g_resets.load(std::memory_order_relaxed);
+    out->made = g_made.load(std::memory_order_relaxed);
 }
 
 void ListStateRestore(ID3D12GraphicsCommandList* list, const ListState& state)

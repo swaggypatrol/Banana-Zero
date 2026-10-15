@@ -2861,9 +2861,13 @@ void TestListState()
     Must(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&otherAllocator)),
          "CreateCommandAllocator");
     ID3D12GraphicsCommandList* other = nullptr;
-    Must(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, otherAllocator, nullptr, IID_PPV_ARGS(&other)),
+    Must(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, otherAllocator, g.nr, IID_PPV_ARGS(&other)),
          "CreateCommandList");
-    Check(!ListStateCapture(other, &s), "list state: a second list starts unknown");
+    // Made since the watch began, in the recording state: known from its creation, with its initial pipeline. GTA V
+    // brings new lists all through a session, and each one's first pass was a frame without NR.
+    other->SetComputeRootSignature(gameRoot);
+    Check(ListStateCapture(other, &s) && s.pipeline == g.nr && s.computeRoot == gameRoot && s.heapCount == 0,
+          "list state: a list made since the watch began is known from its creation, with its initial pipeline");
     Must(other->Close(), "Close");
     Must(other->Reset(otherAllocator, nullptr), "Reset");
     other->SetDescriptorHeaps(1, &ourHeap);
@@ -2873,6 +2877,35 @@ void TestListState()
     other->Close();
     other->Release();
     otherAllocator->Release();
+
+    // A list made and reset since the watch began is known at its first pass, with no Reset more: GTA V records DLSS
+    // on lists of a pool of about a thousand, and a pass skipped at each list's first was a frame without NR every few
+    // seconds, a flash.
+    ID3D12CommandAllocator* poolAllocator = nullptr;
+    Must(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&poolAllocator)),
+         "CreateCommandAllocator");
+    ID3D12GraphicsCommandList* pooled = nullptr;
+    Must(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, poolAllocator, nullptr, IID_PPV_ARGS(&pooled)),
+         "CreateCommandList");
+    Must(pooled->Close(), "Close");
+    Must(pooled->Reset(poolAllocator, nullptr), "Reset");
+    pooled->SetDescriptorHeaps(1, &gameHeap);
+    pooled->SetComputeRootSignature(gameRoot);
+    Check(ListStateCapture(pooled, &s) && s.heapCount == 1 && s.heaps[0] == gameHeap && s.computeRoot == gameRoot,
+          "list state: a list reset since the watch began is known at its first pass");
+
+    // A list born where a followed one died carries no mark until its own Reset, while its slot still holds the dead
+    // list's state, which must not be taken for its own. Such a list is this one with its mark taken away (where the
+    // heap hands an address out again cannot be counted on).
+    const GUID seen = { 0x6b616e61, 0x6e61, 0x4c69, { 0x73, 0x74, 0x53, 0x74, 0x61, 0x74, 0x65, 0x21 } }; // kSeen
+    Must(pooled->SetPrivateData(seen, 0, nullptr), "SetPrivateData");                                     // removes it
+    Check(!ListStateCapture(pooled, &s), "list state: a list whose slot is known but which carries no mark is unknown");
+    Must(pooled->Close(), "Close");
+    Must(pooled->Reset(poolAllocator, nullptr), "Reset");
+    Check(ListStateCapture(pooled, &s) && Empty(s, nullptr), "list state: and known after its own Reset");
+    pooled->Close();
+    pooled->Release();
+    poolAllocator->Release();
 
     // Each list with a table of its own is followed: its table is taken when it first comes, its Reset goes
     // through us, and what it binds after is known.
