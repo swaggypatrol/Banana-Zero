@@ -211,6 +211,42 @@ void PutLine(Out* out, const Key& key, const char* eol, const char* comment, siz
     }
     Put(out, eol, strlen(eol));
 }
+
+// Moves `from` over `to`. A rename with POSIX semantics first (Windows 10 1709 on, NTFS): it replaces a file that
+// someone else has open, as long as they let it be deleted, as our reload thread, most editors and virus scanners do;
+// MoveFileExW refuses that with error 5, which looks like "no permission" in the log. Where the file system has no
+// such rename (FAT, exFAT, some network shares), MoveFileExW. False with the Win32 error in *error.
+bool Replace(const wchar_t* from, const wchar_t* to, unsigned long* error)
+{
+    const size_t length = wcslen(to);
+    const HANDLE file = length < MAX_PATH ? CreateFileW(from, DELETE | SYNCHRONIZE,
+                                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                                        OPEN_EXISTING, 0, nullptr)
+                                          : INVALID_HANDLE_VALUE;
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        alignas(FILE_RENAME_INFO) unsigned char buffer[sizeof(FILE_RENAME_INFO) + MAX_PATH * sizeof(wchar_t)] = {};
+        FILE_RENAME_INFO* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer);
+        info->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        info->FileNameLength = DWORD(length * sizeof(wchar_t));
+        memcpy(info->FileName, to, length * sizeof(wchar_t));
+        const bool renamed = SetFileInformationByHandle(file, FileRenameInfoEx, info, sizeof buffer) != FALSE;
+        const DWORD failure = renamed ? 0 : GetLastError();
+        CloseHandle(file);
+        if (renamed)
+            return true;
+        // A file system without the POSIX rename says so with one of these; anything else is the answer.
+        if (failure != ERROR_INVALID_PARAMETER && failure != ERROR_NOT_SUPPORTED && failure != ERROR_INVALID_FUNCTION)
+        {
+            *error = failure;
+            return false;
+        }
+    }
+    if (MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return true;
+    *error = GetLastError();
+    return false;
+}
 } // namespace
 
 char* SettingsMergeIni(const char* text, const Settings& settings, size_t* length)
@@ -295,12 +331,18 @@ char* SettingsMergeIni(const char* text, const Settings& settings, size_t* lengt
     return out.text;
 }
 
-bool SettingsWriteIni(const wchar_t* path, const Settings& settings, unsigned long* error)
+bool SettingsWriteIni(const wchar_t* path, const Settings& settings, unsigned long* error, const wchar_t* from,
+                      const char** step)
 {
     *error = 0;
+    const char* unused = nullptr;
+    if (step == nullptr)
+        step = &unused;
+    *step = "at the read";
     char* text = nullptr;
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                              OPEN_EXISTING, 0, nullptr);
+    HANDLE file = CreateFileW(from != nullptr ? from : path, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                              nullptr);
     if (file != INVALID_HANDLE_VALUE)
     {
         LARGE_INTEGER size = {};
@@ -329,6 +371,7 @@ bool SettingsWriteIni(const wchar_t* path, const Settings& settings, unsigned lo
         return false;
     }
 
+    *step = "at the write";
     size_t length = 0;
     char* merged = SettingsMergeIni(text, settings, &length);
     delete[] text;
@@ -366,12 +409,12 @@ bool SettingsWriteIni(const wchar_t* path, const Settings& settings, unsigned lo
         DeleteFileW(temporary);
         return false;
     }
-    // The replace fails while someone has the file open (the reload thread reading it, an editor): a few more tries.
+    // The replace fails while someone has the file open and will not let it be deleted (error 32): a few more tries.
+    *step = "at the replace";
     for (unsigned attempt = 0;; ++attempt)
     {
-        if (MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        if (Replace(temporary, path, error))
             return true;
-        *error = GetLastError();
         if (attempt == 10)
             break;
         Sleep(20);

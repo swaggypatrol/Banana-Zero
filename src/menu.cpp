@@ -4,6 +4,8 @@
 
 #include <windows.h>
 
+#include <atomic>
+
 #include "freeze.h"
 #include "log.h"
 #include "menu_model.h"
@@ -27,17 +29,38 @@ HANDLE g_writeEvent = nullptr;
 HANDLE g_writeThread = nullptr;
 Settings g_writePending;
 bool g_writeWanted = false;
+// The file that was read could not be written, so the menu writes its own copy (settings.h, SettingsUserPath) for
+// the rest of the session: the file that was read, with the menu's keys merged in. Being the newer of the two, the
+// copy is what the next start reads.
+std::atomic<bool> g_toCopy { false };
 
 void WriteNow(const Settings& s)
 {
+    const wchar_t* path = SettingsPath();
     unsigned long error = 0;
-    if (SettingsWriteIni(SettingsPath(), s, &error))
+    const char* step = "";
+    if (!g_toCopy.load(std::memory_order_relaxed))
     {
-        SettingsNoteWritten();
-        Log("menu: wrote %ls", SettingsPath());
+        if (SettingsWriteIni(path, s, &error, nullptr, &step))
+        {
+            SettingsNoteWritten();
+            Log("menu: wrote %ls", path);
+            return;
+        }
+        Log("menu: could not write %ls (error %lu %s)", path, error, step);
+    }
+    wchar_t copy[MAX_PATH];
+    if (!SettingsUserPath(copy, MAX_PATH, true) || _wcsicmp(copy, path) == 0)
+        return; // no copy to be had, or the copy is the file that failed: said above
+    if (SettingsWriteIni(copy, s, &error, path, &step))
+    {
+        if (!g_toCopy.exchange(true, std::memory_order_relaxed))
+            Log("menu: wrote %ls instead; the next start reads it, being the newer", copy);
+        else
+            Log("menu: wrote %ls", copy);
     }
     else
-        Log("menu: could not write %ls (error %lu)", SettingsPath(), error);
+        Log("menu: could not write %ls either (error %lu %s)", copy, error, step);
 }
 
 DWORD WINAPI Writer(void*)
