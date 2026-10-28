@@ -22,7 +22,8 @@ The release zip ([Releases](https://github.com/swaggypatrol/Banana-Zero/releases
 | `banana.nvngx.dll` | The crossover. A tiny bridge the NR model is called through (more on why [below](#how-it-works)) |
 | `README.md`, `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt` | The paperwork. Please read the paperwork |
 
-**Not in the box:** `nvngx_dlssnr.dll`, the NR model itself (about 165 MB; its file properties say "NVIDIA DLSSNR").
+**Not in the box:** `nvngx_dlssnr.dll`, the NR model itself (about 166 MB for 310.8.0.0 or 266 MB for 310.9.16.0;
+its file properties say "NVIDIA DLSSNR"). Supply the version you want to use; you do not need both.
 It is NVIDIA's and not ours to hand out, so you bring your own, the way you bring your own room to a speaker.
 
 ## Specifications
@@ -33,7 +34,8 @@ It is NVIDIA's and not ours to hand out, so you bring your own, the way you brin
 | API | DirectX 12 |
 | Game must have | DLSS Super Resolution or Ray Reconstruction switched on |
 | Model | `nvngx_dlssnr.dll`, supplied by you |
-| Tested on | RTX 5090, driver 32.0.16.1742, Windows 11, model file 310.8 |
+| Game tests | RTX 5090, driver 32.0.16.1742, Windows 11, model file 310.8 |
+| New-model standalone tests | RTX 5090, driver 621.01, model 310.9.16.0, presets 1 and 2; see [compatibility notes](docs/DLSSNR_COMPATIBILITY.md) |
 | Frequency response | One frame in, the same frame out |
 | Crossover point | Right after DLSS, before tone mapping, the HUD and frame generation |
 | Distortion | Each pixel moves at most 1 EV brighter or darker by default. Hard limit, not a suggestion |
@@ -112,7 +114,8 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
   the game runs), it saves a copy in `%LOCALAPPDATA%\Banana-Zero` instead, and from the next start on that copy is
   the file to edit (see [dlssnr.ini](#dlssnrini)).
 - The status line at the top reads like `3840x2160 RR HDR  frames N  failed N  model builds N`: resolution, which DLSS
-  the game uses, HDR or not, frames processed, failures, and how many times the model was built.
+  the game uses, HDR or not, frames processed, failures, and how many times the model was built. A second line shows
+  the model DLL version and the requested/active preset from its known version profile, including pending switches.
 
 ### The top row
 
@@ -132,9 +135,14 @@ Three knobs. For most people, three knobs is plenty.
 | **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness. In The Witcher 3 the model cools the whole picture whenever there is a lot of sky in view, so the colours drift as you look around; 0 stops that |
 | **Style** | Standard, Natural, Cinematic | The model's three built-in styles. NVIDIA has not documented what they do, so audition them. Takes effect on the next frame |
 
-**Advanced (rarely needed)** is folded away below, on purpose.
+### Model: weights, masks and strengths
 
-*Model.* The model's own knobs. NVIDIA has not documented any of them. What they feed and where comes from taking the
+Open **Model** directly in the tab bar; these controls are not hidden inside Advanced. You only need the two
+Banana-Zero DLLs alongside your existing model DLL: no supplied or hand-edited INI is needed. Menu changes apply
+automatically and create/update the settings file after a short idle or when the menu closes. **Reset model controls**
+restores the model parameters (including Style), while leaving HDR/composite settings and keys alone.
+
+The model's own knobs. NVIDIA has not documented any of them. What they feed and where comes from taking the
 model's DLL apart; what they look like is our best guess from their names. Each one takes effect on the next frame,
 so you see it while you drag. Style, Local structure, Local tone, Auto mask and Skin structure also restart the
 model's memory of earlier frames at every step, so the picture looks a touch rougher while you drag them and for a
@@ -145,8 +153,13 @@ frame or two after you let go.
 | **Model intensity** | 0 to 1 | Blends the model's result back towards its input, inside the model. Much the same job as Strength, which does it on the HDR frame and goes further, so leave this at 1 |
 | **Local structure** | 0 to 1.5 | Fine texture and small light-and-shade detail |
 | **Local tone** | 0 to 1.5 | Local contrast |
-| **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else. Greyed out while a sky slider (Depth page) is away from 1: handed our map of the picture, the model switches its own off |
+| **Model weights** | dropdown: DLL default, HT (1), CC Small FP8 (2) | Enabled for 310.9.16.0, and for later DLLs whose file still carries both weight resources (shown as unverified); 310.8 shows a disabled control with an explanation. Changing weights rebuilds the model after the existing 30-evaluation cooldown; the old model keeps running while a same-size switch waits. Choices that select the same weights (310.9.16.0: DLL default and CC Small FP8) do not rebuild. Right-click restores DLL default: preset 1 in 310.8, preset 2 in 310.9.16.0. Rebuilding may briefly use more VRAM; the existing 64-creation safety limit still applies |
+| **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else. Also on the Depth page, next to the sky sliders and **Combine**. With a sky slider in use it is disabled on 310.8; on 310.9.16.0 and later it stays usable unless Combine is set to \"Sky mask only\" |
 | **Skin structure** | follows local structure, or 0 to 1.5 | Texture on skin. Only does anything with Auto mask on (greyed out otherwise). Turn it down for less texture on faces |
+
+### Advanced image processing
+
+Back on **Tuning**, **Advanced (rarely needed)** holds HDR encode and composite controls.
 
 *HDR encode.* The Witcher 3 and TLOU2 hand DLSS linear HDR values with no upper limit, even with Windows in SDR mode
 (GTA V hands it linear HDR too), but the model expects a finished-looking picture. So Banana-Zero shows it a
@@ -187,6 +200,8 @@ you touch it, and Reset all puts both back.
 | **Sky local tone** | 0 to 1.5, default 1 | Local tone on the sky alone, as a multiple of Local tone. 1 is the same as the rest of the picture, 0.5 half as much, 0 none. Watch cloud contrast and smooth gradients |
 | **Sky local structure** | 0 to 1.5, default 1 | The same for Local structure: the fine texture in clouds. Turn it down if the sky looks grainy |
 | **Show what counts as sky** | Off, On | Purple stripes over what the sky sliders work on. Not saved |
+| **Auto mask (skin)**, **Skin structure** | as on the Model page | The same two settings as on the Model page, here because Combine goes by them |
+| **Combine** | Auto (default), Sky mask only, Average, Keep the lower, Keep the higher | 310.9.16.0 and later (DLLs with the `DLSSNR.MaskBlendMode` key). How Sky local structure and Auto mask's Skin structure work together while both are in use: both set a structure strength, and the model gets one. **Auto** picks for you from the sliders: anything turned down and nothing up, keep the lower (each lowered setting is kept exactly); anything up and nothing down, keep the higher; one up and one down, average (no choice keeps both, each gets half). A line under it says what is in use now and why, with the numbers. **Sky mask only** is the old rule: the sky mask turns Auto mask off. Only structure is combined; Sky local tone always applies. Without Auto mask or with both sky sliders at 1 there is nothing to combine. Taken from the DLL's GPU code and confirmed on an RTX 5090 (`nrprobe --mask-tests`) |
 
 The sky is whatever sits at the far end of the game's depth: the sky dome, and anything else the game never gave a
 depth. Indoors, unless a window shows the sky, there is none and the sky sliders have nothing to work on; Show what
@@ -195,7 +210,7 @@ picture too, by about a fifth as much.
 
 ### Speed (experimental)
 
-The model costs about 7 ms a frame at 4K on an RTX 5090, nearly all of it inside the model, and its time follows the
+The 310.8 model costs about 7 ms a frame at 4K on an RTX 5090, nearly all of it inside the model, and its time follows the
 number of pixels it looks at. This page trades some of its effect for some of that time. DLSS is not touched: the game
 renders and upscales exactly as before, and only the model's own copy of the frame gets smaller.
 
@@ -252,7 +267,8 @@ writes it for you; this is for people who like to open the back panel.
 | `LocalTone` | 0 to 2 | not set (1) | Local tone |
 | `SkinStructure` | 0 to 2, -1 follows local structure; only with `AutoMask = 1` | not set (-1) | Skin structure |
 | `AutoMask` | 1 / 0 | not set (0) | Auto mask |
-| `Preset` | integer | not set | file only; model 310.8 carries a single set of weights, so every number gives the same model |
+| `Preset` | 0 DLL default, 1 HT, 2 CC Small FP8 | not set (0) | Model weights; creation-only, so changing it rebuilds the feature (unless it selects the same weights). 310.8 always falls back to 1; 310.9.16.0 falls back to 2 for other numbers |
+| `MaskBlendMode` | `auto`, 0 to 3 | not set (Auto) | Combine (Depth page): not set or `auto` picks from the sliders; 0 sky mask only, 1 average, 2 keep the lower, 3 keep the higher. Not sent to DLLs without the key (310.8) |
 | `InputType` | `auto` / `linear` / `tonemapped` | `auto` | file only; `auto` follows the game's own HDR flag |
 | `WhiteSource` | `auto` / `exposure` / `scene` / `manual` | `auto` | White point from |
 | `WhiteEV` | -4 to +4 | 0 | White point (EV) |
@@ -323,6 +339,7 @@ file next to the game (that one is not picked up then, and the menu's next save 
 
 | Version | What changed |
 |---|---|
+| v0.1.7 | Model file 310.9.16.0 works, as well as 310.8. It carries a second set of weights, CC Small FP8, and uses it unless told otherwise: the new **Model** page picks DLL default, HT (the weights 310.8 has) or CC Small FP8, and `Preset = 1` brings back HT. A change of weights rebuilds the model, and only when the weights really change. The new model can use the sky sliders and Auto mask together: on the Depth page, **Sky + Auto mask** has Auto mask, Skin structure and **Combine**, which on Auto picks how the two masks work together from the sliders and says what it picked and why. A later model file is recognised by what it carries, not only by its version number. Slider values are saved exactly (1.0625 used to come back as 1.062). 310.9.16.0 has been tested on an RTX 5090 outside games (both weight sets, every mask combination, Model input size down to 33.3%), not yet in games. With model 310.8 the picture is the same as v0.1.6 |
 | v0.1.6 | Grand Theft Auto V Enhanced works. The mouse works in the game after the menu closes: the menu's mouse no longer goes through Dear ImGui's Win32 backend, which took and released the mouse capture on GTA V's window at a click in the menu (v0.1.3 did at every click; v0.1.5 still could before the first raw mouse data). A key or mouse button held as the menu opens keeps its device the game's until it is let go, ten seconds at most. NR no longer skips a frame at each command list's first pass: GTA V records DLSS on many different command lists, so v0.1.5 skipped 1,001 of 19,707 frames there, most of them in the first minute and then one every few seconds, seen as walls and pale surfaces flashing brighter; v0.1.6 skipped 2 of 33,960, both before NR had run once. When the menu cannot replace `dlssnr.ini` next to the game (in GTA V something holds it open while the game runs), it saves a copy in `%LOCALAPPDATA%\Banana-Zero`, and the newer of the two is read at the next start. The log says much more while Banana-Zero is being developed: why NR skipped a frame and why Banana-Zero restarted the model's memory (the first 20 times for each reason, then the 32nd, 64th and so on), a line every 10 seconds that counts them all, and `StatsLog` on by default. The picture is the same as v0.1.5 wherever NR ran before |
 | v0.1.5 | NR runs on every frame in games whose command lists each carry a function table of their own: in Gears of War E-Day v0.1.4 ran it on about 2.5% of the frames, v0.1.5 on 99.8%. The menu reads the mouse (and, where it has to, the keyboard) from raw input on a thread of its own, so it works in games whose window messages no hook sees, and while it is open Windows makes no mouse messages for the game, so a click in the menu is not also a click in the game. The picture is the same as v0.1.4 wherever NR ran before |
 | v0.1.4 | Resident Evil Requiem works, with [REFramework](#re-engine-games-and-reframework). The NR pass now puts back what the game had bound on its command list (some games, RE Engine among them, rely on it surviving the DLSS call, and crashed), and the menu opens, works and closes alongside REFramework's own hooks. `dlssnr.ini` is read next to the game's `.exe` first. The menu reads its input without touching the game's window procedure. The picture is the same as v0.1.3 |
@@ -378,7 +395,8 @@ and a periodic report.
 
 ### Tests
 
-Run these from the repository root after a build. The exit code is the number of failures, so 0 means pass.
+Run these from the repository root after a build. Exit code 0 means pass; a nonzero code means failure.
+`menutest --no-input` skips the two device-input suites, for testing settings and the panel without sending keyboard or mouse events.
 
 | Program | Needs | Checks |
 |---|---|---|
@@ -386,7 +404,10 @@ Run these from the repository root after a build. The exit code is the number of
 | `build\Release\ngxtest.exe` | nothing special | The five hooks against a fake NGX runtime and the bridge against a fake model |
 | `build\Release\menutest.exe` | nothing special | Draws the panel with no GPU, drags sliders with fake mouse events, checks that every step of a drag applies at once, right-click reset and the ini write-back. Then the menu's input on a hidden window with a message loop of its own: the hook, the raw input going to a thread of ours with the mouse's window messages off, and the game's own registration put back. Then a game that registers its raw input as GTA V does (no window, no flags), its window holding the mouse capture: a click in the menu leaves the capture alone and asks the game's window for no `WM_MOUSELEAVE`, a key held at the open keeps the keyboard the game's until it is let go, and a wheel notch in every frame is taken in that frame, every frame ending at the menu's own pointer. Then the menu's own copy when a file cannot be replaced (a read-only one), with `%LOCALAPPDATA%` pointed at the test's own folder under `%TEMP%`. It sends F24 and a one-count mouse move and back with `SendInput`, which leave your keyboard and cursor as they were |
 | `build\Release\shadertest.exe` | any D3D12 GPU | Runs the shaders on synthetic frames and compares them with the same maths on the CPU, and checks that the game's compute state is followed and put back after the NR pass, also on lists with function tables of their own, and that a list made or reset after Banana-Zero began following lists is known at its first pass |
-| `build\Release\nrprobe.exe [--model <path>]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll` |
+| `build\Release\modeltest.exe [old-dll new-dll]` | no GPU | Checks typed parameters, sticky-default resets, profiles and rebuild decisions. Optional fixtures are inspected as file version resources, not executed |
+| `build\Release\nrprobe.exe [--model <path>] [--preset N] [--mask-blend N]` | RTX 50 + `nvngx_dlssnr.dll` | Creates and evaluates the real model on the real GPU, then tears down in the same order as `dxgi.dll`. Every auxiliary feature uses the selected preset too |
+| `build\Release\nrprobe.exe --model <path> --preset N --mask-tests` | the same; a DLL with MaskBlendMode | Runs all 16 combinations of blend mode, AutoMask and external mask (finite output each), then checks the modes' behaviour: 1 to 3 equal 0 without Auto mask or without an external mask, differ from 0 with both, and min differs from max |
+| `build\Release\nrprobe.exe --model <path> --preset N --preset-tests` | the same; a DLL with two weight sets | Creates a feature per preset request 0, 1 and 2 and checks that requests selecting the same weights give the same picture and the others do not, so the creation key demonstrably reaches the model |
 | `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along moving edges and thin bars, whether a control mask sets it per pixel, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
 | `build\Release\nrprobe.exe --subrects` | the same | Runs the model on smaller pictures inside a feature made for the full one, as Model input size does: that the result matches a feature made at the smaller size, that nothing outside the smaller picture is written, how long each size takes, and which motion-vector scale it wants then |
 
@@ -421,6 +442,7 @@ Every build compares the new `dxgi.dll` with the local `System32\dxgi.dll` and w
 | `src/main.cpp` | `DllMain`: loads the real `dxgi.dll`, fills the forwarding table |
 | `src/ngx_hook.*` | The five NGX hooks |
 | `src/nr_dx12.*`, `src/nr_frame.h` | The NR pass: bridge, model, parameters, build and rebuild, encode, model, composite |
+| `src/model_config.*` | Known DLL version profiles, typed creation/evaluation keys, preset rebuild decisions |
 | `src/nr.hlsl`, `src/nr_stats.hlsl`, `src/nr_common.hlsli`, `src/nr_shared.h` | The compute shaders and the maths they share |
 | `src/settings*` | `dlssnr.ini`: reading, hot reload, the menu's write-back and its own copy |
 | `src/menu*`, `src/overlay_dx12.*`, `src/keys.*`, `src/freeze.*` | The menu, drawn with Dear ImGui on the game's swap chain |

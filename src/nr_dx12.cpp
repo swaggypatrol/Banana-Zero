@@ -599,6 +599,10 @@ struct Nr
     wchar_t dataPath[MAX_PATH] = {};  // what the model's Init_Ext accepted
     ID3D12Device* device = nullptr;
     Bridge bridge;
+    ModelCapabilities model;
+    unsigned requestedPreset = 0;
+    unsigned createdPreset = 0;
+    int blendLogged = -1; // the MaskBlendMode last sent, for one log line per change
     NVSDK_NGX_Parameter* createParams = nullptr;
     NVSDK_NGX_Parameter* evalParams = nullptr;
     NVSDK_NGX_Parameter* capability = nullptr; // the core's, for the fallbacks; never destroyed
@@ -949,7 +953,18 @@ bool LoadModel()
         Log("NR: the model %ls lacks entry points (mask 0x%X of 0x3F)", path, unsigned(found));
         return false;
     }
-    Log("NR: model %ls, its six D3D12 entry points found", path);
+    g_nr.model = ModelInspectFile(path);
+    const ModelCapabilities& caps = g_nr.model;
+    Log("NR: model %ls, version %u.%u.%u.%u, its six D3D12 entry points found; %s", path,
+        caps.major, caps.minor, caps.build, caps.revision,
+        caps.KnownMulti() ? "known 310.9.16.0: presets 1 HT / 2 CC Small FP8, DLL default 2, MaskBlendMode 0..3"
+        : caps.Legacy()   ? "known 310.8.0.0: preset 1 HT, DLL default 1, legacy mask behavior"
+                          : "unknown version: DLL defaults; controls only from what its content shows");
+    if (!caps.Known())
+        Log("NR: model content%s: WEIGHTS_HT %s, WEIGHTS_CC_SMALL_FP8 %s, DLSSNR.MaskBlendMode %s -> preset choice %s, "
+            "blend mode %s (unverified profile)", caps.probed ? "" : " could not be inspected",
+            caps.weightsHt ? "yes" : "no", caps.weightsCcSmall ? "yes" : "no", caps.maskBlendKey ? "yes" : "no",
+            caps.MultiPreset() ? "on" : "off", caps.MaskBlend() ? "on" : "off");
     return true;
 }
 
@@ -1386,33 +1401,6 @@ bool EnsureGuide(Texture* texture, DXGI_FORMAT format, unsigned width, unsigned 
     return true;
 }
 
-// The creation keys. Of the model's own parameters it reads only Preset when it creates the feature (the rest at
-// every evaluation: FillTunables); Preset is written when the user set it, and a key once written stays in the block.
-void FillCreate(NVSDK_NGX_Parameter* params, unsigned width, unsigned height, const ModelSettings& m)
-{
-    params->Set("DLSSNR.Enabled", 1u);
-    params->Set("DLSSNR.Width", width);
-    params->Set("DLSSNR.Height", height);
-    params->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
-    params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-    if (m.preset.set)
-        params->Set("DLSSNR.Hint.Render.Preset", m.preset.value);
-}
-
-// The model's own parameters, which it reads at every evaluation, so a change shows from the next frame (a change of
-// Style, the two local strengths, skin structure or the auto mask also restarts the model's history). A key once
-// written stays in the block, so one the user has not set is written as the model's default, which is also what the
-// model takes for a key that is absent. Each with the type the model reads it as.
-void FillTunables(NVSDK_NGX_Parameter* p, const ModelSettings& m)
-{
-    p->Set("DLSSNR.Intensity", m.intensity.set ? m.intensity.value : 1.0f);
-    p->Set("DLSSNR.Style", m.style.set ? m.style.value : 0u);
-    p->Set("DLSSNR.LocalStructureStrength", m.localStructure.set ? m.localStructure.value : 1.0f);
-    p->Set("DLSSNR.LocalToneStrength", m.localTone.set ? m.localTone.value : 1.0f);
-    p->Set("DLSSNR.SkinStructureStrength", m.skinStructure.set ? m.skinStructure.value : -1.0f);
-    p->Set("DLSSNR.UseAutoMask", m.autoMask.set && m.autoMask.value != 0 ? 1 : 0);
-}
-
 void DescribeFrame(const Frame& f)
 {
     char output[32], depth[32], motion[32], exposure[96], render[48], preExposure[32];
@@ -1482,16 +1470,17 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Frame& f, const ModelS
     }
 
     ++g_nr.creates;
-    FillCreate(g_nr.createParams, f.width, f.height, model);
+    ModelFillCreate(g_nr.createParams, f.width, f.height, model);
     void* handle = nullptr;
     int result = g_nr.bridge.create(list, kFeatureNR, g_nr.createParams, &handle);
     Log("NR: CreateFeature(18, %ux%u, %s) -> 0x%08X %s, handle %p, creation %u", f.width, f.height,
         g_nr.ownBlocks ? "own block" : "capability block", unsigned(result), ResultName(result), handle, g_nr.creates);
-    if (result != NVSDK_NGX_Result_Success && g_nr.ownBlocks && g_nr.capability != nullptr)
+    if (result != NVSDK_NGX_Result_Success && g_nr.ownBlocks && g_nr.capability != nullptr &&
+        g_nr.creates < kMaxCreates)
     {
         // The fallback: the model may want the block it populated the callbacks into to be the core's own.
         const int populated = g_nr.bridge.populate(g_nr.capability);
-        FillCreate(g_nr.capability, f.width, f.height, model);
+        ModelFillCreate(g_nr.capability, f.width, f.height, model);
         handle = nullptr;
         ++g_nr.creates;
         result = g_nr.bridge.create(list, kFeatureNR, g_nr.capability, &handle);
@@ -1515,6 +1504,11 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Frame& f, const ModelS
     g_nr.handle = handle;
     g_nr.createdWidth = f.width;
     g_nr.createdHeight = f.height;
+    g_nr.createdPreset = ModelRequestedPreset(model);
+    Log("NR: created model version %u.%u.%u.%u, preset request %u, resolved %u%s",
+        g_nr.model.major, g_nr.model.minor, g_nr.model.build, g_nr.model.revision,
+        g_nr.createdPreset, g_nr.model.ResolvePreset(g_nr.createdPreset),
+        g_nr.model.Known() ? " (known version profile)" : " (unknown; model decides)");
     g_nr.createdAt = g_nr.evaluatesSeen;
     NoteReset(kResetFeature);
     return true;
@@ -2541,7 +2535,18 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     FillEvaluate(g_nr.evalParams, f, modelWidth, modelHeight, depth, depthBaseX, depthBaseY, motion, motionBaseX,
                  motionBaseY, reset);
     FillMask(g_nr.evalParams, sky ? &g_nr.mask : nullptr);
-    FillTunables(g_nr.evalParams, s.model);
+    const ModelSkyMask skyMask { sky, s.skyStructure };
+    ModelFillTunables(g_nr.evalParams, g_nr.model, s.model, skyMask);
+    if (g_nr.model.MaskBlend())
+    {
+        const ModelBlendChoice blend = ModelMaskBlendResolve(g_nr.model, s.model, skyMask);
+        if (blend.mode != g_nr.blendLogged)
+        {
+            g_nr.blendLogged = blend.mode;
+            Log("NR: MaskBlendMode %d (%s), %s", blend.mode, ModelBlendName(blend.mode),
+                blend.why == ModelBlendWhy::Manual ? "set by hand" : "Auto from the sky and skin sliders");
+        }
+    }
     if (timing)
         list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 1);
     const int result = g_nr.bridge.evaluate(list, g_nr.handle, g_nr.evalParams, nullptr);
@@ -3049,6 +3054,11 @@ void PublishStatus()
     g_status.ready = g_nr.ready;
     g_status.haveFeature = g_nr.handle != nullptr;
     g_status.creates = g_nr.creates;
+    g_status.model = g_nr.model;
+    g_status.requestedPreset = g_nr.requestedPreset;
+    g_status.activePreset = g_nr.handle ? g_nr.model.ResolvePreset(g_nr.createdPreset) : 0;
+    g_status.presetPending = g_nr.handle && ModelPresetKey(g_nr.model, g_nr.createdPreset) !=
+                                                ModelPresetKey(g_nr.model, g_nr.requestedPreset);
     g_status.frames = g_nr.frames.load(std::memory_order_relaxed);
     g_status.failed = g_nr.failed.load(std::memory_order_relaxed);
     g_status.evaluatesSeen = g_nr.evaluatesSeen;
@@ -3080,6 +3090,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
         StartWorker(); // after the first load: from here on only that thread reads the file
     }
     const Settings* s = SettingsCurrent(); // one snapshot for the whole frame
+    g_nr.requestedPreset = ModelRequestedPreset(s->model);
     // The preview lives only while the menu asks for it: closing the menu frees the picture.
     const bool previewing = PreviewWanted(*s);
     if (g_nr.preview.resource != nullptr && !previewing)
@@ -3148,13 +3159,22 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     ReleaseParked();
     CollectStats(previewing);
     CollectDump();
-    if (g_nr.handle != nullptr && (frame.width != g_nr.createdWidth || frame.height != g_nr.createdHeight))
+    const ModelCreationKey active { g_nr.createdWidth, g_nr.createdHeight,
+                                    ModelPresetKey(g_nr.model, g_nr.createdPreset) };
+    const ModelCreationKey requested = ModelCreateKey(g_nr.model, frame.width, frame.height, s->model);
+    if (g_nr.handle != nullptr)
     {
-        if (g_nr.evaluatesSeen - g_nr.createdAt < kEvaluatesBetweenCreates)
+        const ModelRebuild plan = ModelPlanRebuild(active, requested, g_nr.evaluatesSeen - g_nr.createdAt,
+                                                   kEvaluatesBetweenCreates);
+        if (plan == ModelRebuild::WaitForGeometry)
             return kSkipWaiting;
-        Log("NR: the frame is now %ux%u (was %ux%u); rebuilding", frame.width, frame.height, g_nr.createdWidth,
-            g_nr.createdHeight);
-        ParkCurrent();
+        if (plan == ModelRebuild::Recreate)
+        {
+            Log("NR: rebuilding %ux%u preset request %u -> %ux%u preset request %u", g_nr.createdWidth,
+                g_nr.createdHeight, g_nr.createdPreset, frame.width, frame.height, g_nr.requestedPreset);
+            ParkCurrent(); // keep old handles/textures alive for command lists in flight
+        }
+        // Keep includes a preset-only request waiting for the throttle: continue rendering with the old feature.
     }
     if (g_nr.handle == nullptr)
     {

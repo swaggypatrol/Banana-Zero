@@ -264,6 +264,7 @@ void TestWrite()
     full.model.style = { true, 2 };
     full.model.skinStructure = { true, -1.0f };
     full.model.autoMask = { true, 0 };
+    full.model.maskBlendMode = { true, 3 };
     full.inputType = InputType::LinearHdr;
     full.whiteSource = WhiteSource::Manual;
     full.shoulder = 0.85f;
@@ -341,6 +342,41 @@ void TestWrite()
 
 // ModelScale's steps: a third, each whole percent from 34, two thirds in place of 67; anything else goes to the
 // nearest, the file's value too.
+void TestMaskSettings()
+{
+    WriteAll(g_ini, "Style=1\r\nStyle=99\r\nMaskBlendMode=3\r\nMaskBlendMode=4\r\nStatsLog=0\r\n");
+    const Settings* loaded = SettingsLoad(g_ini);
+    Check(loaded->model.style.set && loaded->model.style.value == 1,
+          "parse: invalid Style does not leak into the published snapshot");
+    Check(loaded->model.maskBlendMode.set && loaded->model.maskBlendMode.value == 3,
+          "parse: invalid MaskBlendMode preserves the previous valid value");
+    WriteAll(g_ini, "MaskBlendMode=-1\r\n");
+    Check(!SettingsLoad(g_ini)->model.maskBlendMode.set, "parse: negative mask mode is rejected");
+    WriteAll(g_ini, "MaskBlendMode=0\r\n");
+    loaded = SettingsLoad(g_ini);
+    Check(loaded->model.maskBlendMode.set && loaded->model.maskBlendMode.value == 0,
+          "parse: explicit legacy mode 0 is retained");
+    WriteAll(g_ini, "MaskBlendMode=2\r\nMaskBlendMode=Auto\r\n");
+    Check(!SettingsLoad(g_ini)->model.maskBlendMode.set, "parse: MaskBlendMode = auto means not set (Auto)");
+    Settings before, after;
+    after.model.maskBlendMode = { true, 2 };
+    char diff[512];
+    Check(SettingsDiff(before, after, diff, sizeof diff) != 0 && strstr(diff, "MaskBlendMode") != nullptr,
+          "diff: a mask-only edit is seen by the menu model");
+    size_t length = 0;
+    char* merged = SettingsMergeIni("MaskBlendMode=3\r\n", before, &length);
+    Check(merged && !strstr(merged, "MaskBlendMode"), "write: restoring default removes a retained mask-mode line");
+    delete[] merged;
+    for (float value : { 1.0625f, 1.3125f, 1.2345678f })
+    {
+        Settings s;
+        s.model.skinStructure = { true, value };
+        unsigned long error = 0;
+        Check(SettingsWriteIni(g_ini, s, &error) && SettingsLoad(g_ini)->model.skinStructure.value == value,
+              "write: a slider value %.9g survives saving and reloading exactly", double(value));
+    }
+}
+
 void TestModelScaleSteps()
 {
     struct Case
@@ -489,6 +525,16 @@ bool Click(const char* key, float atX = 0.5f, int button = 0)
     return true;
 }
 
+// Open a real combo popup and click the recorded selectable, rather than assigning the draft in the test.
+bool Choose(const char* key, unsigned index)
+{
+    if (!Click(key))
+        return false;
+    char option[64];
+    snprintf(option, sizeof option, "%s/option/%u", key, index);
+    return Click(option);
+}
+
 unsigned Generation() { return SettingsCurrent()->generation; }
 
 void TestPanel()
@@ -509,6 +555,7 @@ void TestPanel()
     g_fakeStatus.attempted = true;
     g_fakeStatus.haveFeature = true;
     g_fakeStatus.ready = true;
+    g_fakeStatus.model = { 310, 8, 0, 0 };
     g_fakeStatus.width = 3840;
     g_fakeStatus.height = 2160;
     g_fakeStatus.feature = 13;
@@ -523,8 +570,8 @@ void TestPanel()
     Frame();
     float x, y;
     Check(Centre("DetailStrength", &x, &y), "panel: the strength slider was drawn");
-    Check(!Centre("Intensity", &x, &y), "panel: the model's parameters wait under the advanced header");
-    Check(Click("Advanced"), "panel: open the advanced header");
+    Check(!Centre("Intensity", &x, &y), "panel: model parameters wait on the dedicated Model page");
+    Check(Click("TabModel"), "panel: open Model without unfolding Advanced");
     Check(Centre("Intensity", &x, &y), "panel: the Intensity slider was drawn");
     Check(Centre("Close", &x, &y), "panel: the close button was drawn");
     Check(Generation() == g0, "panel: drawing publishes nothing");
@@ -590,9 +637,9 @@ void TestPanel()
 
     // The card freezes; the freeze box unfreezes and takes the card with it. The card is on the compare page.
     Check(!FreezeWanted(), "panel: not frozen to begin with");
-    Check(!Centre("Card", &x, &y), "panel: the card is not there while the tuning page shows");
+    Check(!Centre("Card", &x, &y), "panel: the card is not there while the Model page shows");
     Check(Click("TabCompare"), "panel: open the compare page");
-    Check(!Centre("Intensity", &x, &y), "panel: the tuning page is hidden now");
+    Check(!Centre("Intensity", &x, &y), "panel: the Model page is hidden now");
     Check(Click("Card"), "panel: click the card");
     Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g1 + 5, "panel: the card freezes the frame");
     Check(Click("Freeze"), "panel: click the freeze box");
@@ -610,8 +657,8 @@ void TestPanel()
     Check(Click("Card") && !SettingsCurrent()->card && Generation() == g1 + 10, "panel: the card off again");
     Check(FreezeWanted(), "panel: the freeze made by hand stays");
     Check(Click("Freeze") && !FreezeWanted(), "panel: unfrozen by hand");
-    Check(Click("TabTune"), "panel: back to the tuning page");
-    Check(Centre("Intensity", &x, &y), "panel: the tuning page shows again");
+    Check(Click("TabModel"), "panel: back to the Model page");
+    Check(Centre("Intensity", &x, &y), "panel: the Model page shows again");
 
     // A choice commits at once and a reload behind the menu is followed.
     WriteAll(g_ini, "Enabled = 1\r\nIntensity = 0.3\r\nWhiteEV = 2\r\nStatsLog = 0\r\nDumpEvery = 0\r\n");
@@ -664,16 +711,16 @@ void TestPanel()
           "panel: the click publishes the value under the mouse at once (%.2f, generation %u)",
           double(SettingsCurrent()->skyStructure), Generation());
     Check(Click("ShowSky") && SettingsCurrent()->showSky && Generation() == g3 + 2, "panel: the sky's stripes on");
-    Check(Click("TabTune") && Centre("AutoMask", &x, &y), "panel: back on the tuning page, the auto mask is drawn");
+    Check(Click("TabModel") && Centre("AutoMask", &x, &y), "panel: back on Model, the auto mask is drawn");
     Check(Click("AutoMask", 0.5f, 1) && Generation() == g3 + 2,
           "panel: the auto mask takes no right-click while a sky slider is away from 1");
     Check(Click("TabDepth") && Click("SkyStructure", 0.5f, 1), "panel: right-click sky local structure");
     Check(Generation() == g3 + 3 && SettingsCurrent()->skyStructure == 1.0f, "panel: sky local structure back to 1");
-    Check(Click("TabTune") && Click("AutoMask", 0.5f, 1) && Generation() == g3 + 4,
+    Check(Click("TabModel") && Click("AutoMask", 0.5f, 1) && Generation() == g3 + 4,
           "panel: with both sky sliders at 1 the auto mask takes a right-click again");
     Check(Click("TabDepth") && Click("DilateMotion") && SettingsCurrent()->dilateMotion && Generation() == g3 + 5,
           "panel: dilate by depth on, published at once");
-    Check(Click("TabTune"), "panel: back to the tuning page");
+    Check(Click("TabModel"), "panel: back to the Model page");
 
     // The speed page: the model's input size is a slider like the others, under it the size the pass gives the model
     // and its time on the GPU, as the pass reports them.
@@ -787,7 +834,75 @@ void TestPanel()
     }
     g_fakeStatus.haveTiming = false;
     Frame();
-    Check(Click("TabTune"), "panel: back to the tuning page");
+    Check(Click("TabModel"), "panel: back to the Model page");
+
+    // New model controls: weights on the Model page; the sky + auto mask combination on the Depth page under the
+    // sky sliders. Auto (the default) and modes 1..3 permit the automatic mask with sky; mode 0 by hand keeps the
+    // legacy restriction.
+    g_fakeStatus.model = { 310, 9, 16, 0 };
+    Frame();
+    Check(Centre("Preset", &x, &y) && !Centre("MaskBlendMode", &x, &y),
+          "panel: the new profile shows model weights on the Model page, the mask combination elsewhere");
+    {
+        MenuLock();
+        auto& settings = MenuModelLocked().draft;
+        settings.skyStructure = 0.5f;
+        settings.model.autoMask = { true, 1 };
+        settings.model.maskBlendMode = { true, 1 };
+        settings.model.preset = { true, 1 };
+        MenuCommitLocked("test");
+        MenuUnlock();
+    }
+    Frame();
+    unsigned modesGeneration = Generation();
+    Check(Click("SkinStructure", 0.8f) && Generation() == modesGeneration + 1,
+          "panel: new nonzero blend mode permits skin structure with a sky mask");
+    Check(Click("Preset", 0.5f, 1) && !SettingsCurrent()->model.preset.set,
+          "panel: preset right-click restores DLL default");
+    Check(Click("TabDepth") && Centre("MaskBlendMode", &x, &y) && Centre("AutoMask", &x, &y),
+          "panel: the Depth page has the mask combination and the auto mask under the sky sliders");
+    Check(Click("MaskBlendMode", 0.5f, 1) && !SettingsCurrent()->model.maskBlendMode.set,
+          "panel: mask combination right-click restores Auto");
+    modesGeneration = Generation();
+    Check(Click("AutoMask", 0.5f, 1) && Generation() == modesGeneration + 1 && !SettingsCurrent()->model.autoMask.set,
+          "panel: with Auto the auto mask stays usable while a sky slider is away from 1");
+    Check(Choose("AutoMask", 1) && SettingsCurrent()->model.autoMask.value == 1, "panel: auto mask on from the Depth page");
+    modesGeneration = Generation();
+    Check(Click("SkinStructure", 0.3f) && Generation() == modesGeneration + 1 &&
+              SettingsCurrent()->model.skinStructure.set,
+          "panel: the Depth page's skin structure slider applies next to the sky sliders");
+    Check(Choose("MaskBlendMode", 1) && SettingsCurrent()->model.maskBlendMode.set &&
+              SettingsCurrent()->model.maskBlendMode.value == 0,
+          "panel: \"Sky mask only\" chosen by hand is MaskBlendMode 0");
+    modesGeneration = Generation();
+    Check(Click("AutoMask", 0.5f, 1) && Generation() == modesGeneration,
+          "panel: mode 0 by hand still disables automatic mask with a sky mask");
+    Check(Choose("MaskBlendMode", 0) && !SettingsCurrent()->model.maskBlendMode.set,
+          "panel: choosing Auto in the dropdown clears the setting");
+    Check(Click("TabModel"), "panel: back to the Model page after the Depth page");
+    {
+        MenuLock();
+        auto& settings = MenuModelLocked().draft;
+        settings.model.maskBlendMode = { true, 2 };
+        MenuCommitLocked("test");
+        MenuUnlock();
+    }
+    g_fakeStatus.model = { 310, 8, 0, 0 };
+    Frame();
+    modesGeneration = Generation();
+    Check(Click("AutoMask", 0.5f, 1) && Generation() == modesGeneration,
+          "panel: a saved nonzero blend mode cannot unlock legacy DLL behavior");
+    {
+        MenuLock();
+        auto& settings = MenuModelLocked().draft;
+        settings.skyStructure = 1.0f;
+        settings.model.autoMask = {};
+        settings.model.skinStructure = {};
+        settings.model.maskBlendMode = {};
+        MenuCommitLocked("test");
+        MenuUnlock();
+    }
+    Frame();
 
     // Closing writes the file at once.
     {
@@ -807,6 +922,85 @@ void TestPanel()
     Check(FileHas("ModelScale = 33.33", 0.0), "panel: ModelScale written");
 
     ImGui::DestroyContext();
+}
+
+// The normal two-tool-DLL workflow: start without any INI, use actual menus, auto-create/save and read back.
+void TestModelPageFirstRun()
+{
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%sfirst-run.ini", g_directory);
+    Check(!Exists(path), "first run: no pre-supplied INI");
+    SettingsLoad(path); // defaults, as in a game with only the DLLs copied in
+    MenuOnEvaluate(nullptr);
+    g_fakeStatus.model = { 310, 9, 16, 0 };
+    g_fakeStatus.ready = true;
+    g_fakeStatus.attempted = true;
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1920.0f, 1200.0f);
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    io.IniFilename = nullptr;
+    io.Fonts->AddFontDefault();
+    MenuSetOpen(true);
+    Frame();
+    Frame();
+    Check(Click("TabModel"), "first run: Model tab is directly accessible");
+    float x, y;
+    Check(Centre("Preset", &x, &y) && Centre("ModelDefaults", &x, &y),
+          "first run: weights and reset button are visible without Advanced");
+    Check(Choose("Preset", 1) && SettingsCurrent()->model.preset.set && SettingsCurrent()->model.preset.value == 1,
+          "first run: actual weights dropdown selects HT and publishes it");
+    Check(Choose("AutoMask", 1) && SettingsCurrent()->model.autoMask.value == 1,
+          "first run: actual automatic-mask dropdown enables it");
+    Check(Click("TabDepth") && Choose("MaskBlendMode", 3) && SettingsCurrent()->model.maskBlendMode.value == 2,
+          "first run: the Depth page's combination dropdown selects Keep the lower (mode 2) and publishes it");
+    Check(Click("TabModel"), "first run: back to the Model page");
+    Check(Click("SkinStructure", 0.7f) && SettingsCurrent()->model.skinStructure.set,
+          "first run: the skin slider applies with automatic mask enabled");
+    Check(Click("LocalTone", 0.25f) && SettingsCurrent()->model.localTone.set,
+          "first run: the model strength slider applies without an INI");
+    const ModelSettings saved = SettingsCurrent()->model;
+    Sleep(1100);
+    MenuOnEvaluate(nullptr);
+    Check(FileHasAt(path, "Preset = 1", 5.0) && FileHasAt(path, "MaskBlendMode = 2", 0.0) &&
+              FileHasAt(path, "AutoMask = 1", 0.0),
+          "first run: idle auto-save creates the missing INI from menu choices");
+    MenuSetOpen(false);
+    Check(SettingsLoad(path)->model == saved, "first run: reloading the generated INI restores all model choices");
+    MenuOnEvaluate(nullptr);
+    MenuSetOpen(true);
+    Frame();
+    Check(Click("TabModel"), "first run: reopen the Model page");
+    for (unsigned preset : { 2u, 0u, 1u })
+        Check(Choose("Preset", preset) && SettingsCurrent()->model.preset.value == preset,
+              "first run: the weights dropdown selects request %u", preset);
+    Check(Click("TabDepth"), "first run: the Depth page");
+    Check(Choose("MaskBlendMode", 0) && !SettingsCurrent()->model.maskBlendMode.set,
+          "first run: the combination dropdown selects Auto");
+    for (unsigned mode = 0; mode <= 3; ++mode)
+        Check(Choose("MaskBlendMode", mode + 1) && SettingsCurrent()->model.maskBlendMode.set &&
+                  SettingsCurrent()->model.maskBlendMode.value == mode,
+              "first run: the combination dropdown selects mode %u by hand", mode);
+    Check(Click("Close"), "first run: close the menu after changing mode");
+    Check(FileHasAt(path, "MaskBlendMode = 3", 5.0), "first run: closing saves the last dropdown selection");
+    MenuSetOpen(true);
+    Frame();
+    Check(Click("TabModel") && Click("ModelDefaults") && SettingsCurrent()->model == ModelSettings {},
+          "first run: one reset-model button restores all model defaults");
+    MenuSetOpen(false);
+    const ULONGLONG until = GetTickCount64() + 5000;
+    char text[4096] = {};
+    bool cleared = false;
+    do
+    {
+        cleared = ReadAll(path, text, sizeof text) && !strstr(text, "Preset") && !strstr(text, "MaskBlendMode");
+        if (!cleared)
+            Sleep(10);
+    } while (!cleared && GetTickCount64() < until);
+    Check(cleared, "first run: restoring defaults removes stale model selections from generated INI");
+    ImGui::DestroyContext();
+    SettingsLoad(g_ini); // leave the existing input/copy suites on their own fixture
+    MenuOnEvaluate(nullptr);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1381,16 +1575,30 @@ void TestCopy()
 }
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    const bool noInput = argc == 2 && strcmp(argv[1], "--no-input") == 0;
+    if (argc != 1 && !noInput)
+    {
+        std::puts("usage: menutest [--no-input]");
+        return 1;
+    }
     const DWORD length = GetTempPathW(MAX_PATH, g_directory);
-    if (length == 0 || length + 32 >= MAX_PATH)
+    if (length == 0 || length + 64 >= MAX_PATH)
     {
         std::puts("no temp directory");
         return 1;
     }
-    wcscat_s(g_directory, MAX_PATH, L"banana-zero-menutest\\");
-    CreateDirectoryW(g_directory, nullptr);
+    // Debug/Release or two CI jobs may run together: never share mutable INI/log files between processes.
+    wchar_t suffix[64];
+    swprintf_s(suffix, L"banana-zero-menutest-%lu-%llX\\", GetCurrentProcessId(),
+               static_cast<unsigned long long>(GetTickCount64()));
+    wcscat_s(g_directory, MAX_PATH, suffix);
+    if (!CreateDirectoryW(g_directory, nullptr))
+    {
+        std::printf("could not create the test directory (%lu)\n", GetLastError());
+        return 1;
+    }
     swprintf_s(g_ini, MAX_PATH, L"%sdlssnr.ini", g_directory);
     swprintf_s(g_logPath, MAX_PATH, L"%smenutest.log", g_directory);
     LogOpen(g_logPath);
@@ -1403,11 +1611,18 @@ int main()
 
     TestKeys();
     TestWrite();
+    TestMaskSettings();
     TestModelScaleSteps();
     TestModel();
     TestPanel();
-    TestInput();
-    TestInputGame();
+    TestModelPageFirstRun();
+    if (!noInput)
+    {
+        TestInput();
+        TestInputGame();
+    }
+    else
+        std::puts("input-device tests skipped (--no-input); no SendInput events");
     TestCopy();
 
     std::printf("%d checks, %d failed\n", g_checks, g_failed);

@@ -246,8 +246,20 @@ bool Apply(Settings* s, const char* key, const char* value, const char** problem
         return ParseTunable(value, &m.preset);
     if (_stricmp(key, "Intensity") == 0)
         return ParseTunable(value, &m.intensity);
-    if (_stricmp(key, "Style") == 0)
-        return ParseTunable(value, &m.style) && m.style.value <= 2;
+    if (_stricmp(key, "MaskBlendMode") == 0 && _stricmp(value, "auto") == 0)
+    {
+        m.maskBlendMode = {}; // Auto: picked from the sky and skin sliders (model_config.h), also when absent
+        return true;
+    }
+    if (_stricmp(key, "Style") == 0 || _stricmp(key, "MaskBlendMode") == 0)
+    {
+        unsigned parsed = 0;
+        const bool blend = _stricmp(key, "MaskBlendMode") == 0;
+        if (!ParseUnsigned(value, &parsed) || parsed > (blend ? 3u : 2u))
+            return false; // reject without leaving an invalid value in the published snapshot
+        (blend ? m.maskBlendMode : m.style) = { true, parsed };
+        return true;
+    }
     if (_stricmp(key, "LocalStructure") == 0)
         return ParseTunable(value, &m.localStructure);
     if (_stricmp(key, "LocalTone") == 0)
@@ -440,6 +452,7 @@ void SettingsDescribeModel(const ModelSettings& m, char* out, size_t size)
     DescribeTunable(out, size, &length, &any, "LocalTone", m.localTone);
     DescribeTunable(out, size, &length, &any, "SkinStructure", m.skinStructure);
     DescribeTunable(out, size, &length, &any, "AutoMask", m.autoMask);
+    DescribeTunable(out, size, &length, &any, "MaskBlendMode", m.maskBlendMode);
     if (!any)
         Append(out, size, &length, " the model's defaults");
 }

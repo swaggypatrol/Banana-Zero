@@ -35,6 +35,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "shadertest", "tests\shadert
 		{7378DF31-CB8D-4CAA-9364-F920CCE94691} = {7378DF31-CB8D-4CAA-9364-F920CCE94691}
 	EndProjectSection
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "modeltest", "tests\modeltest.vcxproj", "{4D308E16-B947-4C19-A8FD-210931091600}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -77,5 +79,9 @@ Global
 		{BCB9FBFB-ED3A-4F02-8084-40F7C9364AEA}.Debug|x64.Build.0 = Debug|x64
 		{BCB9FBFB-ED3A-4F02-8084-40F7C9364AEA}.Release|x64.ActiveCfg = Release|x64
 		{BCB9FBFB-ED3A-4F02-8084-40F7C9364AEA}.Release|x64.Build.0 = Release|x64
+		{4D308E16-B947-4C19-A8FD-210931091600}.Debug|x64.ActiveCfg = Debug|x64
+		{4D308E16-B947-4C19-A8FD-210931091600}.Debug|x64.Build.0 = Debug|x64
+		{4D308E16-B947-4C19-A8FD-210931091600}.Release|x64.ActiveCfg = Release|x64
+		{4D308E16-B947-4C19-A8FD-210931091600}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 EndGlobal
