@@ -46,7 +46,7 @@ jobs:
         shell: pwsh
         run: |
           $failed = 0
-          foreach ($test in 'menutest', 'ngxtest') {
+          foreach ($test in 'menutest', 'ngxtest', 'modeltest') {
             & "build\Release\$test.exe" | Out-File "build\Release\$test.txt"
             $code = $LASTEXITCODE
             "$test exit $code" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY

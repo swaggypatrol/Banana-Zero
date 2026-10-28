@@ -64,7 +64,7 @@ enum class MenuColour : unsigned
 };
 
 // The model's own parameters. The model reads Preset when it creates its feature and the rest at every evaluation
-// (nr_dx12.cpp, FillTunables), so a change shows from the next frame.
+// (model_config.cpp). Preset changes rebuild the feature; other controls apply at the next evaluation.
 struct ModelSettings
 {
     Tunable<unsigned> preset;      // Preset: DLSSNR.Hint.Render.Preset
@@ -74,6 +74,7 @@ struct ModelSettings
     Tunable<float> localTone;      // LocalTone: DLSSNR.LocalToneStrength
     Tunable<float> skinStructure;  // SkinStructure: DLSSNR.SkinStructureStrength, -1 = follow local structure
     Tunable<unsigned> autoMask;    // AutoMask: DLSSNR.UseAutoMask, 0 or 1; skin structure acts only with it on
+    Tunable<unsigned> maskBlendMode; // MaskBlendMode: not set = Auto (from the sky/skin sliders), 0..3 by hand; NGX int
 
     bool operator==(const ModelSettings&) const = default;
 };

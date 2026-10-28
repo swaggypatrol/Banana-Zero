@@ -27,12 +27,12 @@ const Settings g_defaults;
 // Where each control was drawn, for menutest.
 struct ItemRect
 {
-    const char* key;
+    char key[64]; // own generated combo-option keys as well as literal control keys
     ImVec2 min;
     ImVec2 max;
     unsigned frame; // the draw it was last part of: a control on a page that is not showing is not found
 };
-ItemRect g_items[64];
+ItemRect g_items[128];
 unsigned g_itemCount = 0;
 unsigned g_frame = 0;
 
@@ -49,7 +49,13 @@ void RecordRect(const char* key, ImVec2 min, ImVec2 max)
         }
     }
     if (g_itemCount < sizeof g_items / sizeof g_items[0])
-        g_items[g_itemCount++] = { key, min, max, g_frame };
+    {
+        ItemRect& item = g_items[g_itemCount++];
+        snprintf(item.key, sizeof item.key, "%s", key);
+        item.min = min;
+        item.max = max;
+        item.frame = g_frame;
+    }
 }
 
 void Record(const char* key) { RecordRect(key, ImGui::GetItemRectMin(), ImGui::GetItemRectMax()); }
@@ -144,6 +150,9 @@ bool ComboBox(const char* key, const char* label, int* v, const char* const* nam
                 *v = i;
                 changed = true;
             }
+            char optionKey[64];
+            snprintf(optionKey, sizeof optionKey, "%s/option/%d", key, i);
+            Record(optionKey); // lets headless tests click the real dropdown choices
             if (i == *v)
                 ImGui::SetItemDefaultFocus();
         }
@@ -412,9 +421,9 @@ bool TunableFloat(const char* key, const char* label, Tunable<float>* t, float l
 bool TunableChoice(const char* key, const char* label, Tunable<unsigned>* t, unsigned fallback,
                    const char* const* names, int count)
 {
-    int v = int(t->set ? t->value : fallback);
-    if (v >= count)
-        v = count - 1;
+    const unsigned raw = t->set ? t->value : fallback;
+    const int last = count - 1;
+    int v = raw < unsigned(count) ? int(raw) : last; // avoid signed wrap and names[-1] for large INI values
     bool commit = ComboBox(key, label, &v, names, count);
     if (commit)
     {
@@ -537,8 +546,91 @@ void StatusLines(const MenuModel& m, const NrStatusState& st, bool have)
         ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s", "NR is switched off");
     if (FreezeActive())
         ImGui::TextColored(MenuToneColour(MenuTone::Info), "%s", "Frame frozen");
+    if (st.model.major != 0)
+        ImGui::TextDisabled("DLL %u.%u.%u.%u  preset request %u / active %u (%s)%s", st.model.major, st.model.minor,
+                            st.model.build, st.model.revision, st.requestedPreset, st.activePreset,
+                            ModelPresetName(st.activePreset),
+                            st.presetPending ? " (switch pending)" : st.model.Known() ? "" : " (unverified profile)");
     if (!st.haveFeature)
         ImGui::TextDisabled("%s", "The model is not built yet");
+}
+
+// The sky mask and the model's auto mask together, on the Depth page under the sky sliders (MaskBlendMode). Auto
+// (not set, the default) picks the mode from the sliders (ModelMaskBlendResolve); the line under it says what is in
+// use now and why, with the numbers it went by, so nothing has to be remembered.
+void SkyAutoMask(Settings& d, const NrStatusState& st, bool* commit)
+{
+    ModelSettings& mm = d.model;
+    const ModelSkyMask sky { d.skyTone != 1.0f || d.skyStructure != 1.0f, d.skyStructure };
+    ImGui::SeparatorText("Sky + Auto mask");
+    const char* const masks[] = { "Off", "On" };
+    const bool excludes = ModelExternalExcludesAuto(st.model, mm, sky);
+    ImGui::BeginDisabled(excludes);
+    *commit |= TunableChoice("AutoMask", "Auto mask (skin)", &mm.autoMask, 0, masks, 2);
+    ImGui::EndDisabled();
+    // The same Skin structure as on the Model page, here because it is one of the two numbers Auto goes by.
+    const bool skinLive = !excludes && ModelAutoMaskOn(mm);
+    ImGui::BeginDisabled(!skinLive);
+    *commit |= TunableFloat("SkinStructure", "Skin structure", &mm.skinStructure, 0.0f, 1.5f, 25, -1.0f, "%.2f",
+                            "follows local structure");
+    ImGui::EndDisabled();
+    if (!st.model.MaskBlend())
+    {
+        ImGui::TextDisabled("%s", "This DLL turns Auto mask off while a sky slider is away from 1.");
+        return;
+    }
+    // Combo index 0 is Auto (the setting not set), 1..4 are MaskBlendMode 0..3 by hand.
+    const char* const names[] = { "Auto (follow the sliders)", "Sky mask only (Auto mask off)", "Average",
+                                  "Keep the lower", "Keep the higher" };
+    int v = mm.maskBlendMode.set ? int(mm.maskBlendMode.value <= 3 ? mm.maskBlendMode.value : 0) + 1 : 0;
+    if (ComboBox("MaskBlendMode", "Combine", &v, names, 5))
+    {
+        mm.maskBlendMode = v == 0 ? Tunable<unsigned> {} : Tunable<unsigned> { true, unsigned(v - 1) };
+        *commit = true;
+    }
+    if (RightClicked())
+    {
+        mm.maskBlendMode = {};
+        *commit = true;
+    }
+    ImGui::PushTextWrapPos(0.0f); // the lines below wrap at the window's edge
+    const ModelBlendChoice now = ModelMaskBlendResolve(st.model, mm, sky);
+    const float local = mm.localStructure.set ? mm.localStructure.value : 1.0f;
+    const float skin = mm.skinStructure.set && mm.skinStructure.value >= 0.0f ? mm.skinStructure.value : local;
+    switch (now.why)
+    {
+    case ModelBlendWhy::NoSky:
+        ImGui::TextDisabled("%s", "Now: nothing to combine (both sky sliders at 1).");
+        break;
+    case ModelBlendWhy::NoAutoMask:
+        ImGui::TextDisabled("%s", "Now: sky mask alone (Auto mask is Off).");
+        break;
+    case ModelBlendWhy::Untouched:
+        ImGui::TextDisabled("%s", "Now: both apply; sky and skin structure are at normal, nothing to resolve.");
+        break;
+    case ModelBlendWhy::BothDown:
+        ImGui::TextDisabled("Now: Keep the lower. Sky structure %.2f, skin %.2f (local %.2f): nothing is turned up, "
+                            "so what you turned down is kept exactly.", d.skyStructure, skin, local);
+        break;
+    case ModelBlendWhy::BothUp:
+        ImGui::TextDisabled("Now: Keep the higher. Sky structure %.2f, skin %.2f (local %.2f): nothing is turned "
+                            "down, so what you turned up is kept exactly.", d.skyStructure, skin, local);
+        break;
+    case ModelBlendWhy::Opposite:
+        ImGui::TextDisabled("Now: Average. Sky structure %.2f, skin %.2f (local %.2f): one is up and one down, no "
+                            "mode keeps both, so each gets half.", d.skyStructure, skin, local);
+        break;
+    default: // Manual
+        if (!ModelMaskBlendActive(st.model, mm, sky))
+            ImGui::TextDisabled("%s", now.mode == 0 && sky.present
+                                          ? "Now: sky mask only; Auto mask is turned off while it is in use."
+                                          : "Now: no effect (needs Auto mask On and a sky slider away from 1).");
+        else
+            ImGui::TextDisabled("Now: %s, chosen by hand. Right-click for Auto.", ModelBlendName(now.mode));
+        break;
+    }
+    ImGui::TextDisabled("%s", "Only structure is combined; Sky local tone always applies.");
+    ImGui::PopTextWrapPos();
 }
 
 void PreviewWindow(MenuModel& m)
@@ -685,7 +777,8 @@ void MenuDraw()
         if (tune)
         {
             // Three things are taste: how much of the model's picture reaches the frame, whether its colour comes
-            // along, and the model's style. Everything else waits under a header that opens closed: the composite
+            // along, and the model's style. Weights/masks have their own Model page; image-processing controls
+            // stay under Advanced: the composite
             // keeps the frame's exposure by construction (a ratio per pixel, capped at MaxGainEV) and the M4
             // measurements (567 statistics lines over two games, model defaults) put the model's median luminance
             // change within 0.05 EV in 441 of them and within 0.15 EV in 559, so nothing there needs a hand in
@@ -706,37 +799,6 @@ void MenuDraw()
             Record("Advanced");
             if (advanced)
             {
-                // The model's other parameters. It reads them at every evaluation, so a change shows on the next frame.
-                // Model intensity blends the model's result with its input inside the model and does nothing above
-                // 1. Skin structure reaches the network only with the auto mask on (with it off, the model passes -1
-                // for both the skin and the other areas), so it is greyed out without. No Preset: it picks a set of
-                // network weights and the model DLL (310.8) embeds exactly one (WEIGHTS_HT; any other number falls
-                // back to it inside the model), so every value is the same model. The ini key stays for a model
-                // build that ships several.
-                ImGui::SeparatorText("Model");
-                commit |= TunableFloat("Intensity", "Model intensity", &mm.intensity, 0.0f, 1.0f, 21, 1.0f, "%.2f");
-                commit |=
-                    TunableFloat("LocalStructure", "Local structure", &mm.localStructure, 0.0f, 1.5f, 25, 1.0f, "%.2f");
-                commit |= TunableFloat("LocalTone", "Local tone", &mm.localTone, 0.0f, 1.5f, 25, 1.0f, "%.2f");
-                // While the sky sliders (the depth page) are in use, the model gets a control mask, and with one it
-                // keeps its own auto mask off (the teardown): then neither the auto mask nor skin structure reaches it.
-                const bool skyMask = d.skyTone != 1.0f || d.skyStructure != 1.0f;
-                ImGui::BeginDisabled(skyMask);
-                {
-                    const char* const masks[] = { "Off", "On" };
-                    commit |= TunableChoice("AutoMask", skyMask ? "Auto mask (off: sky sliders in use)" : "Auto mask",
-                                            &mm.autoMask, 0, masks, 2);
-                }
-                ImGui::EndDisabled();
-                const bool skin = !skyMask && mm.autoMask.set && mm.autoMask.value != 0;
-                ImGui::BeginDisabled(!skin);
-                commit |= TunableFloat("SkinStructure",
-                                       skin      ? "Skin structure"
-                                       : skyMask ? "Skin structure (off: sky sliders in use)"
-                                                 : "Skin structure (needs Auto mask)",
-                                       &mm.skinStructure, 0.0f, 1.5f, 25, -1.0f, "%.2f", "follows local structure");
-                ImGui::EndDisabled();
-
                 // The HDR encode (M4). InputType is ini-only: auto follows the game's IsHDR flag and both games
                 // are right.
                 ImGui::SeparatorText("HDR encode");
@@ -762,6 +824,75 @@ void MenuDraw()
                 commit |= Float("HighlightRestore", "Highlight restore", &d.highlightRestore, 0.0f, 1.0f, 25, false,
                                 def.highlightRestore, "%.2f");
             }
+            ImGui::EndTabItem();
+        }
+
+        // Model controls are a first-class page, never hidden in Advanced and never INI-only.
+        const bool modelPage = ImGui::BeginTabItem("Model");
+        Record("TabModel");
+        if (modelPage)
+        {
+            ModelSettings& mm = d.model;
+            ImGui::PushItemWidth(fs * 17.0f);
+            ImGui::TextDisabled("%s", "Changes apply now; your settings are saved automatically.");
+            ImGui::SeparatorText("Weights");
+            const char* const presets[] = {
+                st.model.KnownMulti() ? "DLL default (CC Small FP8)"
+                : st.model.Legacy()   ? "DLL default (HT)" : "DLL default (unverified)",
+                "HT / legacy weights (1)", "CC Small FP8 (2)"
+            };
+            Tunable<unsigned> unavailablePreset { true, st.model.Legacy() ? 1u : 0u };
+            ImGui::BeginDisabled(!st.model.MultiPreset());
+            commit |= TunableChoice("Preset", "Model weights",
+                                    st.model.MultiPreset() ? &mm.preset : &unavailablePreset, 0, presets, 3);
+            ImGui::EndDisabled();
+            if (st.model.MultiPreset())
+                ImGui::TextDisabled("%s", st.model.Known()
+                                              ? "Weight switches rebuild the model and may use more VRAM."
+                                              : "Unverified DLL with both weight sets; numbering assumed as 310.9.16.");
+            else
+                ImGui::TextDisabled("%s", st.model.Legacy() ? "This DLL has HT weights only."
+                                          : !haveStatus || !st.ready ? "Waiting for the model DLL to initialize."
+                                                                    : "Unknown DLL: extra model controls are disabled.");
+            if (st.presetPending)
+                ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s",
+                                   "Switch pending: the current weights run until ready.");
+
+            ImGui::SeparatorText("Masks");
+            const ModelSkyMask sky { d.skyTone != 1.0f || d.skyStructure != 1.0f, d.skyStructure };
+            const bool excludesAuto = ModelExternalExcludesAuto(st.model, mm, sky);
+            const char* const masks[] = { "Off", "On" };
+            ImGui::BeginDisabled(excludesAuto);
+            commit |= TunableChoice("AutoMask", "Auto mask", &mm.autoMask, 0, masks, 2);
+            ImGui::EndDisabled();
+            if (excludesAuto)
+                ImGui::TextDisabled("%s", st.model.MaskBlend()
+                                              ? "Sky mask active and Sky + Auto mask is \"Sky mask only\" (Depth page)."
+                                              : "Sky mask active: this DLL disables automatic masking.");
+            else if (sky.present && st.model.MaskBlend() && ModelAutoMaskOn(mm))
+                ImGui::TextDisabled("With the sky mask: %s (Depth page)",
+                                    ModelBlendName(ModelMaskBlendMode(st.model, mm, sky)));
+            const bool skin = !excludesAuto && mm.autoMask.set && mm.autoMask.value != 0;
+            ImGui::BeginDisabled(!skin);
+            commit |= TunableFloat("SkinStructure", "Skin structure", &mm.skinStructure, 0.0f, 1.5f, 25, -1.0f,
+                                   "%.2f", "follows local structure");
+            ImGui::EndDisabled();
+            if (!skin)
+                ImGui::TextDisabled("%s", "Skin structure needs an active automatic mask.");
+
+            ImGui::SeparatorText("Model strengths");
+            commit |= TunableFloat("Intensity", "Model intensity", &mm.intensity, 0.0f, 1.0f, 21, 1.0f, "%.2f");
+            commit |= TunableFloat("LocalStructure", "Local structure", &mm.localStructure, 0.0f, 1.5f, 25, 1.0f, "%.2f");
+            commit |= TunableFloat("LocalTone", "Local tone", &mm.localTone, 0.0f, 1.5f, 25, 1.0f, "%.2f");
+            if (ImGui::Button("Reset model controls"))
+            {
+                mm = {};
+                commit = true;
+                why = "model defaults";
+            }
+            Record("ModelDefaults");
+            ImGui::TextDisabled("%s", "Right-click for defaults. No INI editing needed.");
+            ImGui::PopItemWidth();
             ImGui::EndTabItem();
         }
 
@@ -821,9 +952,7 @@ void MenuDraw()
             commit |= Bool("ShowSky", "Show what counts as sky (purple stripes)", &d.showSky, def.showSky);
             ImGui::TextDisabled("%s", "1 = as the rest of the picture (times Local tone / Local structure).");
             ImGui::TextDisabled("%s", "Sky = the far end of the game's depth. Stripes are never saved.");
-            if ((d.skyTone != 1.0f || d.skyStructure != 1.0f) && d.model.autoMask.set && d.model.autoMask.value != 0)
-                ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s",
-                                   "Auto mask is off while either sky slider is away from 1");
+            SkyAutoMask(d, st, &commit);
             ImGui::EndTabItem();
         }
 

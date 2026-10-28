@@ -5,6 +5,7 @@
 //   build\Release\nrprobe.exe [--model <path\nvngx_dlssnr.dll>] [--size WxH] [--evaluates N] [--init N]
 //                             [--capability] [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first]
 //                             [--tuning] [--dumps <folder>] [--subrects]
+//                             [--preset N] [--mask-blend 0..3] [--mask-tests] [--preset-tests]
 //
 // It makes the same calls in the same order as dxgi.dll's NR pass (src/nr_dx12.cpp), one line of output per step,
 // and stops at the first step that fails: device, the driver's core and its Init, the bridge from beside this exe,
@@ -51,6 +52,7 @@
 #include <vector>
 
 #include "nvsdk_ngx.h"
+#include "model_config.h"
 
 namespace
 {
@@ -475,6 +477,10 @@ struct Options
     bool nvapiFirst = false;
     bool tuning = false;
     bool subrects = false;
+    bool maskTests = false;
+    bool presetTests = false;
+    unsigned preset = 0;
+    unsigned maskBlendMode = 0;
     std::wstring dumps; // --tuning's T6: where the frame dumps are; empty: %LOCALAPPDATA%\Banana-Zero\dumps
 };
 
@@ -510,6 +516,20 @@ bool ParseOptions(int argc, wchar_t** argv, Options* options)
             options->tuning = true;
         else if (arg == L"--subrects")
             options->subrects = true;
+        else if (arg == L"--mask-tests")
+            options->maskTests = true;
+        else if (arg == L"--preset-tests")
+            options->presetTests = true;
+        else if ((arg == L"--preset" || arg == L"--mask-blend") && hasValue)
+        {
+            wchar_t* end = nullptr;
+            const wchar_t* text = argv[++i];
+            const unsigned long value = wcstoul(text, &end, 10);
+            if (end == text || *end != L'\0' || *text == L'-' ||
+                value > (arg == L"--mask-blend" ? 3ul : 0x7ffffffful))
+                return false;
+            (arg == L"--preset" ? options->preset : options->maskBlendMode) = unsigned(value);
+        }
         else if (arg == L"--dumps" && hasValue)
             options->dumps = argv[++i];
         else
@@ -593,8 +613,12 @@ struct Model
     GetParams allocate = nullptr;
 };
 
+// Selected once before model creation; reused by every auxiliary feature and every evaluation.
+ModelCapabilities g_modelCapabilities;
+ModelSettings g_requestedModel;
+
 // The six parameters the model reads at every evaluation, each with the type it reads it as; the defaults are the
-// model's own (what it takes for a key that is absent), as dxgi.dll writes them (nr_dx12.cpp, FillTunables).
+// model's own (what it takes for a key that is absent), as dxgi.dll writes them (model_config.cpp).
 struct Tunables
 {
     float intensity = 1.0f;
@@ -607,12 +631,14 @@ struct Tunables
 
 void SetTunables(NVSDK_NGX_Parameter* p, const Tunables& t)
 {
-    p->Set("DLSSNR.Intensity", t.intensity);
-    p->Set("DLSSNR.Style", t.style);
-    p->Set("DLSSNR.LocalStructureStrength", t.localStructure);
-    p->Set("DLSSNR.LocalToneStrength", t.localTone);
-    p->Set("DLSSNR.SkinStructureStrength", t.skin);
-    p->Set("DLSSNR.UseAutoMask", t.autoMask);
+    ModelSettings settings = g_requestedModel;
+    settings.intensity = { true, t.intensity };
+    settings.style = { true, t.style };
+    settings.localStructure = { true, t.localStructure };
+    settings.localTone = { true, t.localTone };
+    settings.skinStructure = { true, t.skin };
+    settings.autoMask = { true, unsigned(t.autoMask) };
+    ModelFillTunables(p, g_modelCapabilities, settings, ModelSkyMask {}); // explicit mode: sky state unused
 }
 
 // What one evaluation is given, the way dxgi.dll gives it (nr_dx12.cpp, FillEvaluate).
@@ -658,6 +684,8 @@ void SetInputs(NVSDK_NGX_Parameter* p, const Inputs& in, unsigned reset)
     p->Set("DLSSNR.MVecSubrectHeight", in.motionHeight);
     p->Set("DLSSNR.MVecScaleX", in.mvScaleX);
     p->Set("DLSSNR.MVecScaleY", in.mvScaleY);
+    if (g_modelCapabilities.MaskBlend())
+        p->Set("DLSSNR.MaskBlendMode", ModelMaskBlendMode(g_modelCapabilities, g_requestedModel, ModelSkyMask {}));
 }
 
 // A feature of its own for a test, from a fresh pair of parameter blocks (left allocated, as dxgi.dll leaves its
@@ -675,11 +703,7 @@ void* CreateOwn(const Model& m, unsigned width, unsigned height, const Tunables*
     }
     m.populate(create);
     m.populate(evaluate);
-    create->Set("DLSSNR.Enabled", 1u);
-    create->Set("DLSSNR.Width", width);
-    create->Set("DLSSNR.Height", height);
-    create->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
-    create->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+    ModelFillCreate(create, width, height, g_requestedModel);
     if (atCreate != nullptr)
         SetTunables(create, *atCreate);
     void* handle = nullptr;
@@ -1677,11 +1701,154 @@ void Tuning8(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, const
         r->Release();
 }
 
-// --subrects: the model at a smaller input than the feature was created for, as dxgi.dll runs it when ModelScale is
-// below 100%: the Color and Output subrects shrink, the feature and its textures stay. The teardown says the model
-// sizes its network from the subrects at every evaluation (and ScalingRatio is held at 1), so a smaller subrect should
-// cost less without a new feature.
-//
+// T11 (--mask-tests): MaskBlendMode, the 310.9 per-frame key. First every mode x AutoMask x external mask evaluates
+// with finite output; then what the teardown says the modes do (docs/DLSSNR_COMPATIBILITY.md): the GPU branch runs only with
+// an external mask, a nonzero mode and the auto mask's two structure strengths live (UseAutoMask 1), and then hands
+// the network the sky mask's structure (B x LocalStructure) averaged with, the lower of, or the higher of the auto
+// mask's. So: without the auto mask or without an external mask every mode is mode 0's picture; with both, modes 1-3
+// differ from mode 0 (which also turns the auto mask off) and min differs from max where the mask's B is below 1.
+void MaskTests11(const Model& m, void* handle, NVSDK_NGX_Parameter* p, const Inputs& in)
+{
+    if (!g_modelCapabilities.MaskBlend())
+    {
+        Note("T11 skipped: this DLL has no MaskBlendMode support");
+        return;
+    }
+    std::vector<uint16_t> texels(size_t(in.width) * in.height * 4, FloatToHalf(1.0f));
+    for (unsigned y = 0; y < in.height; ++y)
+        for (unsigned x = in.width / 2; x < in.width; ++x)
+        {
+            texels[(size_t(y) * in.width + x) * 4 + 1] = FloatToHalf(0.5f);
+            texels[(size_t(y) * in.width + x) * 4 + 2] = FloatToHalf(0.75f);
+        }
+    ID3D12Resource* mask = MakeFilled(DXGI_FORMAT_R16G16B16A16_FLOAT, in.width, in.height,
+                                     texels.data(), in.width * 8);
+    if (!mask)
+    {
+        Expect(false, "T11 could not create the external mask");
+        return;
+    }
+    const auto saved = g_requestedModel.maskBlendMode;
+    constexpr unsigned kFrames = 3;
+    std::vector<float> out[4][2][2]; // [mode][automatic][external]
+    bool all = true;
+    for (unsigned mode = 0; mode <= 3; ++mode)
+        for (int automatic = 0; automatic <= 1; ++automatic)
+            for (int external = 1; external >= 0; --external)
+            {
+                g_requestedModel.maskBlendMode = { true, mode };
+                SetMask(p, external ? mask : nullptr, external ? in.width : 0, external ? in.height : 0);
+                Tunables t;
+                t.autoMask = automatic;
+                std::vector<float>& o = out[mode][automatic][external];
+                const bool ran = Run(m, handle, p, in, &t, kFrames, &o);
+                const bool finite = ran && !o.empty() &&
+                    std::all_of(o.begin(), o.end(), [](float value) { return std::isfinite(value); });
+                all &= finite;
+                Expect(finite, "T11 mode %u, AutoMask %d, external mask %d: evaluates and returns finite output",
+                       mode, automatic, external);
+            }
+    if (all)
+    {
+        // The noise floor: the busiest case run again.
+        std::vector<float> again;
+        g_requestedModel.maskBlendMode = { true, 0 };
+        SetMask(p, mask, in.width, in.height);
+        Tunables t;
+        t.autoMask = 1;
+        if (Run(m, handle, p, in, &t, kFrames, &again))
+        {
+            const double noise = Difference(out[0][1][1], again);
+            const double same = noise * 4.0 > 1.0e-5 ? noise * 4.0 : 1.0e-5;
+            const double differs = noise * 10.0 > 2.0e-4 ? noise * 10.0 : 2.0e-4;
+            Say("T11 two identical runs differ by %.6f: same <= %.6f, differs >= %.6f", noise, same, differs);
+            for (unsigned mode = 1; mode <= 3; ++mode)
+            {
+                const double offAuto = Difference(out[mode][0][1], out[0][0][1]);
+                Expect(offAuto <= same, "T11 mode %u = mode 0 with the auto mask off (%.6f)", mode, offAuto);
+                for (int automatic = 0; automatic <= 1; ++automatic)
+                {
+                    const double noMask = Difference(out[mode][automatic][0], out[0][automatic][0]);
+                    Expect(noMask <= same, "T11 mode %u = mode 0 without an external mask, AutoMask %d (%.6f)", mode,
+                           automatic, noMask);
+                }
+                const double both = Difference(out[mode][1][1], out[0][1][1]);
+                Expect(both >= differs, "T11 mode %u differs from mode 0 with the auto and the external mask (%.6f)",
+                       mode, both);
+            }
+            const double minMax = Difference(out[2][1][1], out[3][1][1]);
+            Expect(minMax >= differs, "T11 mode 2 (min) differs from mode 3 (max) where the mask's B is 0.75 (%.6f)",
+                   minMax);
+            Note("T11 average vs min %.6f, average vs max %.6f", Difference(out[1][1][1], out[2][1][1]),
+                 Difference(out[1][1][1], out[3][1][1]));
+        }
+        else
+            Expect(false, "T11 the repeat run for the noise floor");
+    }
+    SetMask(p, nullptr, 0, 0);
+    g_requestedModel.maskBlendMode = saved;
+    mask->Release();
+}
+
+// T12 (--preset-tests): that the preset request reaches the model through the creation block. A feature of its own
+// per request 0, 1 and 2, all at the basic run's size and from the same inputs, against the main feature: requests the
+// version profile resolves to the main feature's weights must give its picture, the others must not.
+void PresetTests12(const Model& m, void* handle, NVSDK_NGX_Parameter* p, const Inputs& in)
+{
+    if (!g_modelCapabilities.MultiPreset())
+    {
+        Note("T12 skipped: this DLL has a single weight set");
+        return;
+    }
+    if (m.allocate == nullptr)
+    {
+        Note("T12 skipped: it needs parameter blocks of our own (not --capability)");
+        return;
+    }
+    constexpr unsigned kFrames = 3;
+    const Tunables defaults;
+    std::vector<float> main, main2;
+    if (!Run(m, handle, p, in, &defaults, kFrames, &main) || !Run(m, handle, p, in, &defaults, kFrames, &main2))
+    {
+        Expect(false, "T12 the main feature's runs");
+        return;
+    }
+    const double noise = Difference(main, main2);
+    const double same = noise * 4.0 > 1.0e-5 ? noise * 4.0 : 1.0e-5;
+    const double differs = noise * 10.0 > 2.0e-4 ? noise * 10.0 : 2.0e-4;
+    const auto saved = g_requestedModel.preset;
+    const unsigned mainResolved = g_modelCapabilities.ResolvePreset(ModelRequestedPreset(g_requestedModel));
+    Say("T12 main feature: preset request %u, resolved %u (%s); same <= %.6f, differs >= %.6f",
+        ModelRequestedPreset(g_requestedModel), mainResolved, ModelPresetName(mainResolved), same, differs);
+    for (unsigned request : { 0u, 1u, 2u })
+    {
+        g_requestedModel.preset = { true, request };
+        const unsigned resolved = g_modelCapabilities.ResolvePreset(request);
+        NVSDK_NGX_Parameter* own = nullptr;
+        void* other = CreateOwn(m, in.width, in.height, nullptr, &own);
+        std::vector<float> picture;
+        if (other == nullptr || !Run(m, other, own, in, &defaults, kFrames, &picture))
+            Expect(false, "T12 preset request %u: a feature of its own created and run", request);
+        else
+        {
+            const double diff = Difference(main, picture);
+            if (resolved == 0 || mainResolved == 0)
+                Note("T12 preset request %u vs the main feature: %.6f (profile cannot tell which weights)", request,
+                     diff);
+            else if (resolved == mainResolved)
+                Expect(diff <= same, "T12 preset request %u (%s) = the main feature's picture (%.6f)", request,
+                       ModelPresetName(resolved), diff);
+            else
+                Expect(diff >= differs, "T12 preset request %u (%s) differs from the main feature's %s (%.6f)",
+                       request, ModelPresetName(resolved), ModelPresetName(mainResolved), diff);
+        }
+        if (other != nullptr)
+            Expect(m.release(other) == NVSDK_NGX_Result_Success, "T12 preset request %u: feature released", request);
+    }
+    g_requestedModel.preset = saved;
+}
+
+// --subrects: ModelScale uses Color/Output subrects inside a full-size feature, not DLL ScalingRatio.
 // T9: at 100%, 75%, 66.7%, 50% and 33.3% of the basic run's frame, inside the basic run's textures: whether the model
 // takes the subrect, whether it leaves the Output outside it alone, whether the picture is the one a feature created at
 // that size makes of the same pixels, and how long an evaluation takes (median, wall time from submit to fence).
@@ -1710,7 +1877,7 @@ void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, con
         if (!UploadNow(base.output, fill.data(), w * 8, h, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
-            Note("T9 %s: could not fill the Output", size.name);
+            Expect(false, "T9 %s: could not fill the Output", size.name);
             continue;
         }
         Inputs in = base;
@@ -1727,7 +1894,7 @@ void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, con
             const double ms = Submit("evaluate");
             if (r != NVSDK_NGX_Result_Success || ms < 0.0)
             {
-                Note("T9 %s (%ux%u in %ux%u): EvaluateFeature -> 0x%08X %s%s", size.name, sw, sh, w, h, unsigned(r),
+                Expect(false, "T9 %s (%ux%u in %ux%u): EvaluateFeature -> 0x%08X %s%s", size.name, sw, sh, w, h, unsigned(r),
                      ResultName(r), ms < 0.0 ? ", GPU failed" : "");
                 ok = false;
             }
@@ -1767,9 +1934,13 @@ void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, con
         }
         else
         {
-            Note("T9 %s: could not read the Output back", size.name);
+            Expect(false, "T9 %s: could not read the Output back", size.name);
             continue;
         }
+
+        Expect(outside == 0, "T9 %s: no writes outside the active subrect", size.name);
+        Expect(std::all_of(inside.begin(), inside.end(), [](float value) { return std::isfinite(value); }),
+               "T9 %s: finite output inside the active subrect", size.name);
 
         // The same pixels given to a feature created at the subrect's size.
         double ownMs = 0.0, diff = -1.0;
@@ -1815,12 +1986,14 @@ void Subrects9(const Model& m, void* handle, NVSDK_NGX_Parameter* evalBlock, con
                     diff = Difference(inside, ownPicture);
                 }
                 else
-                    Note("T9 %s: the feature created at %ux%u did not run", size.name, sw, sh);
+                    Expect(false, "T9 %s: the feature created at %ux%u did not run", size.name, sw, sh);
             }
             else
-                Note("T9 %s: no feature or textures at %ux%u to compare with", size.name, sw, sh);
+                Expect(false, "T9 %s: no feature or textures at %ux%u to compare with", size.name, sw, sh);
+            Expect(diff >= 0.0 && diff < 1e-4, "T9 %s: picture matches a feature created at its own size (%.6f)",
+                   size.name, diff);
             if (own != nullptr)
-                m.release(own);
+                Expect(m.release(own) == NVSDK_NGX_Result_Success, "T9 %s: auxiliary feature released", size.name);
             if (colour != nullptr)
                 colour->Release();
             if (output != nullptr)
@@ -2229,7 +2402,8 @@ int wmain(int argc, wchar_t** argv)
     if (!ParseOptions(argc, argv, &options))
         return Fail("usage: nrprobe [--model <path>] [--size WxH] [--evaluates N] [--init N] [--capability]\n"
                     "               [--no-model-shutdown] [--no-core-shutdown] [--nvapi-first] [--tuning]\n"
-                    "               [--dumps <folder>] [--subrects]");
+                    "               [--dumps <folder>] [--subrects] [--preset N] [--mask-blend 0..3] [--mask-tests]\n"
+                    "               [--preset-tests]");
     if (options.model.empty())
     {
         const wchar_t* const known[] = { L"D:\\Program Files\\Epic Games\\TheWitcher3\\bin\\x64_dx12\\nvngx_dlssnr.dll",
@@ -2245,7 +2419,16 @@ int wmain(int argc, wchar_t** argv)
     }
     if (options.model.empty() || !FileExists(options.model))
         return Fail("no model: give --model <path\\nvngx_dlssnr.dll>");
+    g_modelCapabilities = ModelInspectFile(options.model.c_str());
+    g_requestedModel.preset = { true, options.preset };
+    g_requestedModel.maskBlendMode = { true, options.maskBlendMode };
+    if (options.maskBlendMode != 0 && !g_modelCapabilities.MaskBlend())
+        return Fail("nonzero --mask-blend requires a DLL with MaskBlendMode (310.9.16.0 or later)");
     Say("model: %s", Utf8(options.model).c_str());
+    Say("model version %u.%u.%u.%u; preset request %u, resolved %u (%s); mask blend %u",
+        g_modelCapabilities.major, g_modelCapabilities.minor, g_modelCapabilities.build, g_modelCapabilities.revision,
+        options.preset, g_modelCapabilities.ResolvePreset(options.preset),
+        g_modelCapabilities.Known() ? "known version profile" : "unknown, DLL decides", options.maskBlendMode);
     Say("frame: %ux%u, %u evaluations", options.width, options.height, options.evaluates);
     Say("teardown: model Shutdown1 %s, core Shutdown1 %s, NvAPI initialised by this exe first: %s",
         options.modelShutdown ? "yes" : "no (--no-model-shutdown)",
@@ -2425,11 +2608,7 @@ int wmain(int argc, wchar_t** argv)
     Say("frame uploaded: Color RGBA16F, Depth R32_FLOAT, MVec R16G16_FLOAT, Output RGBA16F (UAV)");
 
     // Create, on the command list, then run that list: the model records its set-up into it.
-    createBlock->Set("DLSSNR.Enabled", 1u);
-    createBlock->Set("DLSSNR.Width", w);
-    createBlock->Set("DLSSNR.Height", h);
-    createBlock->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
-    createBlock->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+    ModelFillCreate(createBlock, w, h, g_requestedModel);
     void* handle = nullptr;
     int created = bzCreate(g.list, 18, createBlock, &handle);
     Say("model CreateFeature(18, %ux%u, %s) -> 0x%08X %s, handle %p", w, h, own ? "own block" : "capability block",
@@ -2437,11 +2616,7 @@ int wmain(int argc, wchar_t** argv)
     if (created != NVSDK_NGX_Result_Success && own && capability != nullptr)
     {
         populated = bzPopulate(capability);
-        capability->Set("DLSSNR.Enabled", 1u);
-        capability->Set("DLSSNR.Width", w);
-        capability->Set("DLSSNR.Height", h);
-        capability->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
-        capability->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+        ModelFillCreate(capability, w, h, g_requestedModel);
         handle = nullptr;
         created = bzCreate(g.list, 18, capability, &handle);
         Say("model CreateFeature(18, %ux%u, capability block after PopulateParameters_Impl -> 0x%08X) -> 0x%08X %s, "
@@ -2492,6 +2667,7 @@ int wmain(int argc, wchar_t** argv)
         p->Set("DLSSNR.MVecSubrectHeight", h);
         p->Set("DLSSNR.MVecScaleX", 1.0f);
         p->Set("DLSSNR.MVecScaleY", 1.0f);
+        ModelFillTunables(p, g_modelCapabilities, g_requestedModel, ModelSkyMask {});
         const int evaluated = bzEvaluate(g.list, handle, p, nullptr);
         const double ms = Submit("evaluate");
         Say("model EvaluateFeature %u -> 0x%08X %s%s%.1f ms", i + 1, unsigned(evaluated), ResultName(evaluated),
@@ -2542,11 +2718,16 @@ int wmain(int argc, wchar_t** argv)
             "than 1/255, %llu NaN/Inf samples",
             sumOut / samples, sumIn / samples, sumDiff / samples, maxDiff,
             100.0 * double(changed) / (double(w) * double(h)), bad);
+        if (bad != 0)
+            ++failures;
     }
     else
+    {
         Say("output: could not be read back");
+        ++failures;
+    }
 
-    if ((options.tuning || options.subrects) && failures == 0)
+    if ((options.tuning || options.subrects || options.maskTests || options.presetTests) && failures == 0)
     {
         Model model;
         model.populate = bzPopulate;
@@ -2566,6 +2747,10 @@ int wmain(int argc, wchar_t** argv)
             Tuning(model, handle, evalBlock, basic, options.dumps);
             Say("tuning: %d of the checks failed", g_mustFail);
         }
+        if (options.maskTests)
+            MaskTests11(model, handle, evalBlock, basic);
+        if (options.presetTests)
+            PresetTests12(model, handle, evalBlock, basic);
         if (options.subrects)
         {
             if (model.allocate == nullptr)
@@ -2580,6 +2765,8 @@ int wmain(int argc, wchar_t** argv)
 
     const int released = bzRelease(handle);
     Say("model ReleaseFeature -> 0x%08X %s", unsigned(released), ResultName(released));
+    if (released != NVSDK_NGX_Result_Success)
+        ++failures;
     // The verdict is about the model path: creation and evaluation. The teardown after it is dxgi.dll's when a game
     // shuts NGX down (the model's own Shutdown1, then the core's), each step guarded and on its own line; our two
     // parameter blocks stay allocated, as dxgi.dll leaves them (DestroyParameters before the core's Shutdown1 faults
@@ -2593,6 +2780,8 @@ int wmain(int argc, wchar_t** argv)
     if (options.modelShutdown)
     {
         const int down = Guarded(bzShutdown, static_cast<void*>(g.device));
+        if (down != NVSDK_NGX_Result_Success)
+            ++failures;
         if (down == kFaulted)
             Say("model Shutdown1 faulted (an access violation inside the model)");
         else
@@ -2605,6 +2794,8 @@ int wmain(int argc, wchar_t** argv)
     else if (shutdown != nullptr)
     {
         const int down = Guarded(shutdown, g.device);
+        if (down != NVSDK_NGX_Result_Success)
+            ++failures;
         if (down == kFaulted)
             Say("core Shutdown1 faulted (an access violation inside the core)");
         else

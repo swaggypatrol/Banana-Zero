@@ -56,7 +56,7 @@
       <ModuleDefinitionFile>$(MSBuildProjectDirectory)\dxgi.def</ModuleDefinitionFile>
       <!-- The menu: D3D12 and DXGI for the overlay, comctl32 for the window subclass, d3dcompiler for the overlay's
            own shaders (the ImGui DX12 backend compiles its shaders the same way). -->
-      <AdditionalDependencies>d3d12.lib;dxgi.lib;comctl32.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;comctl32.lib;d3dcompiler.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">

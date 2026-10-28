@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -29,8 +30,15 @@ struct Key
 
 void Float(char* out, size_t size, float value)
 {
-    // Short and exact enough to come back the same: 4 significant digits cover every slider's steps.
-    snprintf(out, size, "%.4g", double(value));
+    // Four digits truncate steps such as 1.0625. Shortest round-trip formatting keeps both exact slider
+    // values and readable settings (0.9, not 0.899999976); it is also independent of the writer's locale.
+    if (size == 0)
+        return;
+    const auto result = std::to_chars(out, out + size - 1, value, std::chars_format::general);
+    if (result.ec == std::errc {})
+        *result.ptr = '\0';
+    else
+        snprintf(out, size, "%.9g", double(value));
 }
 
 template <typename T> void Tunable(Key* key, const char* name, const ::Tunable<T>& t)
@@ -52,7 +60,7 @@ const char* const kMenuColourText[] = { "auto", "sdr", "hdr" };
 const char* const kMenuThemeText[] = { "dark", "paper" };
 
 // The keys in the order new lines are added. `wanted` is set for a key whose line should exist: a value away from
-// the default, or a model parameter that is set. Room for the 34 keys MakePlan adds and a few more: nothing checks.
+// the default, or a model parameter that is set. Room for the 35 keys MakePlan adds and a few more: nothing checks.
 constexpr unsigned kMaxKeys = 40;
 struct Plan
 {
@@ -119,6 +127,7 @@ Plan MakePlan(const Settings& s)
     AddTunable(&plan, "LocalTone", s.model.localTone);
     AddTunable(&plan, "SkinStructure", s.model.skinStructure);
     AddTunable(&plan, "AutoMask", s.model.autoMask);
+    AddTunable(&plan, "MaskBlendMode", s.model.maskBlendMode);
     AddChoice(&plan, "InputType", nullptr, unsigned(s.inputType), unsigned(d.inputType), kInputText, 3);
     AddChoice(&plan, "WhiteSource", nullptr, unsigned(s.whiteSource), unsigned(d.whiteSource), kWhiteText, 4);
     AddFloat(&plan, "WhiteEV", s.whiteEV, d.whiteEV);

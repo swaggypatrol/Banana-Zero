@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "model_config.h"
+
 struct NVSDK_NGX_Parameter;
 
 // What ngx_hook.cpp knows about the DLSS feature whose evaluation just succeeded.
@@ -50,6 +52,9 @@ struct NrStatusState
     bool ready;            // the bridge and the model are initialised
     bool haveFeature;      // the model's feature exists
     unsigned creates;      // CreateFeature calls so far (at most 64)
+    ModelCapabilities model;
+    unsigned requestedPreset, activePreset; // request and known resolved preset; 0 resolved means unknown
+    bool presetPending;
     uint64_t frames;       // frames the model delivered
     uint64_t failed;
     uint64_t evaluatesSeen;
