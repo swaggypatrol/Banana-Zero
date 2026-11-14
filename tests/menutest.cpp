@@ -435,6 +435,25 @@ const Settings* FakePublish(const Settings& s)
     return &g_lastPublished;
 }
 
+// Hot reload: a file saved again with the same values (only a comment new) leaves the generation alone, as does the
+// menu's own write once noted; a changed value is a new generation.
+void TestReload()
+{
+    WriteAll(g_ini, "Shoulder = 0.6\r\n");
+    const unsigned generation = SettingsLoad(g_ini)->generation;
+    WriteAll(g_ini, "; a note\r\nShoulder = 0.6\r\n");
+    Check(!SettingsReloadIfChanged() && SettingsCurrent()->generation == generation,
+          "reload: the same values with a new comment are not a new generation");
+    WriteAll(g_ini, "Shoulder = 0.65\r\n");
+    Check(SettingsReloadIfChanged() && SettingsCurrent()->generation == generation + 1 &&
+              Near(SettingsCurrent()->shoulder, 0.65f, 1e-6f),
+          "reload: a changed value is read, as the next generation");
+    WriteAll(g_ini, "Shoulder = 0.9\r\n");
+    SettingsNoteWritten();
+    Check(!SettingsReloadIfChanged() && Near(SettingsCurrent()->shoulder, 0.65f, 1e-6f),
+          "reload: the menu's own write, noted, is not read back");
+}
+
 void TestModel()
 {
     Settings current;
@@ -1613,6 +1632,7 @@ int main(int argc, char** argv)
     TestWrite();
     TestMaskSettings();
     TestModelScaleSteps();
+    TestReload();
     TestModel();
     TestPanel();
     TestModelPageFirstRun();

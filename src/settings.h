@@ -134,6 +134,8 @@ struct Settings
     float modelScale = 100.0f; // ModelScale: the model works on a copy of the frame this many percent of its size
                                // on each side, its change brought back to the full frame: 33.3 .. 100 in the steps
                                // ModelScaleStep gives; 100 = as before
+
+    bool operator==(const Settings&) const = default;
 };
 
 // ModelScale's sizes, in percent: a third, then each whole percent from 34 to 100, with two thirds in place of 67. The

@@ -54,8 +54,8 @@
       <!-- The DLL names its PDB by file name only, not by the full path of the build folder it was linked in. -->
       <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
       <ModuleDefinitionFile>$(MSBuildProjectDirectory)\dxgi.def</ModuleDefinitionFile>
-      <!-- The menu: D3D12 and DXGI for the overlay, comctl32 for the window subclass, d3dcompiler for the overlay's
-           own shaders (the ImGui DX12 backend compiles its shaders the same way). -->
+      <!-- The menu: D3D12 and DXGI for the overlay, comctl32 for the window subclass, d3dcompiler for the ImGui
+           DX12 backend. -->
       <AdditionalDependencies>d3d12.lib;dxgi.lib;comctl32.lib;d3dcompiler.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -99,7 +99,7 @@
     <Dxc>$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe</Dxc>
   </PropertyGroup>
   <ItemGroup>
-    <CustomBuild Include="*.hlsl">
+    <CustomBuild Include="*.hlsl" Exclude="overlay.hlsl">
       <!-- MSBuild echoes the message through cmd, so it must not hold a ">": "->" wrote it into src\<name>_shader.h,
            which then shadowed the real header. -->
       <Message>dxc %(Filename).hlsl to %(Filename)_shader.h</Message>
@@ -108,6 +108,12 @@
       <!-- What the shaders include (the shared constants and formulas), and the script that writes the header: a
            change to any of them rebuilds. -->
       <AdditionalInputs>%(RootDir)%(Directory)nr_shared.h;%(RootDir)%(Directory)nr_common.hlsli;$(RepoRoot)tools\create_header.py;%(AdditionalInputs)</AdditionalInputs>
+    </CustomBuild>
+    <CustomBuild Include="overlay.hlsl">
+      <Message>dxc %(Filename).hlsl to %(Filename)_vs_shader.h and %(Filename)_ps_shader.h</Message>
+      <Command>"$(Dxc)" -T vs_6_0 -E VSMain -O3 -Qstrip_debug -Qstrip_reflect "%(FullPath)" -Fo "$(IntDir)%(Filename)_vs.cso" &amp;&amp; python "$(RepoRoot)tools\create_header.py" "$(IntDir)%(Filename)_vs.cso" "$(IntDir)%(Filename)_vs_shader.h" %(Filename)_vs_cso &amp;&amp; "$(Dxc)" -T ps_6_0 -E PSMain -O3 -Qstrip_debug -Qstrip_reflect "%(FullPath)" -Fo "$(IntDir)%(Filename)_ps.cso" &amp;&amp; python "$(RepoRoot)tools\create_header.py" "$(IntDir)%(Filename)_ps.cso" "$(IntDir)%(Filename)_ps_shader.h" %(Filename)_ps_cso</Command>
+      <Outputs>$(IntDir)%(Filename)_vs_shader.h;$(IntDir)%(Filename)_ps_shader.h</Outputs>
+      <AdditionalInputs>$(RepoRoot)tools\create_header.py;%(AdditionalInputs)</AdditionalInputs>
     </CustomBuild>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
