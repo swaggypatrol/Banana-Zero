@@ -1771,21 +1771,22 @@ void ModelSize(const Frame& f, const Settings& s, unsigned* width, unsigned* hei
     *height = side(f.height);
 }
 
-// The fit's three textures for this frame size: made the first time the model works on a smaller copy, at the
-// frame's own size, kept until that changes (ParkCurrent). Ones that cannot be made are not tried again, and the model
-// then works on the whole frame.
-bool EnsureFit(const Frame& f)
+// The fit's three textures, one texel per model texel: made the first time the model works on a smaller copy, at the
+// model's size, kept for any model size they hold and parked for a bigger one, and until the frame's size changes
+// (ParkCurrent). Ones that cannot be made are not tried again, and the model then works on the whole frame.
+bool EnsureFit(unsigned width, unsigned height)
 {
-    if (g_nr.slope.resource != nullptr)
+    if (g_nr.slope.resource != nullptr && g_nr.slope.width >= width && g_nr.slope.height >= height)
         return true;
     if (g_nr.fitFailed)
         return false;
+    DropFit();
     const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (MakeTexture(&g_nr.slope, DXGI_FORMAT_R16G16B16A16_FLOAT, f.width, f.height, uav,
+    if (MakeTexture(&g_nr.slope, DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, uav,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "fit slope") &&
-        MakeTexture(&g_nr.value, DXGI_FORMAT_R16G16B16A16_FLOAT, f.width, f.height, uav,
+        MakeTexture(&g_nr.value, DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, uav,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "fit value") &&
-        MakeTexture(&g_nr.raw, DXGI_FORMAT_R16G16B16A16_FLOAT, f.width, f.height, uav,
+        MakeTexture(&g_nr.raw, DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, uav,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "fit change"))
         return true;
     DropFit();
@@ -2308,7 +2309,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     unsigned modelWidth = f.width, modelHeight = f.height;
     ModelSize(f, s, &modelWidth, &modelHeight);
     bool scaled = modelWidth != f.width || modelHeight != f.height;
-    if (scaled && !EnsureFit(f))
+    if (scaled && !EnsureFit(modelWidth, modelHeight))
     {
         modelWidth = f.width;
         modelHeight = f.height;

@@ -15,13 +15,13 @@
 #include <windows.h>
 
 #include <d3d12.h>
-#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #include "backends/imgui_impl_dx12.h"
 #include "backends/imgui_impl_win32.h"
@@ -29,6 +29,8 @@
 #include "menu.h"
 #include "menu_input.h"
 #include "menu_style.h"
+#include "overlay_ps_shader.h"
+#include "overlay_vs_shader.h"
 #include "settings.h"
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -63,49 +65,6 @@ enum ColourMode : unsigned
     kModeScRgb = 1, // FP16: linear, 1.0 = 80 nits under an HDR display, SDR white otherwise
     kModePq = 2,    // 10-bit under an HDR display: PQ, Rec. 2020
 };
-
-// The composite: the menu picture (premultiplied, sRGB-encoded) over the back buffer, in the buffer's encoding.
-const char kCompositeHlsl[] = R"(
-Texture2D<float4> gMenu : register(t0);
-SamplerState gPoint : register(s0);
-cbuffer C : register(b0) { uint mode; float nits; };
-struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-V VSMain(uint id : SV_VertexID)
-{
-    V v;
-    float2 uv = float2((id << 1) & 2, id & 2);
-    v.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    v.uv = uv;
-    return v;
-}
-float3 SrgbToLinear(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
-float3 Pq(float3 n)
-{
-    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
-    float3 y = pow(saturate(n / 10000.0), m1);
-    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
-}
-float3 Rec709To2020(float3 c)
-{
-    return float3(dot(c, float3(0.6274, 0.3293, 0.0433)), dot(c, float3(0.0691, 0.9195, 0.0114)),
-                  dot(c, float3(0.0164, 0.0880, 0.8956)));
-}
-float4 PSMain(V v) : SV_Target
-{
-    float4 m = gMenu.Sample(gPoint, v.uv);
-    if (m.a <= 0.0)
-        return float4(0.0, 0.0, 0.0, 0.0);
-    float3 c = m.rgb / m.a;
-    float3 o;
-    if (mode == 0)
-        o = c;
-    else if (mode == 1)
-        o = SrgbToLinear(c) * (nits / 80.0);
-    else
-        o = Pq(Rec709To2020(SrgbToLinear(c)) * nits);
-    return float4(o * m.a, m.a);
-}
-)";
 
 struct Frame
 {
@@ -163,8 +122,6 @@ struct Overlay
     ID3D12RootSignature* rootSignature = nullptr;
     ID3D12PipelineState* pipeline = nullptr;
     DXGI_FORMAT pipelineFormat = DXGI_FORMAT_UNKNOWN;
-    ID3DBlob* vs = nullptr;
-    ID3DBlob* ps = nullptr;
     ID3D12Resource* offscreen = nullptr; // R8G8B8A8_UNORM, width x height, rests in PIXEL_SHADER_RESOURCE
     ID3D12Fence* fence = nullptr;
     HANDLE fenceEvent = nullptr;
@@ -299,17 +256,28 @@ bool WriteEntry(void** entry, void* value)
 
 struct Probe
 {
-    ID3D12Device* device;
-    Image dxgi; // the real dxgi.dll's image
-    void** vtable;
-    void* present;
-    void* present1;
-    bool queueOffsetKnown;
-    size_t queueOffset;
-    ID3D12CommandQueue* queue;
-    const char* kind; // of chain, for the log
-    const char* failure;
+    std::atomic<unsigned> refs{ 2 };
+    ID3D12Device* device = nullptr;
+    Image dxgi = { nullptr, 0 }; // the real dxgi.dll's image
+    void** vtable = nullptr;
+    void* present = nullptr;
+    void* present1 = nullptr;
+    bool queueOffsetKnown = false;
+    size_t queueOffset = 0;
+    ID3D12CommandQueue* queue = nullptr;
+    const char* kind = nullptr; // of chain, for the log
+    const char* failure = nullptr;
 };
+
+void DropProbe(Probe* p)
+{
+    if (p->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    {
+        Release(&p->queue);
+        Release(&p->device);
+        delete p;
+    }
+}
 
 LRESULT CALLBACK ProbeProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -331,16 +299,15 @@ HWND ProbeWindow()
                            nullptr);
 }
 
-DWORD WINAPI ProbeThread(void* argument)
+void RunProbe(Probe* p)
 {
-    Probe* p = static_cast<Probe*>(argument);
     typedef HRESULT(WINAPI * CreateFactory2Fn)(UINT, REFIID, void**);
     wchar_t path[MAX_PATH];
     const UINT length = GetSystemDirectoryW(path, MAX_PATH);
     if (length == 0 || length + 10 >= MAX_PATH)
     {
         p->failure = "no system directory";
-        return 0;
+        return;
     }
     wcscat_s(path, MAX_PATH, L"\\dxgi.dll");
     const HMODULE dxgi = LoadLibraryW(path); // the real one, loaded already: our exports forward to it
@@ -350,7 +317,7 @@ DWORD WINAPI ProbeThread(void* argument)
     if (createFactory == nullptr)
     {
         p->failure = "the real dxgi.dll has no CreateDXGIFactory2";
-        return 0;
+        return;
     }
 
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
@@ -444,6 +411,13 @@ DWORD WINAPI ProbeThread(void* argument)
         p->queue = queue; // kept: ImGui's uploads
     else
         Release(&queue);
+}
+
+DWORD WINAPI ProbeThread(void* argument)
+{
+    Probe* p = static_cast<Probe*>(argument);
+    RunProbe(p);
+    DropProbe(p);
     return 0;
 }
 
@@ -453,35 +427,47 @@ bool ProbeOnce()
     if (g.probed)
         return g.failure == nullptr;
     g.probed = true;
-    Probe probe = {};
-    probe.device = g.device;
-    const HANDLE thread = CreateThread(nullptr, 0, &ProbeThread, &probe, 0, nullptr);
+    Probe* probe = new (std::nothrow) Probe;
+    if (probe == nullptr)
+    {
+        g.failure = "no memory for the probe";
+        return false;
+    }
+    probe->device = g.device;
+    probe->device->AddRef();
+    const HANDLE thread = CreateThread(nullptr, 0, &ProbeThread, probe, 0, nullptr);
     if (thread == nullptr)
     {
         g.failure = "no thread for the probe";
+        probe->refs.store(1, std::memory_order_relaxed);
+        DropProbe(probe);
         return false;
     }
     const DWORD waited = WaitForSingleObject(thread, 5000);
     CloseHandle(thread);
     if (waited != WAIT_OBJECT_0)
     {
-        g.failure = "the probe did not finish in 5 s"; // the thread's result is not touched from here on
+        g.failure = "the probe did not finish in 5 s"; // ProbeThread drops its own reference once it unwinds
+        DropProbe(probe);
         return false;
     }
-    if (probe.failure != nullptr)
+    if (probe->failure != nullptr)
     {
-        g.failure = probe.failure;
+        g.failure = probe->failure;
+        DropProbe(probe);
         return false;
     }
-    g.dxgi = probe.dxgi;
-    g.vtable = probe.vtable;
-    g.realPresent = probe.present;
-    g.realPresent1 = probe.present1;
-    g.dxgiPresent = Within(probe.dxgi, probe.present) ? probe.present : nullptr;
-    g.dxgiPresent1 = Within(probe.dxgi, probe.present1) ? probe.present1 : nullptr;
-    g.queueOffsetKnown = probe.queueOffsetKnown;
-    g.queueOffset = probe.queueOffset;
-    g.uploadQueue = probe.queue;
+    g.dxgi = probe->dxgi;
+    g.vtable = probe->vtable;
+    g.realPresent = probe->present;
+    g.realPresent1 = probe->present1;
+    g.dxgiPresent = Within(probe->dxgi, probe->present) ? probe->present : nullptr;
+    g.dxgiPresent1 = Within(probe->dxgi, probe->present1) ? probe->present1 : nullptr;
+    g.queueOffsetKnown = probe->queueOffsetKnown;
+    g.queueOffset = probe->queueOffset;
+    g.uploadQueue = probe->queue;
+    probe->queue = nullptr;
+    DropProbe(probe);
     char presentModule[64];
     char present1Module[64];
     Log("menu: swap chain table at %p, Present %p in %s, Present1 %p in %s, queue at offset %s%zu", g.vtable,
@@ -590,20 +576,6 @@ void SrvFree(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GP
     }
 }
 
-bool CompileShader(const char* entry, const char* target, ID3DBlob** out)
-{
-    ID3DBlob* errors = nullptr;
-    const HRESULT hr = D3DCompile(kCompositeHlsl, sizeof kCompositeHlsl - 1, "overlay", nullptr, nullptr, entry, target,
-                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &errors);
-    if (FAILED(hr))
-    {
-        Log("menu: the overlay's %s did not compile: 0x%08X %s", entry, unsigned(hr),
-            errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer()) : "");
-    }
-    Release(&errors);
-    return SUCCEEDED(hr);
-}
-
 bool MakeRootSignature()
 {
     const HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
@@ -657,8 +629,8 @@ bool MakePipeline(DXGI_FORMAT format)
     g.pipelineFormat = DXGI_FORMAT_UNKNOWN;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = g.rootSignature;
-    desc.VS = { g.vs->GetBufferPointer(), g.vs->GetBufferSize() };
-    desc.PS = { g.ps->GetBufferPointer(), g.ps->GetBufferSize() };
+    desc.VS = { overlay_vs_cso, sizeof overlay_vs_cso };
+    desc.PS = { overlay_ps_cso, sizeof overlay_ps_cso };
     desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
     desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE; // the picture is premultiplied
     desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
@@ -762,8 +734,7 @@ bool MakeObjects()
     g.rtvSize = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g.srvUsed[kSrvOffscreen] = true;
     g.srvUsed[kSrvPreview] = true;
-    if (g.fenceEvent == nullptr || !CompileShader("VSMain", "vs_5_0", &g.vs) ||
-        !CompileShader("PSMain", "ps_5_0", &g.ps) || !MakeRootSignature())
+    if (g.fenceEvent == nullptr || !MakeRootSignature())
     {
         Release(&g.list);
         return false;
@@ -1229,8 +1200,6 @@ void OverlayRelease()
     Release(&g.offscreen);
     Release(&g.pipeline);
     Release(&g.rootSignature);
-    Release(&g.vs);
-    Release(&g.ps);
     Release(&g.list);
     for (Frame& frame : g.frame)
     {
