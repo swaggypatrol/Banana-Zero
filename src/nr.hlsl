@@ -147,24 +147,37 @@ float3 ApplyChange(float3 frame, float change, float3 chroma, float white, bool 
     return linearHdr ? result : SrgbEncode(saturate(result));
 }
 
-// GlobalColour and GlobalBrightness (NR_FLAG_CAST): the model's change to the frame as a whole, its luminance-weighted
-// mean over its picture (the cast pass's sums, this frame's), taken off a pixel's change by castColour and
-// castBrightness, so that what it changes here against there stays and what it changes everywhere at once goes. The
-// weight, the proxy's luminance, is the light ApplyChange adds a colour change at (Shown), so the colour it adds over
-// the frame comes to no cast, up to each pixel's own gain. In
-// Forza Horizon 6 that frame-wide colour change moves a grey's R/B by up to a third within two seconds as the scene
-// changes: a white balance that drifts.
-void TakeCastOff(inout float change, inout float3 chroma)
+// GlobalColour and GlobalBrightness (NR_FLAG_CAST): the model's change to the frame as a whole, measured on this frame
+// by the cast pass (nr_stats.hlsl), taken off each pixel's by castColour and castBrightness, so that what it changes
+// here against there stays and what it changes everywhere at once goes. Its brightness: the luminance-weighted mean
+// of its change in EV, taken off the pixel's. Its colour: its white balance, a gain per channel measured on the
+// greyish parts of its picture (Greyness, Tint), divided out of the model's colour at this pixel, whose light in the
+// model's input is `light`. So greys stay grey, a white-balance cast comes off every pixel exactly, and a saturated
+// colour loses only its own share of it (a red light has no blue to lose). The model can white-balance only what its
+// output has room for, so the share divided out fades from all of it below the shoulder to none where the model's
+// input is at its top (a white highlight it left white keeps its colour). In Forza Horizon 6 the model's
+// white balance moves a grey's B/G by several per cent within seconds as the scene changes; a mean of its colour
+// change by luminance, taken off instead, left the greys most of that, the sky outweighing them.
+float CastSum(uint i) { return float(asint(gDump.Load((NR_S_GLOBAL + i) * 4))); }
+
+void TakeCastOff(inout float change, inout float3 chroma, float3 light)
 {
     if ((g.flags & NR_FLAG_CAST) == 0)
         return;
-    const float weight = float(asint(gDump.Load((NR_S_GLOBAL + NR_G_WEIGHT) * 4)));
-    if (!(weight > 0.0))
+    const float weight = CastSum(NR_G_WEIGHT);
+    if (weight > 0.0)
+        change -= g.castBrightness * CastSum(NR_G_GAIN) / weight;
+    const float grey = CastSum(NR_G_GREY);
+    const float luminance = dot(light, kLuma);
+    if (g.castColour == 0.0 || !(grey > 0.0) || !(luminance > kChromaFloor))
         return;
-    const float r = float(asint(gDump.Load((NR_S_GLOBAL + NR_G_CHROMA_R) * 4))) / weight;
-    const float b = float(asint(gDump.Load((NR_S_GLOBAL + NR_G_CHROMA_B) * 4))) / weight;
-    chroma -= g.castColour * ChromaFromRedBlue(r, b);
-    change -= g.castBrightness * float(asint(gDump.Load((NR_S_GLOBAL + NR_G_GAIN) * 4))) / weight;
+    const float room = saturate((1.0 - Max3(light)) / (1.0 - g.shoulder));
+    const float2 tint = g.castColour * room * float2(CastSum(NR_G_TINT_R), CastSum(NR_G_TINT_B)) / grey;
+    const float3 own = light / luminance;
+    const float3 c = (own + chroma) * float3(exp2(-tint.x), 1.0, exp2(-tint.y));
+    const float y = dot(c, kLuma);
+    if (y > 0.0)
+        chroma = c / y - own;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -496,9 +509,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         {
             float change;
             float3 chroma;
-            if (ScaledChange(id.xy, Guide(ProxyLight(frame.rgb, white, linearHdr)), change, chroma))
+            const float3 light = ProxyLight(frame.rgb, white, linearHdr);
+            if (ScaledChange(id.xy, Guide(light), change, chroma))
             {
-                TakeCastOff(change, chroma);
+                TakeCastOff(change, chroma, light);
                 result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }
@@ -513,7 +527,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 const float3 o = ModelLinear(modelEncoded, proxyEncoded);
                 float change = ModelGain(p, o, linearHdr);
                 float3 chroma = ModelChroma(p, o);
-                TakeCastOff(change, chroma);
+                TakeCastOff(change, chroma, p);
                 result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }

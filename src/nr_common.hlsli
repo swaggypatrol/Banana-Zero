@@ -129,6 +129,26 @@ float3 ModelChroma(float3 p, float3 o)
 // (nr_fit.hlsl) carries those two, and the composite takes green from them.
 float3 ChromaFromRedBlue(float r, float b) { return float3(r, -(kLuma.r * r + kLuma.b * b) / kLuma.g, b); }
 
+// The model's white balance, for GlobalColour, measured where a white balance shows: on the greyish parts of its
+// picture. How much a pixel counts: (its smallest channel over its largest)^2 in the proxy, below the shoulder, with
+// every channel of both pictures above 1/1024 (the near black's colour is noise, a compressed highlight's is the
+// encode's); 0 elsewhere. Its tint there: the model's gain on red and on blue over its gain on green, in EV, held to
+// +-2.
+static const float kTintFloor = 1.0 / 1024.0;
+float Greyness(float3 p, float3 o)
+{
+    const float lo = min(p.r, min(p.g, p.b));
+    const float hi = Max3(p);
+    if (!(lo > kTintFloor) || !(min(o.r, min(o.g, o.b)) > kTintFloor) || hi >= g.shoulder)
+        return 0.0;
+    const float share = lo / hi;
+    return share * share;
+}
+float2 Tint(float3 p, float3 o)
+{
+    return clamp(float2(log2((o.r * p.g) / (p.r * o.g)), log2((o.b * p.g) / (p.b * o.g))), -2.0, 2.0);
+}
+
 // ModelScale (NR_FLAG_SCALED): the model works on a smaller copy of the frame, and the fit and the composite bring its
 // change back to the frame's size along a guide: the log2 luminance of the model's input in linear light, with the
 // gain's floor, so that an edge is a step in it as large as the eye sees it, in the darks as in the lights.

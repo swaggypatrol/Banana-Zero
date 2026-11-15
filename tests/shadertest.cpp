@@ -371,6 +371,38 @@ F3 ApplyChange(F3 frame, float change, F3 chroma, float white, bool linear, cons
     return linear ? result : SrgbEncode(Saturate(result));
 }
 
+const float kTintFloor = 1.0f / 1024.0f;
+float Greyness(F3 p, F3 o, float s)
+{
+    const float lo = Min(p.r, Min(p.g, p.b));
+    const float hi = Max3(p);
+    if (!(lo > kTintFloor) || !(Min(o.r, Min(o.g, o.b)) > kTintFloor) || hi >= s)
+        return 0.0f;
+    const float share = lo / hi;
+    return share * share;
+}
+float TintOf(float oc, float pc, F3 p, F3 o)
+{
+    return std::clamp(std::log2((oc * p.g) / (pc * o.g)), -2.0f, 2.0f);
+}
+
+// TakeCastOff's colour: the tint (red and blue over green, in EV) divided out of the model's colour at a pixel whose
+// light in the model's input is `light`, fading out through the shoulder.
+F3 TakeTintOff(F3 chroma, F3 light, float tintR, float tintB, float s)
+{
+    const float luminance = Dot(light, kLuma);
+    if (!(luminance > kChromaFloor))
+        return chroma;
+    const float room = Min(Max((1.0f - Max3(light)) / (1.0f - s), 0.0f), 1.0f);
+    tintR *= room;
+    tintB *= room;
+    const F3 own = light / luminance;
+    const F3 sum = own + chroma;
+    const F3 c = { sum.r * std::exp2(-tintR), sum.g, sum.b * std::exp2(-tintB) };
+    const float y = Dot(c, kLuma);
+    return y > 0.0f ? c / y - own : chroma;
+}
+
 F3 Composite(F3 frame, F3 pe, F3 me, float white, bool linear, const Knobs& k)
 {
     const F3 p = ProxyLinear(pe);
@@ -1403,8 +1435,13 @@ CpuStats ExpectedStats(const Scene& s, const Setup& u, const std::vector<Pixel>&
         const double weight = ref::Dot(p, ref::kLuma);
         c.global[NR_G_WEIGHT] += weight;
         c.global[NR_G_GAIN] += weight * std::clamp(ref::ModelGain(p, o, u.linear, u.knobs), -2.0f, 2.0f);
-        c.global[NR_G_CHROMA_R] += weight * std::clamp(chroma.r, -2.0f, 2.0f);
-        c.global[NR_G_CHROMA_B] += weight * std::clamp(chroma.b, -2.0f, 2.0f);
+        const float grey = ref::Greyness(p, o, u.knobs.shoulder);
+        if (grey > 0.0f)
+        {
+            c.global[NR_G_GREY] += grey;
+            c.global[NR_G_TINT_R] += grey * ref::TintOf(o.r, p.r, p, o);
+            c.global[NR_G_TINT_B] += grey * ref::TintOf(o.b, p.b, p, o);
+        }
         c.global[NR_G_IN_R] += p.r;
         c.global[NR_G_IN_G] += p.g;
         c.global[NR_G_IN_B] += p.b;
@@ -1503,9 +1540,10 @@ void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes
         globalRight = globalRight && error <= 0.5 + 1.0e-4 * std::fabs(e.global[i]);
     }
     Check(globalRight && e.global[NR_G_WEIGHT] > 1.0,
-          "statistics, %s: the frame-wide sums (weight %.2f, gain %.3f, colour R %.3f B %.3f), worst %.3f off",
-          s.format->name, e.global[NR_G_WEIGHT], e.global[NR_G_GAIN], e.global[NR_G_CHROMA_R],
-          e.global[NR_G_CHROMA_B], worst);
+          "statistics, %s: the frame-wide sums (weight %.2f, gain %.3f, greyness %.2f, tint R %.3f B %.3f), worst "
+          "%.3f off",
+          s.format->name, e.global[NR_G_WEIGHT], e.global[NR_G_GAIN], e.global[NR_G_GREY], e.global[NR_G_TINT_R],
+          e.global[NR_G_TINT_B], worst);
     Check(Bits(c[NR_C_WHITE]) == WhiteOf(u) && Bits(c[NR_C_EXPOSURE]) == (u.useExposure ? u.exposure : 0.0f) &&
               Bits(c[NR_C_MAX_BITS]) == e.largest,
           "statistics, %s: white point %g (want %g), exposure %g, largest value %g (want %g)", s.format->name,
@@ -1513,17 +1551,63 @@ void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes
           double(Bits(c[NR_C_MAX_BITS])), double(e.largest));
 }
 
+// The colour light a composite adds to a pixel is at most Strength x Colour x its gain x the white point x its colour
+// change: the light the model saw it at (nr.hlsl's Shown), never the frame's own. So a red light 64 times as bright as
+// the white point gets no more colour from the model than one at it (added at the frame's light, it came back 64
+// times as strong: Forza Horizon 6's purple tail lights).
+void CheckColourLight(const Scene& s, const Setup& u, const std::vector<Pixel>& proxy, const std::vector<Pixel>& model,
+                      const std::vector<uint8_t>& output, const char* what)
+{
+    const float white = WhiteOf(u);
+    size_t bright = 0, over = 0;
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            const size_t k = size_t(y) * s.width + x;
+            const Pixel& frame = s.Frame(x, y);
+            const Pixel& pe = proxy[k];
+            const Pixel& me = model[k];
+            if (!Finite(frame) || (me.r == pe.r && me.g == pe.g && me.b == pe.b))
+                continue;
+            const ref::F3 p = ref::ProxyLinear(Rgb(pe));
+            const ref::F3 o = ref::ModelLinear(Rgb(me), Rgb(pe));
+            const ref::F3 chroma = ref::ModelChroma(p, o);
+            const float change = ref::ModelGain(p, o, u.linear, u.knobs);
+            const float scale = std::exp2(std::clamp(change * u.knobs.detail, -u.knobs.maxGain, u.knobs.maxGain));
+            const float limit = u.knobs.detail * u.knobs.colour * scale * white * 1.01f;
+            const size_t i = size_t(y + s.baseY) * s.textureWidth + x + s.baseX;
+            const Pixel out = Decode(*s.format, output.data() + i * s.format->bytes);
+            const float got[3] = { out.r, out.g, out.b };
+            const float scaled[3] = { frame.r * scale, frame.g * scale, frame.b * scale };
+            const float d[3] = { chroma.r, chroma.g, chroma.b };
+            bright += ref::Max3(Rgb(frame)) > 8.0f * white;
+            // Within the format's steps of the nearest value the bound allows.
+            for (int c = 0; c < 3; ++c)
+            {
+                const float band = limit * std::fabs(d[c]);
+                over += !Close(*s.format, c, got[c], std::clamp(got[c], scaled[c] - band, scaled[c] + band));
+            }
+        }
+    }
+    Check(bright > 100 && over == 0,
+          "composite, %s, %s: the colour light added within Strength x Colour x gain x the white point x the colour "
+          "change, %zu pixels above 8 times the white point among them (%zu channels over)",
+          s.format->name, what, bright, over);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
-// GlobalColour and GlobalBrightness (nr.hlsl's TakeCastOff): the cast pass sums the model's change over its picture,
-// as the statistics' frame-wide sums, and the composite of the same frame takes that much of the mean off each pixel.
+// GlobalColour and GlobalBrightness (nr.hlsl's TakeCastOff): the cast pass sums the model's brightness change by
+// luminance and its white balance on the greyish pixels, as the statistics' frame-wide sums, and the composite of the
+// same frame takes that much of the brightness off each pixel's change and divides the white balance out of its colour.
 
 void CheckCast(Scene& s, const Setup& base)
 {
     Setup u = base;
     u.castColour = 1.0f;     // GlobalColour 0
     u.castBrightness = 0.5f; // GlobalBrightness 0.5
-    // A model that warms the whole frame and brightens it a little, and brightens every seventh pixel more: a cast and
-    // a local change.
+    // A model that white-balances the whole frame warmer (a gain per channel) and brightens it a little, and brightens
+    // every seventh pixel more: a cast and a local change.
     const std::vector<Pixel> proxy = DecodeAll(kHalf, EncodeAndReadProxy(s, u));
     const std::vector<Pixel> model = MakeModel(proxy, [](ref::F3 p, size_t i) {
         const float local = i % 7 == 0 ? 1.3f : 1.0f;
@@ -1550,7 +1634,8 @@ void CheckCast(Scene& s, const Setup& base)
     const std::vector<uint32_t> w = ReadBuffer(cast, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cast->Release();
 
-    // The pass's sums are the statistics' (checked against the CPU there), with no histogram or count beside them.
+    // The pass's sums are the statistics' (checked against the CPU there), with no histogram or count beside them, and
+    // the white balance they give is the model's.
     const CpuStats e = ExpectedStats(s, u, proxy, model);
     int32_t sum[NR_GLOBALS];
     bool sumsRight = true;
@@ -1562,16 +1647,17 @@ void CheckCast(Scene& s, const Setup& base)
     bool nothingElse = true;
     for (unsigned i = NR_S_TAG_FIRST + 1; i < NR_S_GLOBAL; ++i)
         nothingElse = nothingElse && w[i] == 0;
-    const double r = double(sum[NR_G_CHROMA_R]) / double(sum[NR_G_WEIGHT]);
-    const double b = double(sum[NR_G_CHROMA_B]) / double(sum[NR_G_WEIGHT]);
+    const double tintR = double(sum[NR_G_TINT_R]) / double(sum[NR_G_GREY]);
+    const double tintB = double(sum[NR_G_TINT_B]) / double(sum[NR_G_GREY]);
     const double gain = double(sum[NR_G_GAIN]) / double(sum[NR_G_WEIGHT]);
-    Check(sumsRight && nothingElse && r > 0.01 && b < -0.01,
-          "cast, %s: the cast pass's sums as the CPU's, and nothing else written; the model's mean colour change R %+.4f "
-          "B %+.4f, brightness %+.4f EV",
-          s.format->name, r, b, gain);
+    Check(sumsRight && nothingElse && std::fabs(tintR - std::log2(1.08 / 1.02)) < 0.003 &&
+              std::fabs(tintB - std::log2(0.88 / 1.02)) < 0.003,
+          "cast, %s: the cast pass's sums as the CPU's, and nothing else written; the model's white balance R/G x%.4f "
+          "B/G x%.4f (made x%.4f, x%.4f), brightness %+.4f EV",
+          s.format->name, std::exp2(tintR), std::exp2(tintB), 1.08 / 1.02, 0.88 / 1.02, gain);
 
-    // Each changed pixel: its own change less that share of the mean, then the composite as ever.
-    const ref::F3 meanChroma = ref::ChromaFromRedBlue(float(r), float(b));
+    // Each changed pixel: its brightness change less that share of the mean, the white balance divided out of its
+    // colour, then the composite as ever.
     const float white = WhiteOf(u);
     // A changed pixel's brightness change in EV and colour change, as the composite takes them; false if unchanged.
     auto changeOf = [&](size_t k, const Pixel& frame, float* change, ref::F3* chroma) {
@@ -1582,7 +1668,8 @@ void CheckCast(Scene& s, const Setup& base)
         const ref::F3 p = ref::ProxyLinear(Rgb(pe));
         const ref::F3 o = ref::ModelLinear(Rgb(me), Rgb(pe));
         *change = ref::ModelGain(p, o, u.linear, u.knobs) - u.castBrightness * float(gain);
-        *chroma = ref::ModelChroma(p, o) - meanChroma * u.castColour;
+        *chroma = ref::TakeTintOff(ref::ModelChroma(p, o), p, u.castColour * float(tintR), u.castColour * float(tintB),
+                                   u.knobs.shoulder);
         return true;
     };
     CheckOutput(
@@ -1601,13 +1688,11 @@ void CheckCast(Scene& s, const Setup& base)
             *exact = false;
             return Quantise(*s.format, Pixel { out.r, out.g, out.b, frame.a });
         },
-        "GlobalColour 0, GlobalBrightness 0.5: the model's frame-wide mean taken off each pixel's change");
+        "GlobalColour 0, GlobalBrightness 0.5: the model's frame-wide change taken off each pixel's");
 
-    // The colour light a pixel gets is at most Strength x Colour x its gain x the white point x its colour change:
-    // the light the model saw it at, never the frame's own. So the cast taken off adds no more blue to a red light
-    // 64 times as bright as the white point than to one at it (added at the frame's light, it came back 64 times as
-    // strong: Forza Horizon 6's purple tail lights).
-    size_t bright = 0, over = 0;
+    // The model's change was a white balance and a brightness alone, so every pixel below the shoulder, where the
+    // model had room for it, keeps its own colour, greys and saturated ones alike: only its brightness changes.
+    size_t counted = 0, off = 0;
     for (UINT y = 0; y < s.height; ++y)
     {
         for (UINT x = 0; x < s.width; ++x)
@@ -1615,28 +1700,27 @@ void CheckCast(Scene& s, const Setup& base)
             const Pixel& frame = s.Frame(x, y);
             float change;
             ref::F3 chroma;
-            if (!changeOf(size_t(y) * s.width + x, frame, &change, &chroma))
+            if (!changeOf(size_t(y) * s.width + x, frame, &change, &chroma) || ref::Dot(Rgb(frame), ref::kLuma) <= 0.0f ||
+                !(ref::Max3(ref::ProxyLinear(Rgb(proxy[size_t(y) * s.width + x]))) < u.knobs.shoulder))
                 continue;
             const float scale = std::exp2(std::clamp(change * u.knobs.detail, -u.knobs.maxGain, u.knobs.maxGain));
-            const float limit = u.knobs.detail * u.knobs.colour * scale * white * 1.01f;
             const size_t i = size_t(y + s.baseY) * s.textureWidth + x + s.baseX;
             const Pixel out = Decode(*s.format, output.data() + i * s.format->bytes);
             const float got[3] = { out.r, out.g, out.b };
             const float scaled[3] = { frame.r * scale, frame.g * scale, frame.b * scale };
-            const float d[3] = { chroma.r, chroma.g, chroma.b };
-            bright += ref::Max3(Rgb(frame)) > 8.0f * white;
-            // Within the format's steps of the nearest value the bound allows.
+            ++counted;
+            // Within the format's steps of its own colour, give or take 0.5% for the white balance's estimate.
             for (int c = 0; c < 3; ++c)
             {
-                const float band = limit * std::fabs(d[c]);
-                over += !Close(*s.format, c, got[c], std::clamp(got[c], scaled[c] - band, scaled[c] + band));
+                const float band = 0.005f * std::max({ std::fabs(scaled[0]), std::fabs(scaled[1]), std::fabs(scaled[2]) });
+                off += !Close(*s.format, c, got[c], std::clamp(got[c], scaled[c] - band, scaled[c] + band));
             }
         }
     }
-    Check(bright > 100 && over == 0,
-          "cast, %s: the colour light added within Strength x Colour x gain x the white point x the colour change, "
-          "%zu pixels above 8 times the white point among them (%zu channels over)",
-          s.format->name, bright, over);
+    Check(counted > 1000 && off == 0,
+          "cast, %s: the white balance divided out of every pixel's colour below the shoulder, saturated ones too: %zu "
+          "pixels keep their own colour (%zu channels off)",
+          s.format->name, counted, off);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2439,8 +2523,9 @@ void TestLinear(const Format& f, UINT border)
     highlight.knobs.highlight = 1.0f;
     highlight.knobs.colour = 1.5f;
     highlight.knobs.detail = 1.3f;
-    CheckComposite(s, highlight, proxy, mixed, RunComposite(s, highlight, Encode(mixed)),
-                   "mixed model, HighlightRestore 1, ColourStrength 1.5, DetailStrength 1.3");
+    output = RunComposite(s, highlight, Encode(mixed));
+    CheckComposite(s, highlight, proxy, mixed, output, "mixed model, HighlightRestore 1, ColourStrength 1.5, DetailStrength 1.3");
+    CheckColourLight(s, highlight, proxy, mixed, output, "mixed model");
     CheckClippedWhite(s, proxy);
 
     CheckCard(s);

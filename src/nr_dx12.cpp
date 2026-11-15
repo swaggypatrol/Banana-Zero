@@ -2950,8 +2950,9 @@ void LogSample(const Sample& sample)
         add("; ModelScale: model input %ux%u", info.modelWidth, info.modelHeight);
     if (info.modelRan)
     {
-        // The frame as a whole (NR_S_GLOBAL): what a grey of the frame's mean brightness is turned into by the
-        // model's colour change, and its brightness change, both weighted by luminance; then what of them is kept.
+        // The frame as a whole (NR_S_GLOBAL): the model's white balance, measured on the greyish parts of its picture,
+        // and what it turns a grey into at DetailStrength x ColourStrength; its brightness change, weighted by
+        // luminance; then what of them is kept.
         double global[NR_GLOBALS];
         for (unsigned i = 0; i < NR_GLOBALS; ++i)
             global[i] = double(int32_t(w[NR_S_GLOBAL + i])) / NR_G_SCALE;
@@ -2959,18 +2960,29 @@ void LogSample(const Sample& sample)
         if (weight > 0.0 && global[NR_G_IN_G] > 0.0)
         {
             const double k = double(info.detail) * double(info.colour);
-            const double r = k * global[NR_G_CHROMA_R] / weight;
-            const double b = k * global[NR_G_CHROMA_B] / weight;
-            const double g = -(0.2126 * r + 0.0722 * b) / 0.7152;
-            const double brightness = double(info.detail) * global[NR_G_GAIN] / weight;
+            const double grey = global[NR_G_GREY];
+            const double tr = grey > 0.0 ? global[NR_G_TINT_R] / grey : 0.0;
+            const double tb = grey > 0.0 ? global[NR_G_TINT_B] / grey : 0.0;
+            // A grey under a share of the tint: its colour (2^tr, 1, 2^tb) over its luminance, then k of the change.
+            auto shown = [k](double share, double tR, double tB, double* rg, double* bg) {
+                const double r = std::exp2(share * tR), b = std::exp2(share * tB);
+                const double y = 0.2126 * r + 0.7152 + 0.0722 * b;
+                const double gr = 1.0 + k * (1.0 / y - 1.0);
+                *rg = (1.0 + k * (r / y - 1.0)) / gr;
+                *bg = (1.0 + k * (b / y - 1.0)) / gr;
+            };
+            double rg, bg, keptRg, keptBg;
             const double kept = double(info.globalColour);
+            shown(1.0, tr, tb, &rg, &bg);
+            shown(kept, tr, tb, &keptRg, &keptBg);
+            const double brightness = double(info.detail) * global[NR_G_GAIN] / weight;
             add("; frame: input R/G %.4f B/G %.4f; the model's cast at DetailStrength x ColourStrength %.2f: grey R/G "
-                "x%.4f B/G x%.4f (R %+.4f G %+.4f B %+.4f of luminance); its mean brightness change %+.3f EV; kept "
-                "(GlobalColour %.2f, GlobalBrightness %.2f): grey R/G x%.4f B/G x%.4f, %+.3f EV",
-                global[NR_G_IN_R] / global[NR_G_IN_G], global[NR_G_IN_B] / global[NR_G_IN_G], k, (1.0 + r) / (1.0 + g),
-                (1.0 + b) / (1.0 + g), r, g, b, brightness, kept, double(info.globalBrightness),
-                (1.0 + kept * r) / (1.0 + kept * g), (1.0 + kept * b) / (1.0 + kept * g),
-                double(info.globalBrightness) * brightness);
+                "x%.4f B/G x%.4f (white balance R/G x%.4f B/G x%.4f, measured on %.1f%% of its picture in greys); its "
+                "mean brightness change %+.3f EV; kept (GlobalColour %.2f, GlobalBrightness %.2f): grey R/G x%.4f B/G "
+                "x%.4f, %+.3f EV",
+                global[NR_G_IN_R] / global[NR_G_IN_G], global[NR_G_IN_B] / global[NR_G_IN_G], k, rg, bg, std::exp2(tr),
+                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), brightness, kept,
+                double(info.globalBrightness), keptRg, keptBg, double(info.globalBrightness) * brightness);
         }
     }
     Log("%s", line);
