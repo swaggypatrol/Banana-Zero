@@ -10,7 +10,10 @@
 // How it is learnt: the first time the NR pass is about to record, entries of the list's virtual function table are
 // pointed at us, for every list of that class: Reset and ClearState (after which the state is known: nothing bound),
 // SetDescriptorHeaps, SetPipelineState and SetPipelineState1, SetComputeRootSignature and the six compute root
-// argument setters, and ExecuteBundle (after which the list is unknown: a bundle's bindings stay in the list). A list
+// argument setters, SetGraphicsRootSignature and SetGraphicsRootDescriptorTable, and ExecuteBundle (after which the
+// list is unknown: a bundle's bindings stay in the list). The graphics side is followed only for its descriptor
+// tables: changing the descriptor heaps, as the NR pass does, leaves every table undefined, the game's graphics tables
+// too, and a game may draw on after the DLSS call without setting them again. A list
 // not reset since then is unknown, and the NR pass waits for the next frame; a list reset since then is known at its
 // first NR pass (GTA V records DLSS on lists of a pool of about a thousand), and so is one the device makes since then
 // on a table followed by then (its CreateCommandList is taken with the first table: such a list starts recording
@@ -49,6 +52,8 @@ struct ListState
     ID3D12PipelineState* pipeline;  // at most one of these two
     ID3D12StateObject* stateObject; // a ray tracing pipeline (SetPipelineState1)
     ID3D12RootSignature* computeRoot;
+    ID3D12RootSignature* graphicsRoot;
+    uint64_t graphicsTables[kListStateArgs]; // per graphics root parameter, the table's GPU handle; 0 not set
     ListStateArg args[kListStateArgs];
     ListStateConstant constants[kListStateConstants];
     unsigned constantCount;
@@ -70,6 +75,7 @@ struct ListStateCounts
 };
 void ListStateCount(ListStateCounts* out);
 
-// Binds `state` on `list` again, after the NR pass bound its own: heaps, root signature, its arguments, pipeline.
-// Graphics state is left alone: the NR pass binds none.
+// Binds `state` on `list` again, after the NR pass bound its own: heaps, then the graphics descriptor tables (the heap
+// change left them undefined), then the compute root signature, its arguments and the pipeline. The rest of the
+// graphics state is left alone: the NR pass binds none of it.
 void ListStateRestore(ID3D12GraphicsCommandList* list, const ListState& state);

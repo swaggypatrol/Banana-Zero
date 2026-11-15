@@ -10,20 +10,12 @@
 
 namespace
 {
-constexpr unsigned kRetireFrames = 8; // command lists in flight may still read a retired copy (nr_dx12.cpp's kRing)
-
 struct Copy
 {
     ID3D12Resource* resource = nullptr;
     unsigned width = 0;
     unsigned height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-};
-
-struct Retired
-{
-    ID3D12Resource* resources[4] = {};
-    unsigned long long releaseAt = 0;
 };
 
 std::atomic<bool> g_wanted { false };
@@ -33,17 +25,15 @@ std::atomic<bool> g_active { false };
 struct Freeze
 {
     ID3D12Device* device = nullptr;
-    Copy output; // rests in COPY_SOURCE
-    Copy depth;  // rests in NON_PIXEL_SHADER_RESOURCE, like the game's own guides
-    Copy motion;
+    Copy output; // the frame's subrect; rests in COPY_SOURCE
+    Copy depth;  // the whole texture, as a depth-stencil one must be copied; rests in NON_PIXEL_SHADER_RESOURCE,
+    Copy motion; // like the game's own guides. The motion vectors whole too, the same way.
     Copy exposure; // 1x1, or none
-    bool havePreExposure = false;
-    float preExposure = 0.0f;
+    Frame frozen;  // the frozen frame as the game gave it: where the subrects lie in the guides, their sizes
     bool first = false;            // the next substituted frame is the first: Reset
     bool resetLive = false;        // the next live frame is the first after unfreezing: Reset
     unsigned long long frames = 0; // calls to FreezeApply
     unsigned long long frozenAt = 0;
-    Retired retired[4];
 };
 Freeze g_freeze;
 
@@ -86,7 +76,8 @@ bool Make(Copy* copy, const D3D12_RESOURCE_DESC& like, unsigned width, unsigned 
     return true;
 }
 
-// Copies the `width` x `height` rectangle at (x, y) of `from` (subresource 0) into `to` at (0, 0).
+// Copies the `width` x `height` rectangle at (x, y) of `from` (subresource 0) into `to` at (0, 0). Not for a
+// depth-stencil texture, which is only ever copied whole (CopyBack).
 void CopyRect(ID3D12GraphicsCommandList* list, ID3D12Resource* from, unsigned x, unsigned y, ID3D12Resource* to,
               unsigned width, unsigned height)
 {
@@ -99,7 +90,7 @@ void CopyRect(ID3D12GraphicsCommandList* list, ID3D12Resource* from, unsigned x,
     list->CopyTextureRegion(&destination, 0, 0, 0, &source, &box);
 }
 
-// The other way: the whole of `from` into `to` at (x, y).
+// The whole of `from` (subresource 0) into `to` at (x, y).
 void CopyBack(ID3D12GraphicsCommandList* list, ID3D12Resource* from, ID3D12Resource* to, unsigned x, unsigned y)
 {
     D3D12_TEXTURE_COPY_LOCATION source = {};
@@ -110,42 +101,12 @@ void CopyBack(ID3D12GraphicsCommandList* list, ID3D12Resource* from, ID3D12Resou
     list->CopyTextureRegion(&destination, x, y, 0, &source, nullptr);
 }
 
-void ReleaseRetired(bool all)
-{
-    for (Retired& r : g_freeze.retired)
-    {
-        if (r.releaseAt == 0 || (!all && r.releaseAt > g_freeze.frames))
-            continue;
-        for (ID3D12Resource* resource : r.resources)
-        {
-            if (resource != nullptr)
-                resource->Release();
-        }
-        r = {};
-    }
-}
-
-// Retires the live copies: released kRetireFrames frames on, when no recorded command list can still read them.
+// Retires the live copies to the NR pass, which releases them once the GPU is done with the lists that read them.
 void Retire()
 {
-    Retired* slot = &g_freeze.retired[0];
-    for (Retired& r : g_freeze.retired)
-    {
-        if (r.releaseAt == 0)
-        {
-            slot = &r;
-            break;
-        }
-        if (r.releaseAt < slot->releaseAt)
-            slot = &r;
-    }
-    if (slot->releaseAt != 0)
-        ReleaseRetired(true); // every slot in use: the oldest have long since been read
-    slot->resources[0] = g_freeze.output.resource;
-    slot->resources[1] = g_freeze.depth.resource;
-    slot->resources[2] = g_freeze.motion.resource;
-    slot->resources[3] = g_freeze.exposure.resource;
-    slot->releaseAt = g_freeze.frames + kRetireFrames;
+    ID3D12Resource* const copies[4] = { g_freeze.output.resource, g_freeze.depth.resource, g_freeze.motion.resource,
+                                        g_freeze.exposure.resource };
+    NrRetire(copies, 4);
     g_freeze.output = {};
     g_freeze.depth = {};
     g_freeze.motion = {};
@@ -162,8 +123,8 @@ bool Capture(ID3D12GraphicsCommandList* list, const Frame& f)
     }
     const bool exposure = f.exposure != nullptr && f.exposureView != DXGI_FORMAT_UNKNOWN;
     if (!Make(&g_freeze.output, f.outputDesc, f.width, f.height, "picture") ||
-        !Make(&g_freeze.depth, f.depthDesc, f.guideWidth, f.guideHeight, "depth") ||
-        !Make(&g_freeze.motion, f.motionDesc, f.motionWidth, f.motionHeight, "motion vector") ||
+        !Make(&g_freeze.depth, f.depthDesc, unsigned(f.depthDesc.Width), f.depthDesc.Height, "depth") ||
+        !Make(&g_freeze.motion, f.motionDesc, unsigned(f.motionDesc.Width), f.motionDesc.Height, "motion vector") ||
         (exposure && !Make(&g_freeze.exposure, f.exposureDesc, 1, 1, "exposure")))
     {
         ID3D12Resource* const made[] = { g_freeze.output.resource, g_freeze.depth.resource, g_freeze.motion.resource,
@@ -188,13 +149,13 @@ bool Capture(ID3D12GraphicsCommandList* list, const Frame& f)
     Transition(list, g_freeze.output.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     Transition(list, f.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    CopyRect(list, f.depth, f.depthBaseX, f.depthBaseY, g_freeze.depth.resource, f.guideWidth, f.guideHeight);
+    CopyBack(list, f.depth, g_freeze.depth.resource, 0, 0);
     Transition(list, f.depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(list, g_freeze.depth.resource, D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     Transition(list, f.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    CopyRect(list, f.motion, f.motionBaseX, f.motionBaseY, g_freeze.motion.resource, f.motionWidth, f.motionHeight);
+    CopyBack(list, f.motion, g_freeze.motion.resource, 0, 0);
     Transition(list, f.motion, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(list, g_freeze.motion.resource, D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -207,8 +168,7 @@ bool Capture(ID3D12GraphicsCommandList* list, const Frame& f)
         Transition(list, g_freeze.exposure.resource, D3D12_RESOURCE_STATE_COPY_DEST,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
-    g_freeze.havePreExposure = f.havePreExposure;
-    g_freeze.preExposure = f.preExposure;
+    g_freeze.frozen = f;
     g_freeze.first = true;
     g_freeze.frozenAt = g_freeze.frames;
     g_active.store(true, std::memory_order_release);
@@ -224,17 +184,12 @@ bool Capture(ID3D12GraphicsCommandList* list, const Frame& f)
     return true;
 }
 
-// The frozen copies still fit this frame: same sizes and formats.
+// The frozen picture still fits this frame's Output: the same size and format. The guides and the exposure are the
+// frozen frame's own, whatever the game hands over now.
 bool Fits(const Frame& f)
 {
     return g_freeze.output.width == f.width && g_freeze.output.height == f.height &&
-           g_freeze.output.format == f.outputDesc.Format && g_freeze.depth.width == f.guideWidth &&
-           g_freeze.depth.height == f.guideHeight && g_freeze.depth.format == f.depthDesc.Format &&
-           g_freeze.motion.width == f.motionWidth && g_freeze.motion.height == f.motionHeight &&
-           g_freeze.motion.format == f.motionDesc.Format &&
-           (g_freeze.exposure.resource != nullptr) ==
-               (f.exposure != nullptr && f.exposureView != DXGI_FORMAT_UNKNOWN) &&
-           (g_freeze.exposure.resource == nullptr || g_freeze.exposure.format == f.exposureDesc.Format);
+           g_freeze.output.format == f.outputDesc.Format;
 }
 } // namespace
 
@@ -245,7 +200,6 @@ bool FreezeActive() { return g_active.load(std::memory_order_acquire); }
 bool FreezeApply(ID3D12GraphicsCommandList* list, Frame* f)
 {
     ++g_freeze.frames;
-    ReleaseRetired(false);
     const bool wanted = g_wanted.load(std::memory_order_acquire);
     const bool active = g_freeze.output.resource != nullptr;
     if (!wanted)
@@ -287,17 +241,28 @@ bool FreezeApply(ID3D12GraphicsCommandList* list, Frame* f)
         CopyBack(list, g_freeze.output.resource, f->output, f->baseX, f->baseY);
         Transition(list, f->output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    // The frozen guides, with the frozen frame's subrects in them, and its exposure.
+    const Frame& z = g_freeze.frozen;
     f->depth = g_freeze.depth.resource;
-    f->depthBaseX = 0;
-    f->depthBaseY = 0;
+    f->depthDesc = g_freeze.depth.resource->GetDesc();
+    f->depthBaseX = z.depthBaseX;
+    f->depthBaseY = z.depthBaseY;
+    f->guideWidth = z.guideWidth;
+    f->guideHeight = z.guideHeight;
+    f->depthInverted = z.depthInverted;
     f->motion = g_freeze.motion.resource;
-    f->motionBaseX = 0;
-    f->motionBaseY = 0;
+    f->motionDesc = g_freeze.motion.resource->GetDesc();
+    f->motionBaseX = z.motionBaseX;
+    f->motionBaseY = z.motionBaseY;
+    f->motionWidth = z.motionWidth;
+    f->motionHeight = z.motionHeight;
+    f->lowResMotion = z.lowResMotion;
     f->exposure = g_freeze.exposure.resource;
-    if (f->exposure == nullptr)
-        f->exposureView = DXGI_FORMAT_UNKNOWN;
-    f->havePreExposure = g_freeze.havePreExposure;
-    f->preExposure = g_freeze.preExposure;
+    f->exposureView = f->exposure != nullptr ? z.exposureView : DXGI_FORMAT_UNKNOWN;
+    if (f->exposure != nullptr)
+        f->exposureDesc = g_freeze.exposure.resource->GetDesc();
+    f->havePreExposure = z.havePreExposure;
+    f->preExposure = z.preExposure;
     // The picture does not move: a motion vector scale of 0 tells the model so.
     f->mvScaleX = 0.0f;
     f->mvScaleY = 0.0f;
@@ -313,7 +278,6 @@ void FreezeRelease()
 {
     if (g_freeze.output.resource != nullptr)
         Retire();
-    ReleaseRetired(true);
     g_active.store(false, std::memory_order_release);
     g_freeze.resetLive = false;
     if (g_freeze.device != nullptr)
