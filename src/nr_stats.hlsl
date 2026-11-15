@@ -30,9 +30,26 @@ groupshared uint sMeter[NR_METER_BINS];
 static const float kSceneKey = 0.2;
 static const float kSceneLow = 0.25;
 static const float kSceneHigh = 0.75;
-// How fast the white point follows the scene: a change is 63% followed after this many seconds, 95% after three
-// times as long. The model's history sees a picture that brightens or darkens smoothly, not in steps.
-static const float kSceneSeconds = 0.5;
+// How the white point follows the scene (Follow): the first kSceneSlackEv of any difference is not followed at all,
+// and the rest at one of two speeds, 63% of it after this many seconds, 95% after three times as long. A scene that
+// got brighter is followed fast enough to spare its highlights the shoulder; one that got darker slowly, so a scene
+// that keeps changing (a road through trees, the sky in and out of view) holds the white point near its brightest
+// rather than swinging it both ways, and the model's history sees a picture that changes seldom and smoothly. With
+// one speed of 0.5 s and no slack, Forza Horizon 6's white point moved by up to 3 EV within two seconds of driving,
+// and the picture breathed.
+static const float kSceneBrighterSeconds = 1.0;
+static const float kSceneDarkerSeconds = 4.0;
+static const float kSceneSlackEv = 0.25;
+
+// The next log2 exposure from the last and this frame's target, `seconds` later. The slack is a dead band that moves
+// with the value, so it needs no memory: inside it nothing moves, and a new level is settled kSceneSlackEv short of.
+float Follow(float last, float target, float seconds)
+{
+    const float difference = target - last;
+    const float beyond = difference - clamp(difference, -kSceneSlackEv, kSceneSlackEv);
+    const float time = beyond < 0.0 ? kSceneBrighterSeconds : kSceneDarkerSeconds; // a lower exposure: brighter
+    return last + beyond * (1.0 - exp(-max(seconds, 0.0) / time));
+}
 
 // The pixel the meter takes of square `cell` (NR_METER_STEP a side): a different one in each square, the same every
 // frame. With the same one in every square, a pattern in the frame that repeats in step with the squares would be
@@ -124,10 +141,15 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 below += count;
             }
             const float target = log2(kSceneKey) - sum / (high - low); // log2 of the exposure: key over the middle
-            float next = target;
-            if (haveOld && (g.flags & NR_FLAG_SCENE_RESET) == 0)
-                next = lerp(log2(old), target, 1.0 - exp(-max(g.seconds, 0.0) / kSceneSeconds));
-            exposure = exp2(next);
+            // Held inside the slack: the stored value itself, not exp2 of its log2, so it does not creep frame by frame.
+            if (!haveOld || (g.flags & NR_FLAG_SCENE_RESET) != 0)
+                exposure = exp2(target);
+            else
+            {
+                const float last = log2(old);
+                const float next = Follow(last, target, g.seconds);
+                exposure = next == last ? old : exp2(next);
+            }
         }
         gScene[uint2(0, 0)] = exposure;
         return;

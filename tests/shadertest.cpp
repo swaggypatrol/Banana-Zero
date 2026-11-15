@@ -1729,7 +1729,9 @@ void CheckCast(Scene& s, const Setup& base)
 const float kSceneKey = 0.2f;
 const float kSceneLow = 0.25f;
 const float kSceneHigh = 0.75f;
-const float kSceneSeconds = 0.5f;
+const double kSceneBrighterSeconds = 1.0;
+const double kSceneDarkerSeconds = 4.0;
+const double kSceneSlackEv = 0.25;
 
 // Whether the meter counts a pixel, and the log2 of its luminance if so.
 bool Metered(const Pixel& p, float* ev)
@@ -1855,12 +1857,29 @@ void CheckMeter(Scene& s)
           s.format->name, fresh, want, exact);
     Check(empty(), "scene meter, %s: the histogram is empty again after the resolve", s.format->name);
 
-    // A quarter of a second after a white point 3 EV away: 1 - e^-0.5 = 39% of the way.
+    // Half a second after an exposure 3 EV higher, the scene having got brighter: the first 0.25 EV not followed, of
+    // the rest 1 - e^-0.5 = 39%. After one 3 EV lower, the scene darker: 1 - e^-0.125 = 12% of it.
     const float old = float(std::exp2(want + 3.0));
-    const double eased = std::log2(double(run(true, old, false, 0.25f)));
-    const double wantEased = want + 3.0 * std::exp(-0.25 / double(kSceneSeconds));
-    Check(std::fabs(eased - wantEased) < 0.01, "scene meter, %s: eased for 0.25 s from 2^%+.3f: 2^%+.3f (want 2^%+.3f)",
-          s.format->name, want + 3.0, eased, wantEased);
+    const double eased = std::log2(double(run(true, old, false, 0.5f)));
+    const double wantEased = want + kSceneSlackEv + (3.0 - kSceneSlackEv) * std::exp(-0.5 / kSceneBrighterSeconds);
+    Check(std::fabs(eased - wantEased) < 0.01,
+          "scene meter, %s: a brighter scene followed for 0.5 s from 2^%+.3f: 2^%+.3f (want 2^%+.3f)", s.format->name,
+          want + 3.0, eased, wantEased);
+    const double darker = std::log2(double(run(true, float(std::exp2(want - 3.0)), false, 0.5f)));
+    const double wantDarker = want - kSceneSlackEv - (3.0 - kSceneSlackEv) * std::exp(-0.5 / kSceneDarkerSeconds);
+    Check(std::fabs(darker - wantDarker) < 0.01,
+          "scene meter, %s: a darker scene followed for 0.5 s from 2^%+.3f: 2^%+.3f (want 2^%+.3f)", s.format->name,
+          want - 3.0, darker, wantDarker);
+    // Within the slack nothing moves, however long, either way; a reset still jumps to the scene.
+    const float over = float(std::exp2(want + 0.2));
+    const float under = float(std::exp2(want - 0.2));
+    const float heldUp = run(true, over, false, 10.0f);
+    const float heldDown = run(true, under, false, 10.0f);
+    const double jumped = std::log2(double(run(true, over, true, 0.0f)));
+    Check(heldUp == over && heldDown == under && std::fabs(jumped - want) < 0.01,
+          "scene meter, %s: 0.2 EV either side of the scene's held for 10 s (%g, %g; want %g, %g), a reset jumps to "
+          "2^%+.3f",
+          s.format->name, double(heldUp), double(heldDown), double(over), double(under), jumped);
 
     // Nothing to measure (the meter did not run, so the histogram is empty): the last value stays, even on a reset.
     const float kept = run(false, old, true, 0.0f);

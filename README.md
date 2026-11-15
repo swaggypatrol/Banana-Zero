@@ -169,7 +169,7 @@ folded into a smooth **shoulder**.
 
 | Control | Range | What it does |
 |---|---|---|
-| **White point from** | Auto, Game exposure, Manual, Scene meter | What counts as "white". Auto (default) uses the game's exposure when the game provides it (TLOU2 and GTA V do) and meters the scene when it does not (Witcher 3). It decides every frame: GTA V provides none on some of its own screens, such as around its pause menu and when you quit, so Auto meters those frames. Each switch restarts the model's memory of earlier frames, once |
+| **White point from** | Auto, Game exposure, Manual, Scene meter | What counts as "white". Auto (default) uses the game's exposure when the game provides it (TLOU2 and GTA V do) and meters the scene when it does not (Witcher 3). It decides every frame: GTA V provides none on some of its own screens, such as around its pause menu and when you quit, so Auto meters those frames. Each switch restarts the model's memory of earlier frames, once. The scene meter follows a brighter scene within about a second and a darker one over several, and lets the scene's brightness wander by a quarter of an EV without following it, so the picture does not breathe as you drive or look around |
 | **White point (EV)** | -2 to +2, default 0 | Shifts the white point. +1 hands the model a picture one stop darker |
 | **Highlight shoulder** | 0.50 to 0.90, default 0.70 | Where highlight compression starts, as a fraction of the white point |
 
