@@ -8,8 +8,8 @@
 //      frame's size or (ModelScale) smaller.         in place, plus the badge and the calibration card.
 //   3. proxy UAV -> NPSR; typeless guides cloned. 7. every resource back to the state it arrived in.
 //   4. the model: Color = proxy, Depth/MVec = the
-//      game's (or a typed clone of the subrect),
-//      Output = our model-output texture.
+//      game's (or a typed clone of the whole
+//      texture), Output = our model-output texture.
 // On the frames the background thread asks for them, the statistics passes run beside 2 and 6 and the frame dump
 // beside 6; both are copied into readback buffers that the CPU looks at a few frames later, once the frame numbers
 // written at both ends show the copy has landed (no fence, no wait). While the menu shows the preview, the
@@ -18,6 +18,11 @@
 // At every frame, timestamps around the pass and around the model are resolved into a readback ring the same way,
 // for its GPU time (the menu shows it, the log's periodic lines carry it); a slot is read when it comes round again,
 // kRing frames later.
+//
+// Every recording into a game's list ends with a completion marker (WriteBufferImmediate, MARKER_OUT) into a readback
+// ring: the marker lands once the GPU has finished everything before it. A descriptor slot is written again only once
+// the frame that last used it has landed (else that frame goes without NR), and a retired texture or feature is
+// released only once the recording after its retirement has.
 //
 // Nothing else reads back, waits or allocates per frame; the descriptors come from a ring, the constants are root
 // constants. One lock guards the whole state and is only ever tried, never waited for, on the evaluate path: a
@@ -31,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <vector>
 
 #include "build_hash.h"
 #include "freeze.h"
@@ -48,8 +54,8 @@
 namespace
 {
 constexpr int kFeatureNR = 18;
-constexpr unsigned kRing = 8;                 // frames whose descriptors are kept apart; also how long retired
-                                              // handles and textures are parked before release
+constexpr unsigned kRing = 8;                 // frames whose descriptors and timestamps are kept apart
+constexpr unsigned kMarkers = 64;             // the completion markers' ring (see the top), in recordings
 constexpr unsigned kSrvs = 7;                 // one descriptor table: t0-t6, then u0-u2 (nr_shared.h)
 constexpr unsigned kUav0 = kSrvs;
 constexpr unsigned kUav1 = kSrvs + 1;
@@ -61,7 +67,6 @@ constexpr uint64_t kEvaluatesBetweenCreates = 30; // the driver's feature slots
 constexpr unsigned kMaxCreates = 64;
 constexpr uint64_t kFailuresBeforeOff = 600;  // consecutive model failures before NR stops trying
 constexpr unsigned kMaxModelLogLines = 200;
-constexpr size_t kMaxParked = 8;
 
 constexpr unsigned kStatsSlots = 4;           // the readback ring
 constexpr uint64_t kStatsSlotBytes = (NR_S_WORDS * 4 + 255) / 256 * 256;
@@ -136,6 +141,7 @@ enum Skip
     kSkipWaiting,     // a rebuild is due but too soon after the last one
     kSkipTypedLoad,   // the GPU cannot read the Output's format through a UAV, which the in-place composite needs
     kSkipState,       // what the game has bound on this list is not known yet (list_state.h)
+    kSkipInFlight,    // the GPU has not finished the frame that last used this frame's descriptors
     kSkipCount
 };
 
@@ -154,6 +160,7 @@ const char* const kSkipText[kSkipCount] = {
     "a rebuild is due but the last creation was fewer than 30 evaluations ago",
     "the GPU cannot load the Output's format through a UAV (typed UAV load), which the in-place composite needs",
     "what the game has bound on this command list is not known yet, so it could not be bound again afterwards",
+    "the GPU has not finished the frame that last used this frame's descriptors",
 };
 
 // The same, short, for the counts in the log's evaluation lines: a reason logged once may still come every few
@@ -173,6 +180,7 @@ const char* const kSkipShort[kSkipCount] = {
     "waiting",
     "typed load",
     "list state unknown",
+    "GPU behind",
 };
 
 const char* ResultName(int result)
@@ -202,8 +210,8 @@ const char* ResultName(int result)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Formats. The model wants typed guides; a typeless depth or motion texture is cloned (its subrect only) into a
-// typed one where a typed resource format exists. The two depth-stencil families have none (their typed names are
+// Formats. The model wants typed guides; a typeless depth or motion texture is cloned, the whole of it, into a typed
+// one where a typed resource format exists. The two depth-stencil families have none (their typed names are
 // view-only formats), so they are handed over as they are and the model's answer goes in the log.
 
 DXGI_FORMAT TypedFormat(DXGI_FORMAT format)
@@ -501,12 +509,13 @@ struct Buffer
     uint64_t size = 0;
 };
 
-// A feature and the resources its recorded commands may still reference, released kRing frames after retirement.
+// A feature and the resources its recorded commands may still reference, released once the recording after the one
+// it was retired in has landed (Landed).
 struct Parked
 {
     void* handle = nullptr;
     ID3D12Resource* resources[4] = {};
-    uint64_t releaseAt = 0;
+    uint64_t recording = 0; // g_nr.recordings when it was retired
 };
 
 // What the CPU knew about a frame whose statistics or dump it recorded: goes into the log line or the file header.
@@ -635,9 +644,17 @@ struct Nr
 
     Texture proxy;
     Texture modelOutput;
-    Texture depthClone;
-    Texture motionClone;
-    Parked parked[kMaxParked];
+    Texture depthClone;  // a typeless guide's typed clone, the whole texture: made when its texture changes size or
+    Texture motionClone; // format, none for a typed guide. Rest in COPY_DEST.
+    std::vector<Parked> parked;
+
+    // The completion markers (see the top): kMarkers words, each the stamp (recording + 1) of the last recording
+    // whose marker went there. Made at the first recording; NR goes off without them.
+    Buffer markers;
+    uint64_t markersAddress = 0;
+    bool markersFailed = false;
+    uint64_t recordings = 0;            // recordings into a game's list so far, each ended with a marker
+    uint64_t ringRecording[kRing] = {}; // per descriptor slot, the recording of the frame that last used it
 
     // ModelScale: the model's picture as last evaluated (the frame's size, or smaller; 0 before the feature's first
     // evaluation), since which frame, and the size last logged. The fit's three textures (nr_fit.hlsl), at the
@@ -1149,7 +1166,7 @@ bool Initialise(ID3D12GraphicsCommandList* list)
         Log("NR: could not find our own directory (%lu)", GetLastError());
         return false;
     }
-    if (FAILED(list->GetDevice(IID_PPV_ARGS(&g_nr.device))))
+    if (g_nr.device == nullptr && FAILED(list->GetDevice(IID_PPV_ARGS(&g_nr.device))))
     {
         Log("NR: the command list has no device");
         return false;
@@ -1310,34 +1327,61 @@ void Unpark(Parked* p)
     *p = {};
 }
 
-// Retires a feature and the resources its recorded commands may still reference: command lists in flight may use
-// them for a few more frames, so they are released kRing frames on.
+// Whether the GPU has finished `recording` (see the top): its marker, or a later recording's in the same word, has
+// landed. A recording whose list was never executed is counted as finished once one kMarkers later has landed.
+bool Landed(uint64_t recording)
+{
+    if (g_nr.markers.mapped == nullptr)
+        return false;
+    const uint32_t stamp = uint32_t(recording + 1);
+    const uint32_t got = reinterpret_cast<const volatile uint32_t*>(g_nr.markers.mapped)[recording % kMarkers];
+    return int32_t(got - stamp) >= 0;
+}
+
+// The markers' readback ring, made at the first recording into a game's list: from its device, as the freeze may
+// record before NR is initialised. False when it cannot be had; NR then goes off.
+bool EnsureMarkers(ID3D12GraphicsCommandList* list)
+{
+    if (g_nr.markers.resource != nullptr)
+        return true;
+    if (g_nr.markersFailed)
+        return false;
+    g_nr.markersFailed = true; // until it is in place
+    if (g_nr.device == nullptr && FAILED(list->GetDevice(IID_PPV_ARGS(&g_nr.device))))
+        return false;
+    if (!MakeBuffer(&g_nr.markers, D3D12_HEAP_TYPE_READBACK, kMarkers * 4, "completion markers"))
+        return false;
+    g_nr.markersAddress = g_nr.markers.resource->GetGPUVirtualAddress();
+    g_nr.markersFailed = false;
+    return true;
+}
+
+// Ends a recording into the game's list with its marker. False when the list cannot write one.
+bool MarkRecording(ID3D12GraphicsCommandList* list)
+{
+    ID3D12GraphicsCommandList2* two = nullptr;
+    if (FAILED(list->QueryInterface(IID_PPV_ARGS(&two))) || two == nullptr)
+        return false;
+    const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER marker = { g_nr.markersAddress + (g_nr.recordings % kMarkers) * 4,
+                                                          uint32_t(g_nr.recordings + 1) };
+    const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+    two->WriteBufferImmediate(1, &marker, &mode);
+    two->Release();
+    ++g_nr.recordings;
+    return true;
+}
+
+// Retires a feature and the resources its recorded commands may still reference, until the recording after this one
+// has landed: by then the menu's own list, which may draw the preview at the Present between the two, is done too.
 void Park(void* handle, ID3D12Resource* const* resources, unsigned count)
 {
-    Parked* slot = nullptr;
-    for (Parked& p : g_nr.parked)
-    {
-        if (!Used(p))
-        {
-            slot = &p;
-            break;
-        }
-    }
-    if (slot == nullptr)
-    {
-        // Full: the oldest has waited longest; release it now.
-        slot = &g_nr.parked[0];
-        for (Parked& p : g_nr.parked)
-        {
-            if (p.releaseAt < slot->releaseAt)
-                slot = &p;
-        }
-        Unpark(slot);
-    }
-    slot->handle = handle;
+    Parked p;
+    p.handle = handle;
     for (unsigned i = 0; i < count && i < 4; ++i)
-        slot->resources[i] = resources[i];
-    slot->releaseAt = g_nr.frame + kRing;
+        p.resources[i] = resources[i];
+    p.recording = g_nr.recordings;
+    if (Used(p))
+        g_nr.parked.push_back(p);
 }
 
 // The fit's textures, when the frame's size changes.
@@ -1355,14 +1399,11 @@ void DropFit()
 // The live feature and its textures, for a new frame size.
 void ParkCurrent()
 {
-    ID3D12Resource* const resources[4] = { g_nr.proxy.resource, g_nr.modelOutput.resource, g_nr.depthClone.resource,
-                                           g_nr.motionClone.resource };
-    Park(g_nr.handle, resources, 4);
+    ID3D12Resource* const resources[2] = { g_nr.proxy.resource, g_nr.modelOutput.resource };
+    Park(g_nr.handle, resources, 2);
     g_nr.handle = nullptr;
     g_nr.proxy = {};
     g_nr.modelOutput = {};
-    g_nr.depthClone = {};
-    g_nr.motionClone = {};
     g_nr.modelWidth = 0;
     g_nr.modelHeight = 0;
     DropFit();
@@ -1370,17 +1411,25 @@ void ParkCurrent()
 
 void ReleaseParked()
 {
-    for (Parked& p : g_nr.parked)
+    for (size_t i = 0; i < g_nr.parked.size();)
     {
-        if (Used(p) && p.releaseAt <= g_nr.frame)
-            Unpark(&p);
+        if (Landed(g_nr.parked[i].recording + 1))
+        {
+            Unpark(&g_nr.parked[i]);
+            g_nr.parked[i] = g_nr.parked.back();
+            g_nr.parked.pop_back();
+        }
+        else
+            ++i;
     }
 }
 
-// One of the depth's textures (the dilated motion vectors, the control mask) at this format and size: kept while they
-// stay, made again when they change (the old one parked for the command lists still in flight). One that cannot be
-// made is not tried again, and what wants it does nothing.
-bool EnsureGuide(Texture* texture, DXGI_FORMAT format, unsigned width, unsigned height, bool* failed, const char* what)
+// A texture of ours at this format and size: kept while they stay, made again when they change (the old one parked
+// for the command lists still in flight). One that cannot be made is not tried again. The depth's textures (the
+// dilated motion vectors, the control mask) rest in the UAV state; what wants one that cannot be made does nothing.
+bool EnsureGuide(Texture* texture, DXGI_FORMAT format, unsigned width, unsigned height, bool* failed, const char* what,
+                 D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                 D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
 {
     if (texture->resource != nullptr && texture->format == format && texture->width == width &&
         texture->height == height)
@@ -1393,13 +1442,34 @@ bool EnsureGuide(Texture* texture, DXGI_FORMAT format, unsigned width, unsigned 
         Park(nullptr, old, 1);
         *texture = {};
     }
-    if (!MakeTexture(texture, format, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, what))
+    if (!MakeTexture(texture, format, width, height, flags, state, what))
     {
         *failed = true;
         return false;
     }
     return true;
+}
+
+// The typed clone of a typeless guide, as large as the game's texture: the whole of it is copied (Clone), as a
+// depth-stencil texture must be (CopyTextureRegion), and the game's subrect is read where it lies in the clone. A
+// typed guide needs none, and a clone it had is parked. Each frame, so that the clone follows the texture when the
+// game makes it again at another size (a new render resolution). False when it cannot be made.
+bool EnsureClone(Texture* clone, const D3D12_RESOURCE_DESC& guide, const char* what)
+{
+    const DXGI_FORMAT typed = TypedFormat(guide.Format);
+    if (typed == guide.Format)
+    {
+        if (clone->resource != nullptr)
+        {
+            ID3D12Resource* const old[1] = { clone->resource };
+            Park(nullptr, old, 1);
+            *clone = {};
+        }
+        return true;
+    }
+    bool failed = false;
+    return EnsureGuide(clone, typed, unsigned(guide.Width), guide.Height, &failed, what, D3D12_RESOURCE_FLAG_NONE,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
 }
 
 void DescribeFrame(const Frame& f)
@@ -1451,22 +1521,6 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Frame& f, const ModelS
                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "model output"))
     {
         Off("a texture could not be created");
-        return false;
-    }
-    const DXGI_FORMAT depthTyped = TypedFormat(f.depthDesc.Format);
-    if (depthTyped != f.depthDesc.Format &&
-        !MakeTexture(&g_nr.depthClone, depthTyped, f.guideWidth, f.guideHeight, D3D12_RESOURCE_FLAG_NONE,
-                     D3D12_RESOURCE_STATE_COPY_DEST, "depth clone"))
-    {
-        Off("the depth clone could not be created");
-        return false;
-    }
-    const DXGI_FORMAT motionTyped = TypedFormat(f.motionDesc.Format);
-    if (motionTyped != f.motionDesc.Format &&
-        !MakeTexture(&g_nr.motionClone, motionTyped, f.motionWidth, f.motionHeight, D3D12_RESOURCE_FLAG_NONE,
-                     D3D12_RESOURCE_STATE_COPY_DEST, "motion clone"))
-    {
-        Off("the motion vector clone could not be created");
         return false;
     }
 
@@ -2062,9 +2116,9 @@ void CopyOut(ID3D12GraphicsCommandList* list, const Buffer& from, const Buffer& 
     list->ResourceBarrier(1, &barrier);
 }
 
-// Copies the subrect of a typeless guide into its typed clone; the source is back in NPSR when it returns.
-void Clone(ID3D12GraphicsCommandList* list, ID3D12Resource* source, unsigned baseX, unsigned baseY,
-           const Texture& clone)
+// Copies a typeless guide, the whole of its first subresource, into its typed clone of the same size (no source box,
+// no offset: all a depth-stencil texture allows); the source is back in NPSR when it returns.
+void Clone(ID3D12GraphicsCommandList* list, ID3D12Resource* source, const Texture& clone)
 {
     D3D12_RESOURCE_BARRIER barriers[2];
     Transition(&barriers[0], source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2074,8 +2128,7 @@ void Clone(ID3D12GraphicsCommandList* list, ID3D12Resource* source, unsigned bas
     from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION to = from;
     to.pResource = clone.resource;
-    const D3D12_BOX box = { baseX, baseY, 0, baseX + clone.width, baseY + clone.height, 1 };
-    list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
     Transition(&barriers[0], source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(&barriers[1], clone.resource, D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2285,6 +2338,7 @@ __declspec(noinline) void LogModelRecovered(uint64_t failures)
 void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, unsigned feature, bool previewing)
 {
     const uint64_t frameIndex = g_nr.frame++;
+    g_nr.ringRecording[frameIndex % kRing] = g_nr.recordings;
     const unsigned base = unsigned(frameIndex % kRing) * kDescriptorsPerFrame;
     const unsigned encodeTable = base;
     const unsigned compositeTable = base + kTable;
@@ -2513,17 +2567,15 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     unsigned depthBaseX = f.depthBaseX, depthBaseY = f.depthBaseY;
     if (g_nr.depthClone.resource != nullptr)
     {
-        Clone(list, f.depth, f.depthBaseX, f.depthBaseY, g_nr.depthClone);
+        Clone(list, f.depth, g_nr.depthClone); // the subrect lies where it does in the game's
         depth = g_nr.depthClone.resource;
-        depthBaseX = depthBaseY = 0;
     }
     ID3D12Resource* motion = f.motion;
     unsigned motionBaseX = f.motionBaseX, motionBaseY = f.motionBaseY;
     if (g_nr.motionClone.resource != nullptr)
     {
-        Clone(list, f.motion, f.motionBaseX, f.motionBaseY, g_nr.motionClone);
+        Clone(list, f.motion, g_nr.motionClone);
         motion = g_nr.motionClone.resource;
-        motionBaseX = motionBaseY = 0;
     }
     if (dilate)
     {
@@ -3123,6 +3175,12 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     if (!ListStateCapture(list, game, detail))
         return kSkipState;
     *captured = true;
+    if (!EnsureMarkers(list))
+    {
+        Off("no completion markers: what the GPU has finished cannot be told");
+        return kSkipOff;
+    }
+    ReleaseParked();
     // The frozen frame (M3, freeze.h) goes first, NR on or off: with NR off the frozen picture still replaces the
     // game's Output, so that A/B and the split screen compare the same picture.
     FreezeApply(list, &frame);
@@ -3162,7 +3220,6 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
         NoteReset(kResetHandle);
     }
 
-    ReleaseParked();
     CollectStats(previewing);
     CollectDump();
     const ModelCreationKey active { g_nr.createdWidth, g_nr.createdHeight,
@@ -3193,6 +3250,16 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
             return kSkipOff;
         return kSkipCreated;
     }
+    if (!EnsureClone(&g_nr.depthClone, frame.depthDesc, "depth clone") ||
+        !EnsureClone(&g_nr.motionClone, frame.motionDesc, "motion vector clone"))
+    {
+        Off("a typed clone of the game's depth or motion vectors could not be created");
+        return kSkipOff;
+    }
+    // This frame's descriptors and timestamps go where the frame kRing back left its own: not before the GPU is done
+    // with them.
+    if (g_nr.frame >= kRing && !Landed(g_nr.ringRecording[g_nr.frame % kRing]))
+        return kSkipInFlight;
     Run(list, frame, *s, source.feature, previewing);
     return kSkipNone;
 }
@@ -3215,7 +3282,11 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
     const char* detail = nullptr; // why the list's state is not known, when that is the reason
     const Skip skip = Evaluate(list, params, source, &game, &captured, &detail);
     if (captured)
+    {
         ListStateRestore(list, game);
+        if (g_nr.markers.resource != nullptr && !MarkRecording(list) && !g_nr.off.load(std::memory_order_relaxed))
+            Off("the game's command list cannot write a completion marker (no ID3D12GraphicsCommandList2)");
+    }
     if (g_nr.attempted.load(std::memory_order_relaxed))
         PublishStatus();
     ReleaseSRWLockExclusive(&g_lock);
@@ -3246,20 +3317,14 @@ unsigned ReleaseEverything()
         ++released;
     }
     g_nr.handle = nullptr;
+    FreezeRelease(); // parks its copies, released with the rest just below
     for (Parked& p : g_nr.parked)
     {
         if (p.handle != nullptr)
-        {
-            g_nr.bridge.release(p.handle);
             ++released;
-        }
-        for (ID3D12Resource* r : p.resources)
-        {
-            if (r != nullptr)
-                r->Release();
-        }
-        p = {};
+        Unpark(&p);
     }
+    g_nr.parked.clear();
     Texture* const textures[] = { &g_nr.proxy, &g_nr.modelOutput, &g_nr.depthClone, &g_nr.motionClone, &g_nr.preview,
                                   &g_nr.scene, &g_nr.dilated,     &g_nr.mask,       &g_nr.slope,       &g_nr.value,
                                   &g_nr.raw };
@@ -3269,7 +3334,6 @@ unsigned ReleaseEverything()
             t->resource->Release();
         *t = {};
     }
-    FreezeRelease();
     AcquireSRWLockExclusive(&g_previewLock);
     g_preview = {};
     g_preview.generation = ++g_nr.previewGeneration;
@@ -3285,6 +3349,7 @@ void ReleaseBuffers()
     DropBuffer(&g_nr.stats);
     DropBuffer(&g_nr.statsReadback);
     DropBuffer(&g_nr.timingReadback);
+    DropBuffer(&g_nr.markers);
     g_nr.statsPending = false;
     int state = kDumpReady;
     g_nr.dumpState.compare_exchange_strong(state, kDumpIdle);
@@ -3333,6 +3398,8 @@ void NrBeforeCoreShutdown()
     g_nr.ready = false;
     ReleaseSRWLockExclusive(&g_lock);
 }
+
+void NrRetire(ID3D12Resource* const* resources, unsigned count) { Park(nullptr, resources, count); }
 
 void NrCoreGone()
 {

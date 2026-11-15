@@ -2656,6 +2656,56 @@ void CheckShowSky(ID3D12Resource* depth, const DepthCase& d, bool inverted, cons
     Drop(s);
 }
 
+// The typed clone nr_dx12.cpp makes of a typeless depth (EnsureClone, Clone): as large as the game's texture, with no
+// flags, the whole of it copied with no source box and no offset, as CopyTextureRegion allows for a depth-stencil
+// texture. The guide's subrect is then where it lay in the game's, here at (5,3), not at the clone's corner.
+void CheckClone(ID3D12Resource* depth, const DepthCase& d, bool inverted, const std::vector<DepthRect>& pattern,
+                const char* what)
+{
+    const bool wide = d.resource == DXGI_FORMAT_R32_TYPELESS;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = depth->GetDesc();
+    desc.Format = wide ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16_UNORM; // nr_dx12.cpp's TypedFormat
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Resource* clone = nullptr;
+    Must(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                           IID_PPV_ARGS(&clone)),
+         "CreateCommittedResource(clone)");
+    Barrier(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION from = {};
+    from.pResource = depth;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION to = from;
+    to.pResource = clone;
+    g.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    Barrier(depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(clone, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const std::vector<uint8_t> got = Read(clone, wide ? 4 : 2, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    unsigned wrong = 0;
+    for (UINT y = 0; y < kDepthHeight; ++y)
+    {
+        for (UINT x = 0; x < kDepthWidth; ++x)
+        {
+            const float want = PatternDepth(pattern, x, y, inverted);
+            float value = 0.0f;
+            if (wide)
+                std::memcpy(&value, got.data() + (size_t(y) * kDepthWidth + x) * 4, 4);
+            else
+            {
+                uint16_t bits = 0;
+                std::memcpy(&bits, got.data() + (size_t(y) * kDepthWidth + x) * 2, 2);
+                value = float(bits) / 65535.0f;
+            }
+            if (std::fabs(value - want) > (wide ? 0.0f : 1.0f / 65535.0f))
+                ++wrong;
+        }
+    }
+    Check(wrong == 0, "depth, %s: the typed clone of the whole texture holds every texel where it lay (%u wrong)", what,
+          wrong);
+    clone->Release();
+}
+
 void TestDepth()
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 options = {};
@@ -2691,6 +2741,8 @@ void TestDepth()
                 CheckDilate(depth, d, inverted, pattern, DXGI_FORMAT_R32G32_FLOAT, kGuideWidth, kGuideHeight, 2, 2,
                             what);
             CheckShowSky(depth, d, inverted, pattern, what);
+            if (d.resource == DXGI_FORMAT_R32_TYPELESS || d.resource == DXGI_FORMAT_R16_TYPELESS)
+                CheckClone(depth, d, inverted, pattern, what);
             depth->Release();
         }
     }
@@ -2702,8 +2754,13 @@ bool SameState(const ListState& a, const ListState& b)
 {
     if (a.known != b.known || a.heapCount != b.heapCount || a.heaps[0] != b.heaps[0] || a.heaps[1] != b.heaps[1] ||
         a.pipeline != b.pipeline || a.stateObject != b.stateObject || a.computeRoot != b.computeRoot ||
-        a.constantCount != b.constantCount)
+        a.graphicsRoot != b.graphicsRoot || a.constantCount != b.constantCount)
         return false;
+    for (unsigned i = 0; i < kListStateArgs; ++i)
+    {
+        if (a.graphicsTables[i] != b.graphicsTables[i])
+            return false;
+    }
     for (unsigned i = 0; i < kListStateArgs; ++i)
     {
         if (a.args[i].kind != b.args[i].kind || (a.args[i].kind != 0 && a.args[i].value != b.args[i].value))
@@ -2767,6 +2824,81 @@ void DropOwnTable(OwnTable* o)
     *reinterpret_cast<void***>(o->list) = o->classTable;
     o->list->Release();
     o->allocator->Release();
+}
+
+// A spy in front of list_state.cpp's hooks, in a copy of the list's function table put on it for the restore alone:
+// the order in which the restore sets the descriptor heaps and the graphics descriptor tables.
+struct SpyCall
+{
+    bool heaps; // SetDescriptorHeaps; else SetGraphicsRootDescriptorTable
+    UINT parameter;
+    uint64_t handle;
+};
+std::vector<SpyCall> g_spy;
+void* g_spyHeaps = nullptr; // the entries the spies stand in front of
+void* g_spyTable = nullptr;
+
+void STDMETHODCALLTYPE SpyHeaps(ID3D12GraphicsCommandList* list, UINT count, ID3D12DescriptorHeap* const* heaps)
+{
+    g_spy.push_back({ true, 0, 0 });
+    reinterpret_cast<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*)>(
+        g_spyHeaps)(list, count, heaps);
+}
+
+void STDMETHODCALLTYPE SpyTable(ID3D12GraphicsCommandList* list, UINT parameter, D3D12_GPU_DESCRIPTOR_HANDLE table)
+{
+    g_spy.push_back({ false, parameter, table.ptr });
+    reinterpret_cast<void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE)>(
+        g_spyTable)(list, parameter, table);
+}
+
+// The game's graphics descriptor tables across the NR pass: the pass changes the descriptor heaps, which leaves every
+// table undefined, so the restore must set them again, after the heaps. `list` is followed and known (reset since).
+void CheckGraphicsTables(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* const* gameHeaps,
+                         ID3D12DescriptorHeap* ourHeap, ID3D12RootSignature* gameRoot)
+{
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = gameHeaps[0]->GetGPUDescriptorHandleForHeapStart();
+    list->SetDescriptorHeaps(2, gameHeaps);
+    list->SetGraphicsRootSignature(gameRoot);
+    list->SetGraphicsRootDescriptorTable(2, table);
+    ListState game = {};
+    Check(ListStateCapture(list, &game) && game.graphicsRoot == gameRoot && game.graphicsTables[2] == table.ptr,
+          "list state: the game's graphics root signature and descriptor table");
+    list->SetDescriptorHeaps(1, &ourHeap); // the NR pass's
+
+    constexpr unsigned kHeaps = 28, kGraphicsTable = 32; // ID3D12GraphicsCommandList's table
+    void** const table0 = *reinterpret_cast<void***>(list);
+    void** const spied = CopyTable(table0);
+    g_spyHeaps = table0[kHeaps];
+    g_spyTable = table0[kGraphicsTable];
+    spied[kHeaps] = reinterpret_cast<void*>(&SpyHeaps);
+    spied[kGraphicsTable] = reinterpret_cast<void*>(&SpyTable);
+    g_spy.clear();
+    *reinterpret_cast<void***>(list) = spied;
+    ListStateRestore(list, game);
+    *reinterpret_cast<void***>(list) = table0;
+    size_t heapsAt = SIZE_MAX, tableAt = SIZE_MAX, tables = 0;
+    for (size_t i = 0; i < g_spy.size(); ++i)
+    {
+        if (g_spy[i].heaps)
+            heapsAt = i;
+        else
+        {
+            ++tables;
+            if (g_spy[i].parameter == 2 && g_spy[i].handle == table.ptr)
+                tableAt = i;
+        }
+    }
+    Check(heapsAt != SIZE_MAX && tableAt != SIZE_MAX && tableAt > heapsAt && tables == 1,
+          "list state: after the pass the game's graphics table is set again, after its heaps (%zu calls, %zu tables)",
+          g_spy.size(), tables);
+
+    ListState s = {};
+    list->SetGraphicsRootSignature(g.root);
+    bool none = ListStateCapture(list, &s) && s.graphicsRoot == g.root;
+    for (const uint64_t t : s.graphicsTables)
+        none = none && t == 0;
+    Check(none, "list state: a new graphics root signature leaves no graphics table to set again");
 }
 
 void TestListState()
@@ -2958,6 +3090,7 @@ void TestListState()
     late.list->SetDescriptorHeaps(1, &ourHeap);
     Check(ListStateCapture(late.list, &s) && s.heapCount == 1 && s.heaps[0] == ourHeap,
           "list state: and is followed after its Reset, which reached the runtime's");
+    CheckGraphicsTables(late.list, gameHeaps, ourHeap, gameRoot);
     DropOwnTable(&late);
     for (OwnTable& o : own)
         DropOwnTable(&o);
@@ -2968,10 +3101,43 @@ void TestListState()
 }
 } // namespace
 
+// The completion marker nr_dx12.cpp ends each recording into a game's list with (MarkRecording): a 32-bit stamp
+// written by WriteBufferImmediate, MARKER_OUT, into a readback buffer, which rests in COPY_DEST. Not there while the
+// list has not run, there once it has, and what lies in the word next to it is left alone.
+void TestMarker()
+{
+    ID3D12Resource* markers = MakeBuffer(256, D3D12_HEAP_TYPE_READBACK);
+    const volatile uint32_t* mapped = nullptr;
+    const D3D12_RANGE all = { 0, 256 };
+    Must(markers->Map(0, &all, reinterpret_cast<void**>(const_cast<uint32_t**>(&mapped))), "Map(markers)");
+    ID3D12GraphicsCommandList2* two = nullptr;
+    Must(g.list->QueryInterface(IID_PPV_ARGS(&two)), "QueryInterface(ID3D12GraphicsCommandList2)");
+    // Work before it: the statistics buffer cleared, as a frame of the pass would do something first.
+    ID3D12Resource* work = MakeBuffer(NR_S_WORDS * 4, D3D12_HEAP_TYPE_DEFAULT);
+    Barrier(work, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    NrConstants c = {};
+    c.mode = NR_STATS_CLEAR;
+    c.frame = 5;
+    Dispatch(g.stats, Table({}, {}, {}, {}, {}, work, NR_S_WORDS * 4), c, 1, 1);
+    const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER marker = { markers->GetGPUVirtualAddress() + 4, 7u };
+    const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+    two->WriteBufferImmediate(1, &marker, &mode);
+    Check(mapped[1] == 0, "completion marker: not there before the list has run (%u)", unsigned(mapped[1]));
+    Submit();
+    Check(mapped[1] == 7 && mapped[0] == 0 && mapped[2] == 0,
+          "completion marker: there once the list has run, the words beside it untouched (%u, %u, %u)",
+          unsigned(mapped[0]), unsigned(mapped[1]), unsigned(mapped[2]));
+    two->Release();
+    work->Release();
+    markers->Unmap(0, nullptr);
+    markers->Release();
+}
+
 int main()
 {
     Init();
     TestListState();
+    TestMarker();
     D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
     g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options);
     Say("shadertest: nr_cso %zu bytes, nr_stats_cso %zu bytes, nr_fit_cso %zu bytes, typed UAV loads of the "

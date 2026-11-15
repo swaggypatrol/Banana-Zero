@@ -86,6 +86,14 @@ bool NrPreview(NrPreviewState* out)
     *out = {};
     return false;
 }
+void NrRetire(ID3D12Resource* const* resources, unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i)
+    {
+        if (resources[i] != nullptr)
+            resources[i]->Release();
+    }
+}
 
 namespace
 {

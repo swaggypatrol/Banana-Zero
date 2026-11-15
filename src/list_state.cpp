@@ -21,7 +21,9 @@ enum Index : unsigned
     kExecuteBundle = 27,
     kSetDescriptorHeaps = 28,
     kSetComputeRootSignature = 29,
+    kSetGraphicsRootSignature = 30,
     kSetComputeRootDescriptorTable = 31,
+    kSetGraphicsRootDescriptorTable = 32,
     kSetComputeRoot32BitConstant = 33,
     kSetComputeRoot32BitConstants = 35,
     kSetComputeRootConstantBufferView = 37,
@@ -36,7 +38,9 @@ constexpr Index kWatched[] = { kReset,
                                kExecuteBundle,
                                kSetDescriptorHeaps,
                                kSetComputeRootSignature,
+                               kSetGraphicsRootSignature,
                                kSetComputeRootDescriptorTable,
+                               kSetGraphicsRootDescriptorTable,
                                kSetComputeRoot32BitConstant,
                                kSetComputeRoot32BitConstants,
                                kSetComputeRootConstantBufferView,
@@ -338,6 +342,37 @@ void STDMETHODCALLTYPE HookSetComputeRootSignature(ID3D12GraphicsCommandList* li
     Original<Fn, kSetComputeRootSignature>(list)(list, root);
 }
 
+// The graphics root signature and descriptor tables are followed only so that the tables can be set again after the
+// NR pass changed the descriptor heaps, which leaves every table, graphics ones too, undefined.
+void STDMETHODCALLTYPE HookSetGraphicsRootSignature(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root)
+{
+    typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+    if (ListState* s = StateOf(list, true))
+    {
+        if (s->graphicsRoot != root)
+        {
+            for (uint64_t& t : s->graphicsTables)
+                t = 0;
+        }
+        s->graphicsRoot = root;
+    }
+    Original<Fn, kSetGraphicsRootSignature>(list)(list, root);
+}
+
+void STDMETHODCALLTYPE HookSetGraphicsRootDescriptorTable(ID3D12GraphicsCommandList* list, UINT parameter,
+                                                         D3D12_GPU_DESCRIPTOR_HANDLE table)
+{
+    typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+    if (ListState* s = StateOf(list, true))
+    {
+        if (parameter >= kListStateArgs)
+            Unknown(s, &g_saidOverflow, "a graphics root parameter beyond 64 was set");
+        else
+            s->graphicsTables[parameter] = table.ptr;
+    }
+    Original<Fn, kSetGraphicsRootDescriptorTable>(list)(list, parameter, table);
+}
+
 void STDMETHODCALLTYPE HookSetComputeRootDescriptorTable(ID3D12GraphicsCommandList* list, UINT parameter,
                                                         D3D12_GPU_DESCRIPTOR_HANDLE table)
 {
@@ -420,7 +455,9 @@ void* HookFor(Index index)
     case kExecuteBundle: return reinterpret_cast<void*>(&HookExecuteBundle);
     case kSetDescriptorHeaps: return reinterpret_cast<void*>(&HookSetDescriptorHeaps);
     case kSetComputeRootSignature: return reinterpret_cast<void*>(&HookSetComputeRootSignature);
+    case kSetGraphicsRootSignature: return reinterpret_cast<void*>(&HookSetGraphicsRootSignature);
     case kSetComputeRootDescriptorTable: return reinterpret_cast<void*>(&HookSetComputeRootDescriptorTable);
+    case kSetGraphicsRootDescriptorTable: return reinterpret_cast<void*>(&HookSetGraphicsRootDescriptorTable);
     case kSetComputeRoot32BitConstant: return reinterpret_cast<void*>(&HookSetComputeRoot32BitConstant);
     case kSetComputeRoot32BitConstants: return reinterpret_cast<void*>(&HookSetComputeRoot32BitConstants);
     case kSetComputeRootConstantBufferView: return reinterpret_cast<void*>(&HookSetComputeRootConstantBufferView);
@@ -729,7 +766,19 @@ void ListStateCount(ListStateCounts* out)
 void ListStateRestore(ID3D12GraphicsCommandList* list, const ListState& state)
 {
     if (state.heapCount != 0)
+    {
         list->SetDescriptorHeaps(state.heapCount, state.heaps);
+        // Changing the heaps left the game's graphics tables undefined too: set again on its own graphics root
+        // signature, which the NR pass does not change.
+        if (state.graphicsRoot != nullptr)
+        {
+            for (UINT i = 0; i < kListStateArgs; ++i)
+            {
+                if (state.graphicsTables[i] != 0)
+                    list->SetGraphicsRootDescriptorTable(i, D3D12_GPU_DESCRIPTOR_HANDLE{ state.graphicsTables[i] });
+            }
+        }
+    }
     if (state.computeRoot != nullptr)
     {
         list->SetComputeRootSignature(state.computeRoot);
