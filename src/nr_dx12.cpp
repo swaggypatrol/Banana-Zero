@@ -61,7 +61,7 @@ constexpr unsigned kUav0 = kSrvs;
 constexpr unsigned kUav1 = kSrvs + 1;
 constexpr unsigned kUav2 = kSrvs + 2;
 constexpr unsigned kTable = kSrvs + 3;
-constexpr unsigned kTablesPerFrame = 8;       // encode, composite, dump, preview, meter, dilate, sky, fit
+constexpr unsigned kTablesPerFrame = 9;       // encode, composite, dump, preview, meter, dilate, sky, fit, gain
 constexpr unsigned kDescriptorsPerFrame = kTable * kTablesPerFrame;
 constexpr uint64_t kEvaluatesBetweenCreates = 30; // the driver's feature slots
 constexpr unsigned kMaxCreates = 64;
@@ -541,7 +541,7 @@ struct FrameInfo
     float detail = 0.0f;
     float colour = 0.0f;
     float maxGain = 0.0f;
-    float highlight = 0.0f;
+    float globalColour = 0.0f;
 };
 
 // The statistics of one frame, handed from the render thread to the background thread that logs them.
@@ -692,6 +692,10 @@ struct Nr
     bool dilatedFailed = false;
     bool maskFailed = false;
     bool saidDepth = false; // what the depth's passes read has been logged
+
+    // The cast pass's sums (GlobalColour): made the first frame it is below 1. Rests in COMMON.
+    Buffer cast;
+    bool castFailed = false;
 
     // Statistics: made the first time the background thread or the preview asks.
     Buffer stats;
@@ -1678,6 +1682,20 @@ bool EnsureStats()
     return false;
 }
 
+// The cast pass's buffer: the statistics' layout, of which it fills NR_S_GLOBAL. Should it fail, the cast stays.
+bool EnsureCast()
+{
+    if (g_nr.cast.resource != nullptr)
+        return true;
+    if (g_nr.castFailed)
+        return false;
+    if (MakeBuffer(&g_nr.cast, D3D12_HEAP_TYPE_DEFAULT, NR_S_WORDS * 4, "frame-wide cast"))
+        return true;
+    g_nr.castFailed = true;
+    Log("NR: no buffer for the frame-wide cast; GlobalColour keeps all of the model's white balance");
+    return false;
+}
+
 // The scene meter's texture and histogram. Should they fail, WhiteSource scene falls back to the game's exposure.
 bool EnsureMeter()
 {
@@ -2244,7 +2262,8 @@ NrConstants FrameConstants(const Frame& f, const Settings& s, WhiteSource source
     c.detail = s.detailStrength;
     c.colour = s.colourStrength;
     c.maxGain = s.maxGainEV;
-    c.highlight = s.highlightRestore;
+    c.peak = std::exp2(s.highlightColour);
+    c.castColour = 1.0f - s.globalColour;
     c.whiteScale = 1.0f;
     if (s.compare) // the split screen (M3): the original's share of the width, never the whole of it
         c.splitX = Min(unsigned(float(f.width) * s.compareSplit / 100.0f + 0.5f), f.width - 2) | 1u;
@@ -2320,7 +2339,7 @@ FrameInfo Info(const Frame& f, const Settings& s, WhiteSource source, const NrCo
     info.detail = s.detailStrength;
     info.colour = s.colourStrength;
     info.maxGain = s.maxGainEV;
-    info.highlight = s.highlightRestore;
+    info.globalColour = s.globalColour;
     return info;
 }
 
@@ -2348,6 +2367,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const unsigned dilateTable = base + 5 * kTable;
     const unsigned skyTable = base + 6 * kTable;
     const unsigned fitTable = base + 7 * kTable;
+    const unsigned gainTable = base + 8 * kTable;
     const DXGI_FORMAT outputView = ViewFormat(f.outputDesc.Format);
 
     // The GPU time: this frame's timestamps go where the frame kRing back left its own, which are looked at first.
@@ -2380,6 +2400,10 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     if (!meter)
         g_nr.meterFresh = true;
     NrConstants constants = FrameConstants(f, s, source, frameIndex, modelWidth, modelHeight);
+    // The model's white balance, divided out in the composite (TakeCastOff): only when some of it is to go.
+    const bool cast = constants.castColour > 0.0f && EnsureCast();
+    if (cast)
+        constants.flags |= NR_FLAG_CAST;
     ID3D12Resource* exposure = nullptr;
     DXGI_FORMAT exposureView = DXGI_FORMAT_UNKNOWN;
     if (meter)
@@ -2439,14 +2463,17 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const View modelV = { g_nr.modelOutput.resource, g_nr.modelOutput.format };
     const View depthV = { f.depth, depthView };
     const Buffer* const statsBuffer = stats ? &g_nr.stats : nullptr;
+    const Buffer* const castBuffer = cast ? &g_nr.cast : nullptr;
     WriteTable(encodeTable, { frameView, none, none, exposureV, none, none, none }, proxyV, statsBuffer);
+    if (stats)
+        WriteTable(gainTable, { none, modelV, proxyV, none, none, none, none }, none, statsBuffer);
     if (scaled)
     {
         const View slopeV = { g_nr.slope.resource, g_nr.slope.format };
         const View valueV = { g_nr.value.resource, g_nr.value.format };
         const View rawV = { g_nr.raw.resource, g_nr.raw.format };
         WriteTable(compositeTable, { showSky ? depthV : none, modelV, proxyV, exposureV, slopeV, valueV, rawV },
-                   frameView, statsBuffer);
+                   frameView, castBuffer);
         // The fit's u1 is a texture, not the buffer.
         for (unsigned i = 0; i < kSrvs; ++i)
         {
@@ -2459,7 +2486,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     }
     else
         WriteTable(compositeTable, { showSky ? depthV : none, modelV, proxyV, exposureV, none, none, none }, frameView,
-                   statsBuffer);
+                   castBuffer);
     if (dumpDue)
         WriteTable(dumpTable, { frameView, modelV, proxyV, exposureV, none, none, none }, none, &g_nr.dump);
     if (preview)
@@ -2644,13 +2671,31 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
             c.mode = NR_STATS_GAIN;
             c.width = modelWidth;
             c.height = modelHeight;
-            Dispatch(list, g_nr.statsPipeline, compositeTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
+            Dispatch(list, g_nr.statsPipeline, gainTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
         }
         if (dump)
             DumpPasses(list, dumpTable, constants, NR_MODE_DUMP_BEFORE, layout);
-        Transition(&barriers[0], f.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        count = 0;
+        Transition(&barriers[count++], f.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list->ResourceBarrier(1, barriers);
+        if (cast)
+            Transition(&barriers[count++], g_nr.cast.resource, D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list->ResourceBarrier(count, barriers);
+        if (cast)
+        {
+            // This frame's sums, emptied first, then read by the composite (u1 of its table).
+            NrConstants c = constants;
+            c.mode = NR_STATS_CLEAR;
+            Dispatch(list, g_nr.statsPipeline, compositeTable, c, 1, 1);
+            UavBarrier(&barriers[0], g_nr.cast.resource);
+            list->ResourceBarrier(1, barriers);
+            c.mode = NR_STATS_CAST;
+            c.width = modelWidth;
+            c.height = modelHeight;
+            Dispatch(list, g_nr.statsPipeline, compositeTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
+            list->ResourceBarrier(1, barriers);
+        }
         if (g_nr.frames.load(std::memory_order_relaxed) == 0)
         {
             const float seconds = s.badgeSeconds;
@@ -2661,6 +2706,12 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         constants.badgeSize = LogClock() < g_nr.badgeUntil ? g_nr.badgeSize : 0;
         Dispatch(list, g_nr.pipeline, compositeTable, constants, groupsX, groupsY);
         constants.badgeSize = 0;
+        if (cast)
+        {
+            Transition(&barriers[0], g_nr.cast.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, barriers);
+        }
         if (dump)
         {
             Transition(&barriers[0], f.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -2851,7 +2902,7 @@ void LogSample(const Sample& sample)
         Percentile(w + NR_S_GAIN_HIST, NR_GAIN_BINS, NR_GAIN_EV_MIN, NR_GAIN_PER_EV, 0, 0, 0, gainPoints[i], gain[i],
                    sizeof gain[i]);
 
-    char line[1000];
+    char line[1400];
     size_t length = 0;
     auto add = [&](const char* format, auto... args) {
         if (length + 1 < sizeof line)
@@ -2892,6 +2943,45 @@ void LogSample(const Sample& sample)
     add("; settings #%u", info.generation);
     if ((info.flags & NR_FLAG_SCALED) != 0)
         add("; ModelScale: model input %ux%u", info.modelWidth, info.modelHeight);
+    if (info.modelRan)
+    {
+        // The frame as a whole (NR_S_GLOBAL): the model's white balance, measured on the greyish parts of its picture,
+        // and what it turns a grey into at DetailStrength x ColourStrength; its brightness change, weighted by
+        // luminance; then what of them is kept.
+        double global[NR_GLOBALS];
+        for (unsigned i = 0; i < NR_GLOBALS; ++i)
+            global[i] = double(int32_t(w[NR_S_GLOBAL + i])) / NR_G_SCALE;
+        const double weight = global[NR_G_WEIGHT];
+        if (weight > 0.0 && global[NR_G_IN_G] > 0.0)
+        {
+            const double k = double(info.detail) * double(info.colour);
+            const double grey = global[NR_G_GREY];
+            const double tr = grey > 0.0 ? global[NR_G_TINT_R] / grey : 0.0;
+            const double tb = grey > 0.0 ? global[NR_G_TINT_B] / grey : 0.0;
+            // What TakeCastOff divides out: 1 - GlobalColour of it, less where little grey was found (NR_GREY_PRIOR).
+            const double found = grey > 0.0 ? grey / (grey + NR_GREY_PRIOR * double(c[NR_C_GAIN_PIXELS])) : 0.0;
+            const double taken = (1.0 - double(info.globalColour)) * found;
+            // A grey under a share of the tint: its colour (2^tr, 1, 2^tb) over its luminance, then k of the change.
+            auto shown = [k](double share, double tR, double tB, double* rg, double* bg) {
+                const double r = std::exp2(share * tR), b = std::exp2(share * tB);
+                const double y = 0.2126 * r + 0.7152 + 0.0722 * b;
+                const double gr = 1.0 + k * (1.0 / y - 1.0);
+                *rg = (1.0 + k * (r / y - 1.0)) / gr;
+                *bg = (1.0 + k * (b / y - 1.0)) / gr;
+            };
+            double rg, bg, keptRg, keptBg;
+            shown(1.0, tr, tb, &rg, &bg);
+            shown(1.0 - taken, tr, tb, &keptRg, &keptBg);
+            const double brightness = double(info.detail) * global[NR_G_GAIN] / weight;
+            add("; frame: input R/G %.4f B/G %.4f; the model's cast at DetailStrength x ColourStrength %.2f: grey R/G "
+                "x%.4f B/G x%.4f (white balance R/G x%.4f B/G x%.4f, measured on %.1f%% of its picture in greys); its "
+                "mean brightness change %+.3f EV; kept (GlobalColour %.2f, %.0f%% of the white balance taken off): grey "
+                "R/G x%.4f B/G x%.4f",
+                global[NR_G_IN_R] / global[NR_G_IN_G], global[NR_G_IN_B] / global[NR_G_IN_G], k, rg, bg, std::exp2(tr),
+                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), brightness, double(info.globalColour),
+                100.0 * taken, keptRg, keptBg);
+        }
+    }
     Log("%s", line);
 }
 
@@ -2982,7 +3072,7 @@ void WriteDump(unsigned index)
     header.detail = info.detail;
     header.colour = info.colour;
     header.maxGain = info.maxGain;
-    header.highlight = info.highlight;
+    header.highlight = 0.0f; // HighlightRestore, retired in v0.3.0: the field stays so that older dumps still read
     WideCharToMultiByte(CP_UTF8, 0, exe, -1, header.exe, int(sizeof header.exe) - 1, nullptr, nullptr);
 
     const HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

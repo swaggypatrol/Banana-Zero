@@ -290,8 +290,13 @@ bool Apply(Settings* s, const char* key, const char* value, const char** problem
         return ParseRange(value, 0.0f, 2.0f, &s->colourStrength, problem);
     if (_stricmp(key, "MaxGainEV") == 0)
         return ParseRange(value, 0.0f, 2.0f, &s->maxGainEV, problem);
-    if (_stricmp(key, "HighlightRestore") == 0)
-        return ParseRange(value, 0.0f, 1.0f, &s->highlightRestore, problem);
+    if (_stricmp(key, "GlobalColour") == 0 || _stricmp(key, "GlobalColor") == 0)
+        return ParseRange(value, 0.0f, 1.0f, &s->globalColour, problem);
+    if (_stricmp(key, "HighlightColour") == 0 || _stricmp(key, "HighlightColor") == 0)
+        return ParseRange(value, 0.0f, 6.0f, &s->highlightColour, problem);
+    // Retired in v0.3.0 and still in older files: read and dropped without a word.
+    if (_stricmp(key, "HighlightRestore") == 0 || _stricmp(key, "GlobalBrightness") == 0)
+        return true;
 
     if (_stricmp(key, "Preview") == 0)
         return ParseChoice(value, kPreviewNames, kPreviewValues, &s->preview);
@@ -420,11 +425,11 @@ void SettingsDescribe(const Settings& s, char* out, size_t size)
     out[0] = '\0';
     Append(out, size, &length,
            "Enabled %d, Badge %.1f s; HDR InputType %s, WhiteSource %s, WhiteEV %+.2f, Shoulder %.2f; composite "
-           "DetailStrength %.2f, ColourStrength %.2f, MaxGainEV %.2f, HighlightRestore %.2f; aids Preview %s, Zebra %d, "
-           "Card %d (%s); StatsLog %.1f s, DumpEvery %.0f s; model parameters:",
+           "DetailStrength %.2f, ColourStrength %.2f, MaxGainEV %.2f, GlobalColour %.2f, HighlightColour %.2f; aids "
+           "Preview %s, Zebra %d, Card %d (%s); StatsLog %.1f s, DumpEvery %.0f s; model parameters:",
            s.enabled ? 1 : 0, double(s.badgeSeconds), kInputText[unsigned(s.inputType) % 3],
            kWhiteText[unsigned(s.whiteSource) % 4], double(s.whiteEV), double(s.shoulder), double(s.detailStrength),
-           double(s.colourStrength), double(s.maxGainEV), double(s.highlightRestore),
+           double(s.colourStrength), double(s.maxGainEV), double(s.globalColour), double(s.highlightColour),
            kPreviewText[unsigned(s.preview) % 3], s.zebra ? 1 : 0, s.card ? 1 : 0,
            kCornerText[unsigned(s.cardCorner) % 4], double(s.statsSeconds), double(s.dumpSeconds));
     SettingsDescribeModel(s.model, out + length, size - length);

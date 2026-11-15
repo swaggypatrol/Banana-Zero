@@ -19,6 +19,7 @@ RWByteAddressBuffer gStats : register(u1); // the statistics buffer, or for the 
 
 groupshared uint sHist[NR_HIST_BINS * 2];
 groupshared uint sCount[NR_COUNTS];
+groupshared int sGlobal[NR_GLOBALS];
 groupshared uint sMeter[NR_METER_BINS];
 
 // The scene white point: the frame's middle brightness, the mean log2 luminance of the middle half of its pixels (the
@@ -29,9 +30,26 @@ groupshared uint sMeter[NR_METER_BINS];
 static const float kSceneKey = 0.2;
 static const float kSceneLow = 0.25;
 static const float kSceneHigh = 0.75;
-// How fast the white point follows the scene: a change is 63% followed after this many seconds, 95% after three
-// times as long. The model's history sees a picture that brightens or darkens smoothly, not in steps.
-static const float kSceneSeconds = 0.5;
+// How the white point follows the scene (Follow): the first kSceneSlackEv of any difference is not followed at all,
+// and the rest at one of two speeds, 63% of it after this many seconds, 95% after three times as long. A scene that
+// got brighter is followed fast enough to spare its highlights the shoulder; one that got darker slowly, so a scene
+// that keeps changing (a road through trees, the sky in and out of view) holds the white point near its brightest
+// rather than swinging it both ways, and the model's history sees a picture that changes seldom and smoothly. With
+// one speed of 0.5 s and no slack, Forza Horizon 6's white point moved by up to 3 EV within two seconds of driving,
+// and the picture breathed.
+static const float kSceneBrighterSeconds = 1.0;
+static const float kSceneDarkerSeconds = 4.0;
+static const float kSceneSlackEv = 0.25;
+
+// The next log2 exposure from the last and this frame's target, `seconds` later. The slack is a dead band that moves
+// with the value, so it needs no memory: inside it nothing moves, and a new level is settled kSceneSlackEv short of.
+float Follow(float last, float target, float seconds)
+{
+    const float difference = target - last;
+    const float beyond = difference - clamp(difference, -kSceneSlackEv, kSceneSlackEv);
+    const float time = beyond < 0.0 ? kSceneBrighterSeconds : kSceneDarkerSeconds; // a lower exposure: brighter
+    return last + beyond * (1.0 - exp(-max(seconds, 0.0) / time));
+}
 
 // The pixel the meter takes of square `cell` (NR_METER_STEP a side): a different one in each square, the same every
 // frame. With the same one in every square, a pattern in the frame that repeats in step with the squares would be
@@ -123,10 +141,15 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 below += count;
             }
             const float target = log2(kSceneKey) - sum / (high - low); // log2 of the exposure: key over the middle
-            float next = target;
-            if (haveOld && (g.flags & NR_FLAG_SCENE_RESET) == 0)
-                next = lerp(log2(old), target, 1.0 - exp(-max(g.seconds, 0.0) / kSceneSeconds));
-            exposure = exp2(next);
+            // Held inside the slack: the stored value itself, not exp2 of its log2, so it does not creep frame by frame.
+            if (!haveOld || (g.flags & NR_FLAG_SCENE_RESET) != 0)
+                exposure = exp2(target);
+            else
+            {
+                const float last = log2(old);
+                const float next = Follow(last, target, g.seconds);
+                exposure = next == last ? old : exp2(next);
+            }
         }
         gScene[uint2(0, 0)] = exposure;
         return;
@@ -145,6 +168,8 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         sHist[i] = 0;
     if (gi < NR_COUNTS)
         sCount[gi] = 0;
+    if (gi < NR_GLOBALS)
+        sGlobal[gi] = 0;
     GroupMemoryBarrierWithGroupSync();
 
     const bool linearHdr = (g.flags & NR_FLAG_LINEAR_HDR) != 0;
@@ -204,8 +229,11 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 ++count[NR_C_DARK];
         }
     }
-    else if (g.mode == NR_STATS_GAIN)
+    else if (g.mode == NR_STATS_GAIN || g.mode == NR_STATS_CAST)
     {
+        // The cast pass is this one with its sums alone: no histogram, no counts.
+        const bool histogram = g.mode == NR_STATS_GAIN;
+        float global[NR_GLOBALS] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
         [unroll] for (uint n = 0; n < 4; ++n)
         {
             const uint2 q = id.xy * 2 + uint2(n & 1, n >> 1);
@@ -215,17 +243,44 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             const float3 pe = gProxy.Load(int3(q, 0)).rgb;
             const float3 p = ProxyLinear(pe);
             const float3 o = ModelLinear(gModel.Load(int3(q, 0)).rgb, pe);
-            const float gain = ModelGain(p, o, linearHdr) * g.detail;
+            const float change = ModelGain(p, o);
+            const float gain = change * g.detail;
             if (gain < -g.maxGain)
                 ++count[NR_C_GAIN_LOW];
             else if (gain > g.maxGain)
                 ++count[NR_C_GAIN_HIGH];
-            const float at = clamp(floor((gain - float(NR_GAIN_EV_MIN)) * float(NR_GAIN_PER_EV)), 0.0,
-                                   float(NR_GAIN_BINS - 1));
-            InterlockedAdd(sHist[uint(at)], 1u);
+            if (histogram)
+            {
+                const float at = clamp(floor((gain - float(NR_GAIN_EV_MIN)) * float(NR_GAIN_PER_EV)), 0.0,
+                                       float(NR_GAIN_BINS - 1));
+                InterlockedAdd(sHist[uint(at)], 1u);
+            }
             const float3 chroma = ModelChroma(p, o);
             if (abs(chroma.r) + abs(chroma.g) + abs(chroma.b) > 0.05)
                 ++count[NR_C_COLOUR];
+            // The brightness by the proxy's luminance, the white balance by greyness; each weight at most 1 and each
+            // value held to +-2, so that no sum can leave an int32 at 4K.
+            const float weight = dot(p, kLuma);
+            global[NR_G_WEIGHT] += weight;
+            global[NR_G_GAIN] += weight * clamp(change, -2.0, 2.0);
+            const float grey = Greyness(p, o);
+            if (grey > 0.0)
+            {
+                const float2 tint = Tint(p, o);
+                global[NR_G_GREY] += grey;
+                global[NR_G_TINT_R] += grey * tint.x;
+                global[NR_G_TINT_B] += grey * tint.y;
+            }
+            global[NR_G_IN_R] += p.r;
+            global[NR_G_IN_G] += p.g;
+            global[NR_G_IN_B] += p.b;
+        }
+        // Summed across the wave in floats, then into the group in fixed point, one rounding per wave.
+        [unroll] for (uint k = 0; k < NR_GLOBALS; ++k)
+        {
+            const float sum = WaveActiveSum(global[k]);
+            if (WaveIsFirstLane())
+                InterlockedAdd(sGlobal[k], int(round(sum * NR_G_SCALE)));
         }
     }
 
@@ -238,18 +293,23 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         InterlockedMax(sCount[NR_C_MAX_BITS], largest);
     GroupMemoryBarrierWithGroupSync();
 
-    // Merge: every non-empty bin and count once per group.
-    const uint histWords = g.mode == NR_STATS_INPUT ? NR_HIST_BINS * 2 : NR_GAIN_BINS;
-    const uint histStart = g.mode == NR_STATS_INPUT ? NR_S_MAX_HIST : NR_S_GAIN_HIST;
-    for (uint b = gi; b < histWords; b += 256)
+    // Merge: every non-empty bin and count once per group (the cast pass: its sums alone).
+    if (g.mode != NR_STATS_CAST)
     {
-        if (sHist[b] != 0)
-            gStats.InterlockedAdd((histStart + b) * 4, sHist[b]);
+        const uint histWords = g.mode == NR_STATS_INPUT ? NR_HIST_BINS * 2 : NR_GAIN_BINS;
+        const uint histStart = g.mode == NR_STATS_INPUT ? NR_S_MAX_HIST : NR_S_GAIN_HIST;
+        for (uint b = gi; b < histWords; b += 256)
+        {
+            if (sHist[b] != 0)
+                gStats.InterlockedAdd((histStart + b) * 4, sHist[b]);
+        }
+        if (gi < NR_COUNTS && gi != NR_C_MAX_BITS && sCount[gi] != 0)
+            gStats.InterlockedAdd((NR_S_COUNTS + gi) * 4, sCount[gi]);
+        if (gi == NR_C_MAX_BITS && sCount[gi] != 0)
+            gStats.InterlockedMax((NR_S_COUNTS + gi) * 4, sCount[gi]);
     }
-    if (gi < NR_COUNTS && gi != NR_C_MAX_BITS && sCount[gi] != 0)
-        gStats.InterlockedAdd((NR_S_COUNTS + gi) * 4, sCount[gi]);
-    if (gi == NR_C_MAX_BITS && sCount[gi] != 0)
-        gStats.InterlockedMax((NR_S_COUNTS + gi) * 4, sCount[gi]);
+    if (g.mode != NR_STATS_INPUT && gi < NR_GLOBALS && sGlobal[gi] != 0)
+        gStats.InterlockedAdd((NR_S_GLOBAL + gi) * 4, uint(sGlobal[gi]));
 
     // The values the counts are relative to, once per dispatch.
     if (g.mode == NR_STATS_INPUT && all(id.xy == 0))

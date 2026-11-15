@@ -15,7 +15,7 @@ Texture2D<float4> gSlope : register(t4); // ModelScale: the fit's three textures
 Texture2D<float4> gValue : register(t5);
 Texture2D<float4> gRaw : register(t6);
 RWTexture2D<float4> gTarget : register(u0); // encode: the proxy. composite: the game's Output. preview: the picture
-RWByteAddressBuffer gDump : register(u1);   // the frame dump
+RWByteAddressBuffer gDump : register(u1);   // the frame dump; for the composite, the cast pass's sums (NR_FLAG_CAST)
 
 // ---------------------------------------------------------------------------------------------------------------
 // The calibration card: a test chart drawn from formulas, in units of the white point, so that it goes
@@ -120,27 +120,63 @@ uint2 DepthTexel(uint2 p, uint2 size)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The composite: the model's brightness change as a gain on the frame, its colour change added at the frame's
-// luminance. `frame` is the game's value, in its own units; the result is in the same units. `change` is the
-// brightness change in EV before DetailStrength and MaxGainEV (ModelGain), `chroma` the colour change (ModelChroma).
+// The composite: the model's brightness change as a gain on the frame, its colour change added at the pixel's own
+// light up to the top of the display it assumes (Shown). `frame` is the game's value, in its own units; the result is
+// in the same units. `change` is the brightness change in EV before DetailStrength and MaxGainEV (ModelGain),
+// `chroma` the colour change (ModelChroma).
 
-float3 ApplyChange(float3 frame, float change, float3 chroma, bool linearHdr)
+// The share of a linear HDR pixel's luminance its colour change is added at: all of it while the pixel's largest
+// channel fits the display the composite assumes (the encode's own curve, its top at g.peak = 2^HighlightColour white
+// points), above that only what such a display would show. Added at a light's own luminance, which has no top, the
+// model's glow around a tail light hundreds of times as bright as the white point came back hundreds of times as
+// strong, as purple (Forza Horizon 6). HighlightColour 0 is the top of the model's own picture.
+float Shown(float3 c, float white)
+{
+    const float m = Max3(Clean(c)) / (white * g.peak);
+    return m > g.shoulder ? Shoulder(m, g.shoulder) / m : 1.0;
+}
+
+float3 ApplyChange(float3 frame, float change, float3 chroma, float white, bool linearHdr)
 {
     const float gain = clamp(change * g.detail, -g.maxGain, g.maxGain);
     const float3 c = linearHdr ? frame : SrgbDecode(saturate(frame));
     const float3 scaled = c * exp2(gain);
-    float3 result = scaled + (g.detail * g.colour * dot(max(scaled, 0.0), kLuma)) * chroma;
+    const float at = (linearHdr ? Shown(c, white) : 1.0) * dot(max(scaled, 0.0), kLuma);
+    float3 result = scaled + (g.detail * g.colour * at) * chroma;
     // A colour change may not push a channel below zero, or further below than the frame itself had it; nothing may
     // go above what the Output can store, unless the frame was already there.
     result = clamp(result, min(scaled, 0.0), max(c, kMaxOutput));
     return linearHdr ? result : SrgbEncode(saturate(result));
 }
 
-float3 Composite(float3 frame, float3 proxyEncoded, float3 modelEncoded, bool linearHdr)
+// GlobalColour (NR_FLAG_CAST): the model's white balance, measured on this frame by the cast pass (nr_stats.hlsl) as a
+// gain per channel on the greyish parts of its picture (Greyness, Tint), castColour of it divided out of the model's
+// colour at this pixel, whose light in the model's input is `light`. So greys stay grey, a white-balance cast comes
+// off every pixel exactly, a saturated colour loses only its own share of it (a red light has no blue to lose), and
+// what the model changes here against there stays. In Forza Horizon 6 the model's white balance moves a grey's B/G by
+// several per cent within seconds as the scene changes. The model can white-balance only what its output has room
+// for, so the share divided out fades from all of it below the shoulder to none where the model's input is at its top
+// (a white highlight it left white keeps its colour). And a white balance measured on little grey is mostly left
+// alone: NR_GREY_PRIOR of the picture counts as grey that is untinted, so a loading screen with 0.1% of grey loses a
+// fifth of it, a road with 18% nearly all.
+float CastSum(uint i) { return float(asint(gDump.Load((NR_S_GLOBAL + i) * 4))); }
+
+void TakeCastOff(inout float3 chroma, float3 light)
 {
-    const float3 p = ProxyLinear(proxyEncoded);
-    const float3 o = ModelLinear(modelEncoded, proxyEncoded);
-    return ApplyChange(frame, ModelGain(p, o, linearHdr), ModelChroma(p, o), linearHdr);
+    if ((g.flags & NR_FLAG_CAST) == 0)
+        return;
+    const float grey = CastSum(NR_G_GREY);
+    const float luminance = dot(light, kLuma);
+    if (!(grey > 0.0) || !(luminance > kChromaFloor))
+        return;
+    const float prior = float(NR_GREY_PRIOR * NR_G_SCALE) * float(g.modelWidth) * float(g.modelHeight);
+    const float room = saturate((1.0 - Max3(light)) / (1.0 - g.shoulder));
+    const float2 tint = g.castColour * room * float2(CastSum(NR_G_TINT_R), CastSum(NR_G_TINT_B)) / (grey + prior);
+    const float3 own = light / luminance;
+    const float3 c = (own + chroma) * float3(exp2(-tint.x), 1.0, exp2(-tint.y));
+    const float y = dot(c, kLuma);
+    if (y > 0.0)
+        chroma = c / y - own;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -472,9 +508,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         {
             float change;
             float3 chroma;
-            if (ScaledChange(id.xy, Guide(ProxyLight(frame.rgb, white, linearHdr)), change, chroma))
+            const float3 light = ProxyLight(frame.rgb, white, linearHdr);
+            if (ScaledChange(id.xy, Guide(light), change, chroma))
             {
-                result.rgb = ApplyChange(frame.rgb, change, chroma, linearHdr);
+                TakeCastOff(chroma, light);
+                result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }
         }
@@ -484,7 +522,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             const float3 modelEncoded = gModel.Load(int3(id.xy, 0)).rgb;
             if (any(modelEncoded != proxyEncoded))
             {
-                result.rgb = Composite(frame.rgb, proxyEncoded, modelEncoded, linearHdr);
+                const float3 p = ProxyLinear(proxyEncoded);
+                const float3 o = ModelLinear(modelEncoded, proxyEncoded);
+                const float change = ModelGain(p, o);
+                float3 chroma = ModelChroma(p, o);
+                TakeCastOff(chroma, p);
+                result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }
         }

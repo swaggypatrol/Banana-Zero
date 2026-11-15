@@ -98,7 +98,11 @@ struct Settings
     float detailStrength = 1.0f;   // DetailStrength: 0 .. 2; 0 leaves the frame exactly as DLSS made it
     float colourStrength = 1.0f;   // ColourStrength: 0 .. 2
     float maxGainEV = 1.0f;        // MaxGainEV: 0 .. 2
-    float highlightRestore = 0.0f; // HighlightRestore: 0 .. 1; 0 since the first playtest
+    // How much of the model's white balance is kept (nr.hlsl, TakeCastOff): it drifts with the scene (Forza Horizon 6,
+    // The Witcher 3's sky). The menu calls it Model white balance.
+    float globalColour = 0.0f;     // GlobalColour: 0 .. 1
+    // How far above the white point the model's colour change still goes in at a pixel's own light (nr.hlsl, Shown).
+    float highlightColour = 2.0f;  // HighlightColour: 0 .. 6 EV
 
     // The tuning aids.
     Preview preview = Preview::Off;       // Preview

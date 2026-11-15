@@ -57,7 +57,7 @@ void CSMain(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint gi :
         {
             const float3 o = ModelLinear(me, pe);
             const float3 chroma = ModelChroma(p, o);
-            input.yzw = float3(ModelGain(p, o, linearHdr), chroma.r, chroma.b);
+            input.yzw = float3(ModelGain(p, o), chroma.r, chroma.b);
         }
         sIn[i] = input;
     }

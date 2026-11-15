@@ -132,7 +132,7 @@ Three knobs. For most people, three knobs is plenty.
 | Control | Range | What it does |
 |---|---|---|
 | **Strength** | 0 to 1.5, default 1 | How much of the model's change lands on screen. **0 is bit-for-bit what DLSS made.** 1 is the model's change as it is; 1.5 adds half again. Want more or less? This one |
-| **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness. In The Witcher 3 the model cools the whole picture whenever there is a lot of sky in view, so the colours drift as you look around; 0 stops that |
+| **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness |
 | **Style** | Standard, Natural, Cinematic | The model's three built-in styles. NVIDIA has not documented what they do, so audition them. Takes effect on the next frame |
 
 ### Model: weights, masks and strengths
@@ -168,7 +168,7 @@ folded into a smooth **shoulder**.
 
 | Control | Range | What it does |
 |---|---|---|
-| **White point from** | Auto, Game exposure, Manual, Scene meter | What counts as "white". Auto (default) uses the game's exposure when the game provides it (TLOU2 and GTA V do) and meters the scene when it does not (Witcher 3). It decides every frame: GTA V provides none on some of its own screens, such as around its pause menu and when you quit, so Auto meters those frames. Each switch restarts the model's memory of earlier frames, once |
+| **White point from** | Auto, Game exposure, Manual, Scene meter | What counts as "white". Auto (default) uses the game's exposure when the game provides it (TLOU2 and GTA V do) and meters the scene when it does not (Witcher 3). It decides every frame: GTA V provides none on some of its own screens, such as around its pause menu and when you quit, so Auto meters those frames. Each switch restarts the model's memory of earlier frames, once. The scene meter follows a brighter scene within about a second and a darker one over several, and lets the scene's brightness wander by a quarter of an EV without following it, so the picture does not breathe as you drive or look around |
 | **White point (EV)** | -2 to +2, default 0 | Shifts the white point. +1 hands the model a picture one stop darker |
 | **Highlight shoulder** | 0.50 to 0.90, default 0.70 | Where highlight compression starts, as a fraction of the white point |
 
@@ -177,7 +177,8 @@ folded into a smooth **shoulder**.
 | Control | Range | What it does |
 |---|---|---|
 | **Max gain (EV)** | 0 to 1.5, default 1 | The hard limit on how far any one pixel may move. Bright specks, noise or white fringes? Lower this first |
-| **Highlight restore** | 0 to 1, default 0 | Scales the model's change inside compressed highlights back up. Made the Witcher 3 sky noisy once, hence 0 |
+| **Model white balance** | 0 to 1, default 0 | How much of the model's own white balance comes along (ini key `GlobalColour`). The model shifts the white balance of the whole picture as the scene changes (cooler whenever there is a lot of sky in The Witcher 3; in Forza Horizon 6 the greys of a road went yellow and blue by turns within seconds), so the colours drift as you drive or look around. At 0 it is measured every frame on the greyish parts of the picture, as a gain per colour channel, and divided out of every pixel's colour change: greys stay grey, the model's local colour changes stay. A frame with very little grey in it (a loading screen) has less of it taken off. 1 keeps it, as before v0.3.0 |
+| **Highlight colour (EV)** | 0 to 4, default 2 | How far above the white point the model's colour change still goes in at full strength. Above it a pixel gets only as much colour as a display that tops out there would show, so a light hundreds of times as bright as the white point does not take on the colour of the model's glow around it (Forza Horizon 6's tail lights went purple). 0 stops at the white point; lower it if bright lights take on odd colours |
 
 ### Compare
 
@@ -261,6 +262,7 @@ writes it for you; this is for people who like to open the back panel.
 | `Enabled` | 1 / 0 | 1 | NR on |
 | `DetailStrength` | 0 to 2 | 1 | Strength |
 | `ColourStrength` | 0 to 2 | 1 | Colour |
+| `GlobalColour` | 0 to 1 | 0 | Model white balance |
 | `Style` | 0 standard, 1 natural, 2 cinematic | not set (standard) | Style |
 | `Intensity` | 0 to 1; more acts as 1 | not set (1) | Model intensity |
 | `LocalStructure` | 0 to 2 | not set (1) | Local structure |
@@ -274,7 +276,7 @@ writes it for you; this is for people who like to open the back panel.
 | `WhiteEV` | -4 to +4 | 0 | White point (EV) |
 | `Shoulder` | 0.5 to 0.95 | 0.70 | Highlight shoulder |
 | `MaxGainEV` | 0 to 2 | 1 | Max gain (EV) |
-| `HighlightRestore` | 0 to 1 | 0 | Highlight restore |
+| `HighlightColour` | 0 to 6 | 2 | Highlight colour (EV) |
 | `Compare` | 1 / 0 | 0 | Split screen |
 | `CompareSplit` | 10 to 90 | 50 | Divider |
 | `Preview` | `off` / `input` / `output` | `off` | Preview window |
@@ -339,6 +341,7 @@ file next to the game (that one is not picked up then, and the menu's next save 
 
 | Version | What changed |
 |---|---|
+| v0.3.0 | The colours no longer drift and bright lights no longer turn purple; the picture no longer breathes. The model shifts the white balance of the whole picture as the scene changes (in Forza Horizon 6 the greys of a road went yellow and blue by turns within seconds). **Model white balance** (Advanced, default 0) measures that shift every frame on the greyish parts of the picture, as a gain per colour channel, and divides it out of every pixel's colour change: greys stay grey, the model's local colour changes stay, and a frame with little grey in it has less taken off. The model's colour change now goes in at a pixel's own light only up to **Highlight colour** (new, default 2 EV) above the white point, so a light hundreds of times as bright as the white point no longer takes on the colour of the model's glow around it. The scene meter follows a brighter scene within about a second and a darker one over several, and lets the brightness wander by a quarter of an EV without following it; in Forza Horizon 6, which gives no exposure, it had moved the white point by up to 3 EV within two seconds. **Global brightness** and **Highlight restore** are gone: the first took off a mean that the highlights outweighed, the second had been off since the first playtest. Files that still have them load as before, without a word in the log. The statistics line in the log says how much of the model's white balance was found and taken off. The default picture differs from v0.2.1 |
 | v0.2.1 | Four fixes found by reading the code against Direct3D 12's rules; none has been seen to go wrong in a game. When the game changes its render resolution without changing its output size (another DLSS quality mode, or dynamic resolution), a typeless depth or motion vector texture was still copied for the model at its old size; its copy now follows the texture. A depth texture is now copied whole, as Direct3D 12 requires, both for the model and for the frozen frame. After the NR pass the game's graphics descriptor tables are set again too: the pass changes the descriptor heaps, which leaves them undefined, and a game that draws on after DLSS without setting them again could read the wrong descriptors. Textures and model features that are no longer used are released only once the GPU has finished every frame that used them, and a frame's descriptors are written again only once the GPU is done with the frame that last used them, rather than after a count of 8 frames (a frame that would have to wait goes without NR instead). The picture is the same as v0.2.0 |
 | v0.2.0 | A little less GPU time for the NR pass. The scene meter runs only on the frames that use it: with the game's exposure (Auto in TLOU2 and GTA V, or Game exposure) or Manual as the white point, its pass over the whole frame is no longer run. Where it does run (Scene meter, or Auto in a game that gives no exposure, such as Witcher 3) it reads one pixel in sixteen, a different one in each 4x4 square so that no pattern in the frame falls in step with them; on the 160x90 test frame the white point it finds is within 0.04 EV of the one from every pixel, and a real frame has hundreds of times more pixels. A switch to the meter (GTA V around its pause menu, with Auto) starts from that frame's own brightness, not from a value followed over the frames before. With the game's exposure or Manual the picture is the same as v0.1.8 |
 | v0.1.8 | With Model input size below 100%, the three textures that carry the model's change back to the full frame are made at the model's size, not the frame's: at 4K about 150 MB less video memory at 50%, about 175 MB at 33.3%. The menu's own shaders are compiled with the build, so the first open no longer compiles them in the game. A first open whose swap chain check took more than 5 seconds could leave that check writing to memory no longer its own; it no longer can. `dlssnr.ini` saved again with the same values (only a comment changed, say) is no longer taken as a new file, so the menu keeps its unsaved changes. The picture is the same as v0.1.7 |
@@ -361,7 +364,9 @@ file next to the game (that one is not picked up then, and the menu's next save 
 - After a successful SR or RR evaluate, on the same command list, the NR pass encodes the stand-in picture, runs the
   model 1:1 at display size (no upscaling, it does not replace DLSS), and composites the result back.
 - The composite takes only the model's *ratio* of change per pixel and applies it to the untouched HDR frame, capped
-  by Max gain. That is why the model cannot make the whole picture blow out or go dark.
+  by Max gain. That is why the model cannot make the whole picture blow out or go dark. Its colour change goes in at
+  most at the brightness Highlight colour sets above the white point, so a light far brighter than that gets no more
+  colour than one at it.
 - With Model input size below 100% the model gets a smaller copy instead, each of its pixels the average of the frame
   pixels it covers. Its change comes back to full size through a guided filter: fitted in small windows against the
   brightness of the model's input, applied to the brightness of each full-size pixel, and never more than the model

@@ -821,8 +821,11 @@ void MenuDraw()
                 ImGui::SeparatorText("Composite");
                 commit |=
                     Float("MaxGainEV", "Max gain (EV)", &d.maxGainEV, 0.0f, 1.5f, 25, false, def.maxGainEV, "%.2f");
-                commit |= Float("HighlightRestore", "Highlight restore", &d.highlightRestore, 0.0f, 1.0f, 25, false,
-                                def.highlightRestore, "%.2f");
+                // A correction with a right answer (0: the game's own white balance), not a taste, hence here.
+                commit |= Float("GlobalColour", "Model white balance", &d.globalColour, 0.0f, 1.0f, 21, false,
+                                def.globalColour, "%.2f");
+                commit |= Float("HighlightColour", "Highlight colour (EV)", &d.highlightColour, 0.0f, 4.0f, 21, false,
+                                def.highlightColour, "%.1f");
             }
             ImGui::EndTabItem();
         }

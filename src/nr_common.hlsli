@@ -76,11 +76,6 @@ float ShoulderInverse(float y, float s)
 // What undoing the shoulder multiplies a proxy pixel by, given its largest channel y: 1 below the shoulder.
 float InverseScale(float y, float s) { return y > s ? ShoulderInverse(y, s) / max(y, 1.0e-20) : 1.0; }
 
-// The same, held where the curve compresses by 3 EV (kHeavyU): HighlightRestore undoes the shoulder only up to
-// there. Above it the inverse is so steep that one 8-bit step of the model's output is worth several EV (8 W encodes
-// to 254, and 255 stands for over 1000 W), so a model that clips a bright sky to white would come back as MaxGainEV
-// of extra light, and one that dims it a step as MaxGainEV less (the M4 playtest).
-float RestoreScale(float y, float s) { return InverseScale(min(y, s + kHeavyU * (1.0 - s)), s); }
 
 // The frame as the model's input (linear, before sRGB): white point, then the shoulder on the largest channel.
 float3 EncodeLinear(float3 frame, float white, float s)
@@ -100,21 +95,12 @@ float3 ModelLinear(float3 encoded, float3 proxyEncoded)
 }
 
 // The brightness change the composite applies, in EV, before DetailStrength and MaxGainEV: the model's luminance
-// over the proxy's, plus, above the shoulder, HighlightRestore's share of what undoing the curve (up to 3 EV of
-// compression) adds to it. Exactly 0 when the model returned its input.
-float ModelGain(float3 p, float3 o, bool linearHdr)
+// over the proxy's. Exactly 0 when the model returned its input.
+float ModelGain(float3 p, float3 o)
 {
     const float yp = dot(p, kLuma);
     const float yo = dot(o, kLuma);
-    float gain = yo == yp ? 0.0 : log2((yo + kGainFloor) / (yp + kGainFloor));
-    if (linearHdr && g.highlight != 0.0)
-    {
-        const float mp = Max3(p);
-        const float mo = Max3(o);
-        if (mp > g.shoulder || mo > g.shoulder)
-            gain += g.highlight * (log2(RestoreScale(mo, g.shoulder)) - log2(RestoreScale(mp, g.shoulder)));
-    }
-    return gain;
+    return yo == yp ? 0.0 : log2((yo + kGainFloor) / (yp + kGainFloor));
 }
 
 // The model's colour change: its chromaticity (colour over luminance) minus the proxy's. 0 in the near-black.
@@ -128,6 +114,26 @@ float3 ModelChroma(float3 p, float3 o)
 // Both chromaticities have luminance 1, so the colour change has none: its red and blue say what its green is. The fit
 // (nr_fit.hlsl) carries those two, and the composite takes green from them.
 float3 ChromaFromRedBlue(float r, float b) { return float3(r, -(kLuma.r * r + kLuma.b * b) / kLuma.g, b); }
+
+// The model's white balance, for GlobalColour, measured where a white balance shows: on the greyish parts of its
+// picture. How much a pixel counts: (its smallest channel over its largest)^2 in the proxy, below the shoulder, with
+// every channel of both pictures above 1/1024 (the near black's colour is noise, a compressed highlight's is the
+// encode's); 0 elsewhere. Its tint there: the model's gain on red and on blue over its gain on green, in EV, held to
+// +-2.
+static const float kTintFloor = 1.0 / 1024.0;
+float Greyness(float3 p, float3 o)
+{
+    const float lo = min(p.r, min(p.g, p.b));
+    const float hi = Max3(p);
+    if (!(lo > kTintFloor) || !(min(o.r, min(o.g, o.b)) > kTintFloor) || hi >= g.shoulder)
+        return 0.0;
+    const float share = lo / hi;
+    return share * share;
+}
+float2 Tint(float3 p, float3 o)
+{
+    return clamp(float2(log2((o.r * p.g) / (p.r * o.g)), log2((o.b * p.g) / (p.b * o.g))), -2.0, 2.0);
+}
 
 // ModelScale (NR_FLAG_SCALED): the model works on a smaller copy of the frame, and the fit and the composite bring its
 // change back to the frame's size along a guide: the log2 luminance of the model's input in linear light, with the
