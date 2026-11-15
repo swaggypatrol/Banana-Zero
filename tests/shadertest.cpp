@@ -351,24 +351,31 @@ F3 ModelChroma(F3 p, F3 o)
     return yp > kChromaFloor && yo > kChromaFloor ? o / yo - p / yp : F3 { 0.0f, 0.0f, 0.0f };
 }
 
-F3 ApplyChange(F3 frame, float change, F3 chroma, bool linear, const Knobs& k)
+float Shown(F3 c, float white, float s)
+{
+    const float m = Max3(Clean(c)) / white;
+    return m > s ? Shoulder(m, s) / m : 1.0f;
+}
+
+F3 ApplyChange(F3 frame, float change, F3 chroma, float white, bool linear, const Knobs& k)
 {
     const float gain = Min(Max(change * k.detail, -k.maxGain), k.maxGain);
     const F3 c = linear ? frame : SrgbDecode(Saturate(frame));
     const F3 scaled = c * std::exp2(gain);
     const F3 positive = { Max(scaled.r, 0.0f), Max(scaled.g, 0.0f), Max(scaled.b, 0.0f) };
-    F3 result = scaled + chroma * (k.detail * k.colour * Dot(positive, kLuma));
+    const float at = (linear ? Shown(c, white, k.shoulder) : 1.0f) * Dot(positive, kLuma);
+    F3 result = scaled + chroma * (k.detail * k.colour * at);
     result = { Min(Max(result.r, Min(scaled.r, 0.0f)), Max(c.r, kMaxOutput)),
                Min(Max(result.g, Min(scaled.g, 0.0f)), Max(c.g, kMaxOutput)),
                Min(Max(result.b, Min(scaled.b, 0.0f)), Max(c.b, kMaxOutput)) };
     return linear ? result : SrgbEncode(Saturate(result));
 }
 
-F3 Composite(F3 frame, F3 pe, F3 me, bool linear, const Knobs& k)
+F3 Composite(F3 frame, F3 pe, F3 me, float white, bool linear, const Knobs& k)
 {
     const F3 p = ProxyLinear(pe);
     const F3 o = ModelLinear(me, pe);
-    return ApplyChange(frame, ModelGain(p, o, linear, k), ModelChroma(p, o), linear, k);
+    return ApplyChange(frame, ModelGain(p, o, linear, k), ModelChroma(p, o), white, linear, k);
 }
 
 // ModelScale: the light the model's input holds for a frame value, the guide, the colour change from its red and blue.
@@ -1105,7 +1112,7 @@ Pixel ExpectedOutput(const Scene& s, const Setup& u, const std::vector<Pixel>& p
     const Pixel& me = model[size_t(y) * s.width + x];
     if (u.knobs.detail != 0.0f && Finite(frame) && (me.r != pe.r || me.g != pe.g || me.b != pe.b))
     {
-        const ref::F3 r = ref::Composite(Rgb(frame), Rgb(pe), Rgb(me), u.linear, u.knobs);
+        const ref::F3 r = ref::Composite(Rgb(frame), Rgb(pe), Rgb(me), white, u.linear, u.knobs);
         result = { r.r, r.g, r.b, frame.a };
         written = true;
     }
@@ -1565,6 +1572,19 @@ void CheckCast(Scene& s, const Setup& base)
 
     // Each changed pixel: its own change less that share of the mean, then the composite as ever.
     const ref::F3 meanChroma = ref::ChromaFromRedBlue(float(r), float(b));
+    const float white = WhiteOf(u);
+    // A changed pixel's brightness change in EV and colour change, as the composite takes them; false if unchanged.
+    auto changeOf = [&](size_t k, const Pixel& frame, float* change, ref::F3* chroma) {
+        const Pixel& pe = proxy[k];
+        const Pixel& me = model[k];
+        if (!Finite(frame) || (me.r == pe.r && me.g == pe.g && me.b == pe.b))
+            return false;
+        const ref::F3 p = ref::ProxyLinear(Rgb(pe));
+        const ref::F3 o = ref::ModelLinear(Rgb(me), Rgb(pe));
+        *change = ref::ModelGain(p, o, u.linear, u.knobs) - u.castBrightness * float(gain);
+        *chroma = ref::ModelChroma(p, o) - meanChroma * u.castColour;
+        return true;
+    };
     CheckOutput(
         s, output,
         [&](UINT tx, UINT ty, bool* exact) {
@@ -1572,21 +1592,51 @@ void CheckCast(Scene& s, const Setup& base)
             *exact = true;
             if (tx < s.baseX || tx >= s.baseX + s.width || ty < s.baseY || ty >= s.baseY + s.height)
                 return s.texture[i];
-            const size_t k = size_t(ty - s.baseY) * s.width + (tx - s.baseX);
             const Pixel& frame = s.texture[i];
-            const Pixel& pe = proxy[k];
-            const Pixel& me = model[k];
-            if (!Finite(frame) || (me.r == pe.r && me.g == pe.g && me.b == pe.b))
+            float change;
+            ref::F3 chroma;
+            if (!changeOf(size_t(ty - s.baseY) * s.width + (tx - s.baseX), frame, &change, &chroma))
                 return frame;
-            const ref::F3 p = ref::ProxyLinear(Rgb(pe));
-            const ref::F3 o = ref::ModelLinear(Rgb(me), Rgb(pe));
-            const float change = ref::ModelGain(p, o, u.linear, u.knobs) - u.castBrightness * float(gain);
-            const ref::F3 chroma = ref::ModelChroma(p, o) - meanChroma * u.castColour;
-            const ref::F3 out = ref::ApplyChange(Rgb(frame), change, chroma, u.linear, u.knobs);
+            const ref::F3 out = ref::ApplyChange(Rgb(frame), change, chroma, white, u.linear, u.knobs);
             *exact = false;
             return Quantise(*s.format, Pixel { out.r, out.g, out.b, frame.a });
         },
         "GlobalColour 0, GlobalBrightness 0.5: the model's frame-wide mean taken off each pixel's change");
+
+    // The colour light a pixel gets is at most Strength x Colour x its gain x the white point x its colour change:
+    // the light the model saw it at, never the frame's own. So the cast taken off adds no more blue to a red light
+    // 64 times as bright as the white point than to one at it (added at the frame's light, it came back 64 times as
+    // strong: Forza Horizon 6's purple tail lights).
+    size_t bright = 0, over = 0;
+    for (UINT y = 0; y < s.height; ++y)
+    {
+        for (UINT x = 0; x < s.width; ++x)
+        {
+            const Pixel& frame = s.Frame(x, y);
+            float change;
+            ref::F3 chroma;
+            if (!changeOf(size_t(y) * s.width + x, frame, &change, &chroma))
+                continue;
+            const float scale = std::exp2(std::clamp(change * u.knobs.detail, -u.knobs.maxGain, u.knobs.maxGain));
+            const float limit = u.knobs.detail * u.knobs.colour * scale * white * 1.01f;
+            const size_t i = size_t(y + s.baseY) * s.textureWidth + x + s.baseX;
+            const Pixel out = Decode(*s.format, output.data() + i * s.format->bytes);
+            const float got[3] = { out.r, out.g, out.b };
+            const float scaled[3] = { frame.r * scale, frame.g * scale, frame.b * scale };
+            const float d[3] = { chroma.r, chroma.g, chroma.b };
+            bright += ref::Max3(Rgb(frame)) > 8.0f * white;
+            // Within the format's steps of the nearest value the bound allows.
+            for (int c = 0; c < 3; ++c)
+            {
+                const float band = limit * std::fabs(d[c]);
+                over += !Close(*s.format, c, got[c], std::clamp(got[c], scaled[c] - band, scaled[c] + band));
+            }
+        }
+    }
+    Check(bright > 100 && over == 0,
+          "cast, %s: the colour light added within Strength x Colour x gain x the white point x the colour change, "
+          "%zu pixels above 8 times the white point among them (%zu channels over)",
+          s.format->name, bright, over);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2228,7 +2278,7 @@ Pixel ExpectedScaledOutput(const Scene& s, const Setup& u, const Fit& fit, UINT 
         ScaledChange(s, u, fit, x, y, ref::Guide(ref::ProxyLight(Rgb(frame), white, u.linear, u.knobs.shoulder)), &change,
                      &chroma))
     {
-        const ref::F3 r = ref::ApplyChange(Rgb(frame), change, chroma, u.linear, u.knobs);
+        const ref::F3 r = ref::ApplyChange(Rgb(frame), change, chroma, white, u.linear, u.knobs);
         result = { r.r, r.g, r.b, frame.a };
         written = true;
     }

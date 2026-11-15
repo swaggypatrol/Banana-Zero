@@ -365,7 +365,8 @@ file next to the game (that one is not picked up then, and the menu's next save 
 - After a successful SR or RR evaluate, on the same command list, the NR pass encodes the stand-in picture, runs the
   model 1:1 at display size (no upscaling, it does not replace DLSS), and composites the result back.
 - The composite takes only the model's *ratio* of change per pixel and applies it to the untouched HDR frame, capped
-  by Max gain. That is why the model cannot make the whole picture blow out or go dark.
+  by Max gain. That is why the model cannot make the whole picture blow out or go dark. Its colour change goes in at
+  the brightness the model saw the pixel at, so a light far above the white point gets no more colour than one at it.
 - With Model input size below 100% the model gets a smaller copy instead, each of its pixels the average of the frame
   pixels it covers. Its change comes back to full size through a guided filter: fitted in small windows against the
   brightness of the model's input, applied to the brightness of each full-size pixel, and never more than the model

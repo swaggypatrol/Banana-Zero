@@ -236,7 +236,8 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             const float3 chroma = ModelChroma(p, o);
             if (abs(chroma.r) + abs(chroma.g) + abs(chroma.b) > 0.05)
                 ++count[NR_C_COLOUR];
-            // Held to +-2 each, so that no sum can leave an int32 at 4K.
+            // Weighted by the proxy's luminance, the light the composite adds a colour change at (nr.hlsl's Shown), in
+            // white points. Held to +-2 each, so that no sum can leave an int32 at 4K.
             const float weight = dot(p, kLuma);
             global[NR_G_WEIGHT] += weight;
             global[NR_G_GAIN] += weight * clamp(change, -2.0, 2.0);

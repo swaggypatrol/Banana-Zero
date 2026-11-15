@@ -120,16 +120,27 @@ uint2 DepthTexel(uint2 p, uint2 size)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The composite: the model's brightness change as a gain on the frame, its colour change added at the frame's
-// luminance. `frame` is the game's value, in its own units; the result is in the same units. `change` is the
+// The composite: the model's brightness change as a gain on the frame, its colour change added at the light the model
+// saw the pixel at. `frame` is the game's value, in its own units; the result is in the same units. `change` is the
 // brightness change in EV before DetailStrength and MaxGainEV (ModelGain), `chroma` the colour change (ModelChroma).
 
-float3 ApplyChange(float3 frame, float change, float3 chroma, bool linearHdr)
+// The share of a linear HDR pixel's luminance its colour change is added at: the encode's own scale, so all of it
+// below the shoulder and, above, only the light the encode held the pixel to, at most the white point. The model
+// judged a tail light 500 times as bright as the white point at that light; added at the light's own, the cast
+// GlobalColour takes off, or a glow of the model's, came back 500 times as strong, as purple (Forza Horizon 6).
+float Shown(float3 c, float white)
+{
+    const float m = Max3(Clean(c)) / white;
+    return m > g.shoulder ? Shoulder(m, g.shoulder) / m : 1.0;
+}
+
+float3 ApplyChange(float3 frame, float change, float3 chroma, float white, bool linearHdr)
 {
     const float gain = clamp(change * g.detail, -g.maxGain, g.maxGain);
     const float3 c = linearHdr ? frame : SrgbDecode(saturate(frame));
     const float3 scaled = c * exp2(gain);
-    float3 result = scaled + (g.detail * g.colour * dot(max(scaled, 0.0), kLuma)) * chroma;
+    const float at = (linearHdr ? Shown(c, white) : 1.0) * dot(max(scaled, 0.0), kLuma);
+    float3 result = scaled + (g.detail * g.colour * at) * chroma;
     // A colour change may not push a channel below zero, or further below than the frame itself had it; nothing may
     // go above what the Output can store, unless the frame was already there.
     result = clamp(result, min(scaled, 0.0), max(c, kMaxOutput));
@@ -138,7 +149,9 @@ float3 ApplyChange(float3 frame, float change, float3 chroma, bool linearHdr)
 
 // GlobalColour and GlobalBrightness (NR_FLAG_CAST): the model's change to the frame as a whole, its luminance-weighted
 // mean over its picture (the cast pass's sums, this frame's), taken off a pixel's change by castColour and
-// castBrightness, so that what it changes here against there stays and what it changes everywhere at once goes. In
+// castBrightness, so that what it changes here against there stays and what it changes everywhere at once goes. The
+// weight, the proxy's luminance, is the light ApplyChange adds a colour change at (Shown), so the colour it adds over
+// the frame comes to no cast, up to each pixel's own gain. In
 // Forza Horizon 6 that frame-wide colour change moves a grey's R/B by up to a third within two seconds as the scene
 // changes: a white balance that drifts.
 void TakeCastOff(inout float change, inout float3 chroma)
@@ -486,7 +499,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             if (ScaledChange(id.xy, Guide(ProxyLight(frame.rgb, white, linearHdr)), change, chroma))
             {
                 TakeCastOff(change, chroma);
-                result.rgb = ApplyChange(frame.rgb, change, chroma, linearHdr);
+                result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }
         }
@@ -501,7 +514,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 float change = ModelGain(p, o, linearHdr);
                 float3 chroma = ModelChroma(p, o);
                 TakeCastOff(change, chroma);
-                result.rgb = ApplyChange(frame.rgb, change, chroma, linearHdr);
+                result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }
         }
