@@ -1313,6 +1313,7 @@ struct CpuStats
     uint32_t maxHist[NR_HIST_BINS] = {};
     uint32_t lumHist[NR_HIST_BINS] = {};
     uint32_t gainHist[NR_GAIN_BINS] = {};
+    double global[NR_GLOBALS] = {};
     float largest = 0.0f;
 };
 
@@ -1387,6 +1388,14 @@ CpuStats ExpectedStats(const Scene& s, const Setup& u, const std::vector<Pixel>&
         const ref::F3 chroma = ref::ModelChroma(p, o);
         if (std::fabs(chroma.r) + std::fabs(chroma.g) + std::fabs(chroma.b) > 0.05f)
             ++c.counts[NR_C_COLOUR];
+        const double weight = ref::Dot(p, ref::kLuma);
+        c.global[NR_G_WEIGHT] += weight;
+        c.global[NR_G_GAIN] += weight * std::clamp(gain, -u.knobs.maxGain, u.knobs.maxGain);
+        c.global[NR_G_CHROMA_R] += weight * std::clamp(chroma.r, -2.0f, 2.0f);
+        c.global[NR_G_CHROMA_B] += weight * std::clamp(chroma.b, -2.0f, 2.0f);
+        c.global[NR_G_IN_R] += p.r;
+        c.global[NR_G_IN_G] += p.g;
+        c.global[NR_G_IN_B] += p.b;
     }
     return c;
 }
@@ -1471,6 +1480,20 @@ void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes
               SameHistogram(w.data() + NR_S_LUM_HIST, e.lumHist, NR_HIST_BINS, slack) &&
               SameHistogram(w.data() + NR_S_GAIN_HIST, e.gainHist, NR_GAIN_BINS, slack),
           "statistics, %s: the three histograms", s.format->name);
+    // The frame-wide sums: within a rounding per wave (1/64 each) and the GPU's float sums.
+    bool globalRight = true;
+    double worst = 0.0;
+    for (unsigned i = 0; i < NR_GLOBALS; ++i)
+    {
+        const double got = double(int32_t(w[NR_S_GLOBAL + i])) / NR_G_SCALE;
+        const double error = std::fabs(got - e.global[i]);
+        worst = std::max(worst, error);
+        globalRight = globalRight && error <= 0.5 + 1.0e-4 * std::fabs(e.global[i]);
+    }
+    Check(globalRight && e.global[NR_G_WEIGHT] > 1.0,
+          "statistics, %s: the frame-wide sums (weight %.2f, gain %.3f, colour R %.3f B %.3f), worst %.3f off",
+          s.format->name, e.global[NR_G_WEIGHT], e.global[NR_G_GAIN], e.global[NR_G_CHROMA_R],
+          e.global[NR_G_CHROMA_B], worst);
     Check(Bits(c[NR_C_WHITE]) == WhiteOf(u) && Bits(c[NR_C_EXPOSURE]) == (u.useExposure ? u.exposure : 0.0f) &&
               Bits(c[NR_C_MAX_BITS]) == e.largest,
           "statistics, %s: white point %g (want %g), exposure %g, largest value %g (want %g)", s.format->name,

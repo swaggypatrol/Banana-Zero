@@ -169,7 +169,20 @@ static_assert(sizeof(NrConstants) == 144, "NrConstants is passed as root constan
 #define NR_C_WHITE 14      // the white point used, as float bits
 #define NR_C_COLOUR 15     // pixels whose chromaticity the model changed by more than 0.05 (sum over R, G, B)
 #define NR_COUNTS 16
-#define NR_S_TAG_LAST (NR_S_COUNTS + NR_COUNTS)         // frame + 1 again
+// The gain pass's sums over the model's picture, each pixel weighted by its luminance in the proxy (so that the near
+// black, where the model's colour is noise, counts for little): what the model does to the frame as a whole, its colour
+// cast and its brightness, and the colour of what it was given. Signed fixed point, NR_G_SCALE to 1 (int32 bits).
+#define NR_S_GLOBAL (NR_S_COUNTS + NR_COUNTS)
+#define NR_G_WEIGHT 0   // the luminances themselves
+#define NR_G_GAIN 1     // times the brightness change the composite applies, in EV (DetailStrength, MaxGainEV)
+#define NR_G_CHROMA_R 2 // times the model's colour change (ModelChroma, before DetailStrength x ColourStrength): red
+#define NR_G_CHROMA_B 3 // ... and blue; green follows from them (ChromaFromRedBlue)
+#define NR_G_IN_R 4     // the proxy's linear red, green and blue, unweighted: the colour of the model's input
+#define NR_G_IN_G 5
+#define NR_G_IN_B 6
+#define NR_GLOBALS 7
+#define NR_G_SCALE 64.0
+#define NR_S_TAG_LAST (NR_S_GLOBAL + NR_GLOBALS)       // frame + 1 again
 #define NR_S_WORDS (NR_S_TAG_LAST + 1)
 
 // The frame dump (tools/bzdump.py reads it): NR_DUMP_HEADER_BYTES of words, then four pictures of the frame reduced

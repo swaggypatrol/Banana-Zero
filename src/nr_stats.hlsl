@@ -19,6 +19,7 @@ RWByteAddressBuffer gStats : register(u1); // the statistics buffer, or for the 
 
 groupshared uint sHist[NR_HIST_BINS * 2];
 groupshared uint sCount[NR_COUNTS];
+groupshared int sGlobal[NR_GLOBALS];
 groupshared uint sMeter[NR_METER_BINS];
 
 // The scene white point: the frame's middle brightness, the mean log2 luminance of the middle half of its pixels (the
@@ -145,6 +146,8 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         sHist[i] = 0;
     if (gi < NR_COUNTS)
         sCount[gi] = 0;
+    if (gi < NR_GLOBALS)
+        sGlobal[gi] = 0;
     GroupMemoryBarrierWithGroupSync();
 
     const bool linearHdr = (g.flags & NR_FLAG_LINEAR_HDR) != 0;
@@ -206,6 +209,7 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
     }
     else if (g.mode == NR_STATS_GAIN)
     {
+        float global[NR_GLOBALS] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
         [unroll] for (uint n = 0; n < 4; ++n)
         {
             const uint2 q = id.xy * 2 + uint2(n & 1, n >> 1);
@@ -226,6 +230,22 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             const float3 chroma = ModelChroma(p, o);
             if (abs(chroma.r) + abs(chroma.g) + abs(chroma.b) > 0.05)
                 ++count[NR_C_COLOUR];
+            // Held to +-2 each, so that no sum can leave an int32 at 4K.
+            const float weight = dot(p, kLuma);
+            global[NR_G_WEIGHT] += weight;
+            global[NR_G_GAIN] += weight * clamp(gain, -g.maxGain, g.maxGain);
+            global[NR_G_CHROMA_R] += weight * clamp(chroma.r, -2.0, 2.0);
+            global[NR_G_CHROMA_B] += weight * clamp(chroma.b, -2.0, 2.0);
+            global[NR_G_IN_R] += p.r;
+            global[NR_G_IN_G] += p.g;
+            global[NR_G_IN_B] += p.b;
+        }
+        // Summed across the wave in floats, then into the group in fixed point, one rounding per wave.
+        [unroll] for (uint k = 0; k < NR_GLOBALS; ++k)
+        {
+            const float sum = WaveActiveSum(global[k]);
+            if (WaveIsFirstLane())
+                InterlockedAdd(sGlobal[k], int(round(sum * NR_G_SCALE)));
         }
     }
 
@@ -250,6 +270,8 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         gStats.InterlockedAdd((NR_S_COUNTS + gi) * 4, sCount[gi]);
     if (gi == NR_C_MAX_BITS && sCount[gi] != 0)
         gStats.InterlockedMax((NR_S_COUNTS + gi) * 4, sCount[gi]);
+    if (g.mode == NR_STATS_GAIN && gi < NR_GLOBALS && sGlobal[gi] != 0)
+        gStats.InterlockedAdd((NR_S_GLOBAL + gi) * 4, uint(sGlobal[gi]));
 
     // The values the counts are relative to, once per dispatch.
     if (g.mode == NR_STATS_INPUT && all(id.xy == 0))

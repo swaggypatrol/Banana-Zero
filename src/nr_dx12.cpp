@@ -2851,7 +2851,7 @@ void LogSample(const Sample& sample)
         Percentile(w + NR_S_GAIN_HIST, NR_GAIN_BINS, NR_GAIN_EV_MIN, NR_GAIN_PER_EV, 0, 0, 0, gainPoints[i], gain[i],
                    sizeof gain[i]);
 
-    char line[1000];
+    char line[1400];
     size_t length = 0;
     auto add = [&](const char* format, auto... args) {
         if (length + 1 < sizeof line)
@@ -2892,6 +2892,26 @@ void LogSample(const Sample& sample)
     add("; settings #%u", info.generation);
     if ((info.flags & NR_FLAG_SCALED) != 0)
         add("; ModelScale: model input %ux%u", info.modelWidth, info.modelHeight);
+    if (info.modelRan)
+    {
+        // The frame as a whole (NR_S_GLOBAL): what a grey of the frame's mean brightness is turned into by the
+        // composite's colour change, and the brightness change the composite applies, both weighted by luminance.
+        double global[NR_GLOBALS];
+        for (unsigned i = 0; i < NR_GLOBALS; ++i)
+            global[i] = double(int32_t(w[NR_S_GLOBAL + i])) / NR_G_SCALE;
+        const double weight = global[NR_G_WEIGHT];
+        if (weight > 0.0 && global[NR_G_IN_G] > 0.0)
+        {
+            const double k = double(info.detail) * double(info.colour);
+            const double r = k * global[NR_G_CHROMA_R] / weight;
+            const double b = k * global[NR_G_CHROMA_B] / weight;
+            const double g = -(0.2126 * r + 0.0722 * b) / 0.7152;
+            add("; frame: input R/G %.4f B/G %.4f; the model's cast at DetailStrength x ColourStrength %.2f: grey R/G "
+                "x%.4f B/G x%.4f (R %+.4f G %+.4f B %+.4f of luminance); its mean brightness change %+.3f EV",
+                global[NR_G_IN_R] / global[NR_G_IN_G], global[NR_G_IN_B] / global[NR_G_IN_G], k, (1.0 + r) / (1.0 + g),
+                (1.0 + b) / (1.0 + g), r, g, b, global[NR_G_GAIN] / weight);
+        }
+    }
     Log("%s", line);
 }
 
