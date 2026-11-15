@@ -1496,16 +1496,23 @@ bool Metered(const Pixel& p, float* ev)
     return true;
 }
 
-// The histogram the METER pass makes of the frame.
+// The histogram the METER pass makes of the frame: of one pixel of every NR_METER_STEP square, the one nr_stats.hlsl's
+// MeterPixel picks.
 std::vector<uint32_t> MeterBins(const Scene& s)
 {
     std::vector<uint32_t> bins(NR_METER_BINS);
-    for (UINT y = 0; y < s.height; ++y)
+    for (uint32_t cy = 0; cy * NR_METER_STEP < s.height; ++cy)
     {
-        for (UINT x = 0; x < s.width; ++x)
+        for (uint32_t cx = 0; cx * NR_METER_STEP < s.width; ++cx)
         {
+            uint32_t h = cx * 0x9E3779B1u ^ cy * 0x85EBCA6Bu;
+            h ^= h >> 16;
+            h *= 0x7FEB352Du;
+            h ^= h >> 15;
+            const UINT x = cx * NR_METER_STEP + h % NR_METER_STEP;
+            const UINT y = cy * NR_METER_STEP + (h >> 8) % NR_METER_STEP;
             float ev = 0.0f;
-            if (!Metered(s.Frame(x, y), &ev))
+            if (x >= s.width || y >= s.height || !Metered(s.Frame(x, y), &ev))
                 continue;
             const float at = std::floor((ev - float(NR_METER_EV_MIN)) * float(NR_METER_PER_EV));
             ++bins[size_t(std::clamp(at, 0.0f, float(NR_METER_BINS - 1)))];
@@ -1577,7 +1584,8 @@ void CheckMeter(Scene& s)
         Barrier(s.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         const unsigned table = Table(OutputView(s), {}, {}, {}, { scene, DXGI_FORMAT_R32_FLOAT }, meter, bytes);
         if (measure)
-            Dispatch(g.stats, table, Constants(s, u, NR_STATS_METER), Groups(s.width, 32), Groups(s.height, 32));
+            Dispatch(g.stats, table, Constants(s, u, NR_STATS_METER), Groups(s.width, 16 * NR_METER_STEP),
+                     Groups(s.height, 16 * NR_METER_STEP));
         UavBarrier(meter);
         NrConstants c = Constants(s, u, NR_STATS_RESOLVE);
         c.seconds = seconds;

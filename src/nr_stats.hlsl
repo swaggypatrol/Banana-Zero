@@ -3,11 +3,12 @@
 // group shared memory, merged into a small buffer (u1) that nr_dx12.cpp copies into a readback ring; the counts and
 // the layout are in nr_shared.h.
 //
-// Also the scene meter, which runs every frame before the encode: a histogram of the frame's
-// luminance into its own buffer (u1 then), and a one-group pass that works the scene white point out of it into a
-// 1x1 texture (u0) that the encode reads as its exposure texture. Nothing goes back to the CPU.
+// Also the scene meter, which runs before the encode on the frames whose white point is the scene's: a histogram of
+// the frame's luminance into its own buffer (u1 then), and a one-group pass that works the scene white point out of
+// it into a 1x1 texture (u0) that the encode reads as its exposure texture. Nothing goes back to the CPU.
 //
-// Each thread looks at a 2x2 square of pixels, so a 16x16 group covers 32x32 and merges its histogram once.
+// Each thread of the statistics looks at a 2x2 square of pixels, so a 16x16 group covers 32x32 and merges its
+// histogram once; each thread of the meter looks at one pixel of a NR_METER_STEP square (nr_shared.h).
 //
 // Precompiled: the build turns this file into nr_stats_shader.h (array nr_stats_cso).
 
@@ -31,6 +32,18 @@ static const float kSceneHigh = 0.75;
 // How fast the white point follows the scene: a change is 63% followed after this many seconds, 95% after three
 // times as long. The model's history sees a picture that brightens or darkens smoothly, not in steps.
 static const float kSceneSeconds = 0.5;
+
+// The pixel the meter takes of square `cell` (NR_METER_STEP a side): a different one in each square, the same every
+// frame. With the same one in every square, a pattern in the frame that repeats in step with the squares would be
+// metered by only a part of itself (stripes three rows high in six colours came out 0.1 EV off).
+uint2 MeterPixel(uint2 cell)
+{
+    uint h = cell.x * 0x9E3779B1u ^ cell.y * 0x85EBCA6Bu;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    return cell * NR_METER_STEP + uint2(h % NR_METER_STEP, (h >> 8) % NR_METER_STEP);
+}
 
 uint HistBin(float value, float lowEv, float perEv, uint bins, inout uint below, inout uint above)
 {
@@ -56,18 +69,17 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         for (uint i = gi; i < NR_METER_BINS; i += 256)
             sMeter[i] = 0;
         GroupMemoryBarrierWithGroupSync();
-        [unroll] for (uint n = 0; n < 4; ++n)
+        const uint2 q = MeterPixel(id.xy);
+        if (q.x < g.width && q.y < g.height)
         {
-            const uint2 q = id.xy * 2 + uint2(n & 1, n >> 1);
-            if (q.x >= g.width || q.y >= g.height)
-                continue;
             const float3 c = gFrame.Load(int3(q + uint2(g.baseX, g.baseY), 0)).rgb;
             const float y = dot(Clean(c), kLuma);
-            if (!all(isfinite(c)) || y <= 0.0)
-                continue;
-            const float at = clamp(floor((log2(y) - float(NR_METER_EV_MIN)) * float(NR_METER_PER_EV)), 0.0,
-                                   float(NR_METER_BINS - 1));
-            InterlockedAdd(sMeter[uint(at)], 1u);
+            if (all(isfinite(c)) && y > 0.0)
+            {
+                const float at = clamp(floor((log2(y) - float(NR_METER_EV_MIN)) * float(NR_METER_PER_EV)), 0.0,
+                                       float(NR_METER_BINS - 1));
+                InterlockedAdd(sMeter[uint(at)], 1u);
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         for (uint b = gi; b < NR_METER_BINS; b += 256)

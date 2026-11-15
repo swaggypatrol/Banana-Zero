@@ -130,7 +130,10 @@ static_assert(sizeof(NrConstants) == 144, "NrConstants is passed as root constan
 
 // The scene meter's buffer: a histogram of the frame's luminance in its own units, 1/8 EV bins from
 // -24 to +24 EV; values outside go into the end bins, black and non-finite pixels are left out. The resolve pass
-// empties it after reading it, so every frame starts from zero (the buffer is created zeroed).
+// empties it after reading it, so every frame starts from zero (the buffer is created zeroed). The meter looks at one
+// pixel of every NR_METER_STEP x NR_METER_STEP square (nr_stats.hlsl's MeterPixel says which): the middle half of a
+// frame's brightness is the same from a sixteenth of its pixels.
+#define NR_METER_STEP 4
 #define NR_METER_EV_MIN (-24)
 #define NR_METER_PER_EV 8
 #define NR_METER_BINS 384

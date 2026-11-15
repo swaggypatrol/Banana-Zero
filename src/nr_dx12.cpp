@@ -690,11 +690,12 @@ struct Nr
     unsigned previewGeneration = 0;
     bool previewFailed = false;
 
-    // The scene meter: made the first linear HDR frame, kept for the rest of the process.
+    // The scene meter: made the first frame whose white point is the scene's, kept for the rest of the process.
     Texture scene;           // 1x1 R32_FLOAT: the scene white point as an exposure (1 / W); rests in UAV
     Buffer meter;            // its histogram (nr_shared.h); rests in COMMON
     bool meterFailed = false;
-    bool meterFresh = true;  // the next resolve starts afresh rather than easing from the last value
+    bool meterFresh = true;  // the next resolve starts afresh rather than easing from the last value: the first,
+                             // and the first after a frame without the meter
     double meterClock = 0.0; // LogClock() of the last metered frame
 
     // The frame dump: made the first time one is due, and again when the frame's size changes.
@@ -2157,13 +2158,14 @@ bool LinearHdr(const Frame& f, const Settings& s)
 
 // Where this frame's white point comes from: the setting, with auto made concrete (the game's
 // exposure when it gives an exposure texture, else the scene meter), and scene falling back to the game's exposure
-// when there is no meter.
-WhiteSource Source(const Frame& f, const Settings& s, bool meter)
+// when there is no meter: on a frame that is not linear HDR, or when the meter's objects could not be made. Scene is
+// the answer exactly on the frames the meter runs.
+WhiteSource Source(const Frame& f, const Settings& s)
 {
     WhiteSource source = s.whiteSource;
     if (source == WhiteSource::Auto)
         source = f.exposureView != DXGI_FORMAT_UNKNOWN ? WhiteSource::Exposure : WhiteSource::Scene;
-    if (source == WhiteSource::Scene && !meter)
+    if (source == WhiteSource::Scene && !(LinearHdr(f, s) && EnsureMeter()))
         source = WhiteSource::Exposure;
     return source;
 }
@@ -2317,14 +2319,16 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     }
     NoteModelSize(f, modelWidth, modelHeight, frameIndex);
 
-    // The scene meter runs on every linear HDR frame, whichever white point is in use, so that one switched to it
-    // finds it settled already.
-    const bool meter = LinearHdr(f, s) && EnsureMeter();
-    const WhiteSource source = Source(f, s, meter);
+    // The scene meter runs only on the frames whose white point is its own. After a frame without it, it starts
+    // afresh: a switch to it restarts the model's history anyway (the encode key below).
+    const WhiteSource source = Source(f, s);
+    const bool meter = source == WhiteSource::Scene;
+    if (!meter)
+        g_nr.meterFresh = true;
     NrConstants constants = FrameConstants(f, s, source, frameIndex, modelWidth, modelHeight);
     ID3D12Resource* exposure = nullptr;
     DXGI_FORMAT exposureView = DXGI_FORMAT_UNKNOWN;
-    if (source == WhiteSource::Scene)
+    if (meter)
     {
         exposure = g_nr.scene.resource;
         exposureView = DXGI_FORMAT_R32_FLOAT;
@@ -2437,8 +2441,9 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     list->ResourceBarrier(count, barriers);
     if (meter)
     {
-        constants.mode = NR_STATS_METER;
-        Dispatch(list, g_nr.statsPipeline, meterTable, constants, statsX, statsY);
+        constants.mode = NR_STATS_METER; // 16x16 threads, one pixel of a NR_METER_STEP square each
+        Dispatch(list, g_nr.statsPipeline, meterTable, constants, Groups(f.width, 16 * NR_METER_STEP),
+                 Groups(f.height, 16 * NR_METER_STEP));
         UavBarrier(&barriers[0], g_nr.meter.resource);
         list->ResourceBarrier(1, barriers);
         // The resolve eases the white point towards this frame's by the time since the last metered frame; it jumps
