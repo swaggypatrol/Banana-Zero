@@ -19,6 +19,7 @@
 //   stats clear       -          -             -          -             -           -              stats       -
 //   stats input       read       -             -          read          -           -              stats       -
 //   stats gain        -          read          read       -             -           -              stats       -
+//   cast              -          read          read       -             -           -              cast        -
 //   dilate            depth      motion        -          -             -           dilated motion -           -
 //   sky               depth      -             -          -             -           control mask   -           -
 //
@@ -31,6 +32,10 @@
 // The fit runs only when the model works on a smaller copy of the frame (NR_FLAG_SCALED, ModelScale below 100%):
 // nr_fit.hlsl writes three textures over the model's picture through u0-u2 (u1 is a texture there, not the buffer),
 // and the composite then reads them through t4-t6 (slope, value, raw) instead of the proxy and the model's output.
+//
+// The cast (NR_FLAG_CAST, GlobalColour or GlobalBrightness below 1): every frame, the cast pass sums the model's change
+// over its picture into a buffer laid out as the statistics' (NR_S_GLOBAL), and the composite reads it through u1 and
+// takes that much of the frame-wide mean off each pixel's change.
 
 #ifdef __cplusplus
 #include <cstdint>
@@ -56,6 +61,7 @@
 #define NR_STATS_GAIN 2  // histogram of the brightness change the model made
 #define NR_STATS_METER 3   // the scene meter: histogram of the frame's luminance in its own units
 #define NR_STATS_RESOLVE 4 // the scene white point from that histogram, eased towards over time; empties the histogram
+#define NR_STATS_CAST 5    // the gain pass's frame-wide sums alone (NR_S_GLOBAL), for the composite of the same frame
 
 // NrConstants.flags
 #define NR_FLAG_LINEAR_HDR 0x01     // the frame is linear HDR: white point, shoulder, sRGB. Else it is display-encoded
@@ -70,6 +76,8 @@
 #define NR_FLAG_SHOW_SKY 0x100      // the composite stripes what counts as sky (Show sky); t0 holds the depth
 #define NR_FLAG_SCALED 0x200        // the model works on a smaller copy of the frame (ModelScale): modelWidth x
                                     // modelHeight at the top left of the proxy and of the model's output
+#define NR_FLAG_CAST 0x400          // the composite takes the model's frame-wide cast off (castColour, castBrightness),
+                                    // from the sums the cast pass left in u1
 
 struct NrConstants
 {
@@ -121,10 +129,17 @@ struct NrConstants
     NR_UINT modelHeight;
     NR_FLOAT stepX;
     NR_FLOAT stepY;
+
+    // How much of the model's frame-wide change the composite takes off each pixel's (NR_FLAG_CAST): 1 - GlobalColour
+    // of its mean colour change, 1 - GlobalBrightness of its mean brightness change.
+    NR_FLOAT castColour;
+    NR_FLOAT castBrightness;
+    NR_UINT unused0;
+    NR_UINT unused1;
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(NrConstants) == 144, "NrConstants is passed as root constants: 4-byte scalars, 16-byte multiple");
+static_assert(sizeof(NrConstants) == 160, "NrConstants is passed as root constants: 4-byte scalars, 16-byte multiple");
 #define NR_CONSTANTS_DWORDS (uint32_t(sizeof(NrConstants) / 4))
 #endif
 
@@ -174,7 +189,7 @@ static_assert(sizeof(NrConstants) == 144, "NrConstants is passed as root constan
 // cast and its brightness, and the colour of what it was given. Signed fixed point, NR_G_SCALE to 1 (int32 bits).
 #define NR_S_GLOBAL (NR_S_COUNTS + NR_COUNTS)
 #define NR_G_WEIGHT 0   // the luminances themselves
-#define NR_G_GAIN 1     // times the brightness change the composite applies, in EV (DetailStrength, MaxGainEV)
+#define NR_G_GAIN 1     // times the model's brightness change in EV (ModelGain, before DetailStrength), held to +-2
 #define NR_G_CHROMA_R 2 // times the model's colour change (ModelChroma, before DetailStrength x ColourStrength): red
 #define NR_G_CHROMA_B 3 // ... and blue; green follows from them (ChromaFromRedBlue)
 #define NR_G_IN_R 4     // the proxy's linear red, green and blue, unweighted: the colour of the model's input

@@ -789,6 +789,8 @@ void MenuDraw()
                             "%.2f");
             commit |=
                 Float("ColourStrength", "Colour", &d.colourStrength, 0.0f, 1.5f, 25, false, def.colourStrength, "%.2f");
+            commit |= Float("GlobalColour", "Global colour", &d.globalColour, 0.0f, 1.0f, 21, false, def.globalColour,
+                            "%.2f");
             {
                 // Three, as the model has (its default is Standard).
                 const char* const styles[] = { "Standard", "Natural", "Cinematic" };
@@ -823,6 +825,8 @@ void MenuDraw()
                     Float("MaxGainEV", "Max gain (EV)", &d.maxGainEV, 0.0f, 1.5f, 25, false, def.maxGainEV, "%.2f");
                 commit |= Float("HighlightRestore", "Highlight restore", &d.highlightRestore, 0.0f, 1.0f, 25, false,
                                 def.highlightRestore, "%.2f");
+                commit |= Float("GlobalBrightness", "Global brightness", &d.globalBrightness, 0.0f, 1.0f, 21, false,
+                                def.globalBrightness, "%.2f");
             }
             ImGui::EndTabItem();
         }

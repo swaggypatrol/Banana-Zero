@@ -127,12 +127,13 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
 
 ### Tuning
 
-Three knobs. For most people, three knobs is plenty.
+Four knobs. For most people, these are plenty.
 
 | Control | Range | What it does |
 |---|---|---|
 | **Strength** | 0 to 1.5, default 1 | How much of the model's change lands on screen. **0 is bit-for-bit what DLSS made.** 1 is the model's change as it is; 1.5 adds half again. Want more or less? This one |
-| **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness. In The Witcher 3 the model cools the whole picture whenever there is a lot of sky in view, so the colours drift as you look around; 0 stops that |
+| **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness |
+| **Global colour** | 0 to 1, default 0 | How much of the model's colour change to the *whole frame* comes along. The model shifts the white balance of the whole picture as the scene changes (cooler whenever there is a lot of sky in The Witcher 3; in Forza Horizon 6 a grey's red-to-blue moved by up to a third within two seconds), so the colours drift as you drive or look around. At 0 that frame-wide shift is taken off every frame and only the model's local colour changes stay; 1 keeps it, as before v0.3.0 |
 | **Style** | Standard, Natural, Cinematic | The model's three built-in styles. NVIDIA has not documented what they do, so audition them. Takes effect on the next frame |
 
 ### Model: weights, masks and strengths
@@ -178,6 +179,7 @@ folded into a smooth **shoulder**.
 |---|---|---|
 | **Max gain (EV)** | 0 to 1.5, default 1 | The hard limit on how far any one pixel may move. Bright specks, noise or white fringes? Lower this first |
 | **Highlight restore** | 0 to 1, default 0 | Scales the model's change inside compressed highlights back up. Made the Witcher 3 sky noisy once, hence 0 |
+| **Global brightness** | 0 to 1, default 1 | The same as Global colour for brightness: how much of the model's brightening or darkening of the whole frame comes along. Lower it if the picture as a whole pumps brighter and darker as the scene changes |
 
 ### Compare
 
@@ -261,6 +263,7 @@ writes it for you; this is for people who like to open the back panel.
 | `Enabled` | 1 / 0 | 1 | NR on |
 | `DetailStrength` | 0 to 2 | 1 | Strength |
 | `ColourStrength` | 0 to 2 | 1 | Colour |
+| `GlobalColour` | 0 to 1 | 0 | Global colour |
 | `Style` | 0 standard, 1 natural, 2 cinematic | not set (standard) | Style |
 | `Intensity` | 0 to 1; more acts as 1 | not set (1) | Model intensity |
 | `LocalStructure` | 0 to 2 | not set (1) | Local structure |
@@ -275,6 +278,7 @@ writes it for you; this is for people who like to open the back panel.
 | `Shoulder` | 0.5 to 0.95 | 0.70 | Highlight shoulder |
 | `MaxGainEV` | 0 to 2 | 1 | Max gain (EV) |
 | `HighlightRestore` | 0 to 1 | 0 | Highlight restore |
+| `GlobalBrightness` | 0 to 1 | 1 | Global brightness |
 | `Compare` | 1 / 0 | 0 | Split screen |
 | `CompareSplit` | 10 to 90 | 50 | Divider |
 | `Preview` | `off` / `input` / `output` | `off` | Preview window |

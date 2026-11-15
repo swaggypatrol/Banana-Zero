@@ -207,8 +207,10 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 ++count[NR_C_DARK];
         }
     }
-    else if (g.mode == NR_STATS_GAIN)
+    else if (g.mode == NR_STATS_GAIN || g.mode == NR_STATS_CAST)
     {
+        // The cast pass is this one with its sums alone: no histogram, no counts.
+        const bool histogram = g.mode == NR_STATS_GAIN;
         float global[NR_GLOBALS] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
         [unroll] for (uint n = 0; n < 4; ++n)
         {
@@ -219,21 +221,25 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             const float3 pe = gProxy.Load(int3(q, 0)).rgb;
             const float3 p = ProxyLinear(pe);
             const float3 o = ModelLinear(gModel.Load(int3(q, 0)).rgb, pe);
-            const float gain = ModelGain(p, o, linearHdr) * g.detail;
+            const float change = ModelGain(p, o, linearHdr);
+            const float gain = change * g.detail;
             if (gain < -g.maxGain)
                 ++count[NR_C_GAIN_LOW];
             else if (gain > g.maxGain)
                 ++count[NR_C_GAIN_HIGH];
-            const float at = clamp(floor((gain - float(NR_GAIN_EV_MIN)) * float(NR_GAIN_PER_EV)), 0.0,
-                                   float(NR_GAIN_BINS - 1));
-            InterlockedAdd(sHist[uint(at)], 1u);
+            if (histogram)
+            {
+                const float at = clamp(floor((gain - float(NR_GAIN_EV_MIN)) * float(NR_GAIN_PER_EV)), 0.0,
+                                       float(NR_GAIN_BINS - 1));
+                InterlockedAdd(sHist[uint(at)], 1u);
+            }
             const float3 chroma = ModelChroma(p, o);
             if (abs(chroma.r) + abs(chroma.g) + abs(chroma.b) > 0.05)
                 ++count[NR_C_COLOUR];
             // Held to +-2 each, so that no sum can leave an int32 at 4K.
             const float weight = dot(p, kLuma);
             global[NR_G_WEIGHT] += weight;
-            global[NR_G_GAIN] += weight * clamp(gain, -g.maxGain, g.maxGain);
+            global[NR_G_GAIN] += weight * clamp(change, -2.0, 2.0);
             global[NR_G_CHROMA_R] += weight * clamp(chroma.r, -2.0, 2.0);
             global[NR_G_CHROMA_B] += weight * clamp(chroma.b, -2.0, 2.0);
             global[NR_G_IN_R] += p.r;
@@ -258,19 +264,22 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         InterlockedMax(sCount[NR_C_MAX_BITS], largest);
     GroupMemoryBarrierWithGroupSync();
 
-    // Merge: every non-empty bin and count once per group.
-    const uint histWords = g.mode == NR_STATS_INPUT ? NR_HIST_BINS * 2 : NR_GAIN_BINS;
-    const uint histStart = g.mode == NR_STATS_INPUT ? NR_S_MAX_HIST : NR_S_GAIN_HIST;
-    for (uint b = gi; b < histWords; b += 256)
+    // Merge: every non-empty bin and count once per group (the cast pass: its sums alone).
+    if (g.mode != NR_STATS_CAST)
     {
-        if (sHist[b] != 0)
-            gStats.InterlockedAdd((histStart + b) * 4, sHist[b]);
+        const uint histWords = g.mode == NR_STATS_INPUT ? NR_HIST_BINS * 2 : NR_GAIN_BINS;
+        const uint histStart = g.mode == NR_STATS_INPUT ? NR_S_MAX_HIST : NR_S_GAIN_HIST;
+        for (uint b = gi; b < histWords; b += 256)
+        {
+            if (sHist[b] != 0)
+                gStats.InterlockedAdd((histStart + b) * 4, sHist[b]);
+        }
+        if (gi < NR_COUNTS && gi != NR_C_MAX_BITS && sCount[gi] != 0)
+            gStats.InterlockedAdd((NR_S_COUNTS + gi) * 4, sCount[gi]);
+        if (gi == NR_C_MAX_BITS && sCount[gi] != 0)
+            gStats.InterlockedMax((NR_S_COUNTS + gi) * 4, sCount[gi]);
     }
-    if (gi < NR_COUNTS && gi != NR_C_MAX_BITS && sCount[gi] != 0)
-        gStats.InterlockedAdd((NR_S_COUNTS + gi) * 4, sCount[gi]);
-    if (gi == NR_C_MAX_BITS && sCount[gi] != 0)
-        gStats.InterlockedMax((NR_S_COUNTS + gi) * 4, sCount[gi]);
-    if (g.mode == NR_STATS_GAIN && gi < NR_GLOBALS && sGlobal[gi] != 0)
+    if (g.mode != NR_STATS_INPUT && gi < NR_GLOBALS && sGlobal[gi] != 0)
         gStats.InterlockedAdd((NR_S_GLOBAL + gi) * 4, uint(sGlobal[gi]));
 
     // The values the counts are relative to, once per dispatch.

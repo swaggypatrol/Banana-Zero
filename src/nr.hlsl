@@ -15,7 +15,7 @@ Texture2D<float4> gSlope : register(t4); // ModelScale: the fit's three textures
 Texture2D<float4> gValue : register(t5);
 Texture2D<float4> gRaw : register(t6);
 RWTexture2D<float4> gTarget : register(u0); // encode: the proxy. composite: the game's Output. preview: the picture
-RWByteAddressBuffer gDump : register(u1);   // the frame dump
+RWByteAddressBuffer gDump : register(u1);   // the frame dump; for the composite, the cast pass's sums (NR_FLAG_CAST)
 
 // ---------------------------------------------------------------------------------------------------------------
 // The calibration card: a test chart drawn from formulas, in units of the white point, so that it goes
@@ -136,11 +136,22 @@ float3 ApplyChange(float3 frame, float change, float3 chroma, bool linearHdr)
     return linearHdr ? result : SrgbEncode(saturate(result));
 }
 
-float3 Composite(float3 frame, float3 proxyEncoded, float3 modelEncoded, bool linearHdr)
+// GlobalColour and GlobalBrightness (NR_FLAG_CAST): the model's change to the frame as a whole, its luminance-weighted
+// mean over its picture (the cast pass's sums, this frame's), taken off a pixel's change by castColour and
+// castBrightness, so that what it changes here against there stays and what it changes everywhere at once goes. In
+// Forza Horizon 6 that frame-wide colour change moves a grey's R/B by up to a third within two seconds as the scene
+// changes: a white balance that drifts.
+void TakeCastOff(inout float change, inout float3 chroma)
 {
-    const float3 p = ProxyLinear(proxyEncoded);
-    const float3 o = ModelLinear(modelEncoded, proxyEncoded);
-    return ApplyChange(frame, ModelGain(p, o, linearHdr), ModelChroma(p, o), linearHdr);
+    if ((g.flags & NR_FLAG_CAST) == 0)
+        return;
+    const float weight = float(asint(gDump.Load((NR_S_GLOBAL + NR_G_WEIGHT) * 4)));
+    if (!(weight > 0.0))
+        return;
+    const float r = float(asint(gDump.Load((NR_S_GLOBAL + NR_G_CHROMA_R) * 4))) / weight;
+    const float b = float(asint(gDump.Load((NR_S_GLOBAL + NR_G_CHROMA_B) * 4))) / weight;
+    chroma -= g.castColour * ChromaFromRedBlue(r, b);
+    change -= g.castBrightness * float(asint(gDump.Load((NR_S_GLOBAL + NR_G_GAIN) * 4))) / weight;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -474,6 +485,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             float3 chroma;
             if (ScaledChange(id.xy, Guide(ProxyLight(frame.rgb, white, linearHdr)), change, chroma))
             {
+                TakeCastOff(change, chroma);
                 result.rgb = ApplyChange(frame.rgb, change, chroma, linearHdr);
                 write = true;
             }
@@ -484,7 +496,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             const float3 modelEncoded = gModel.Load(int3(id.xy, 0)).rgb;
             if (any(modelEncoded != proxyEncoded))
             {
-                result.rgb = Composite(frame.rgb, proxyEncoded, modelEncoded, linearHdr);
+                const float3 p = ProxyLinear(proxyEncoded);
+                const float3 o = ModelLinear(modelEncoded, proxyEncoded);
+                float change = ModelGain(p, o, linearHdr);
+                float3 chroma = ModelChroma(p, o);
+                TakeCastOff(change, chroma);
+                result.rgb = ApplyChange(frame.rgb, change, chroma, linearHdr);
                 write = true;
             }
         }

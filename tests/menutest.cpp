@@ -226,6 +226,7 @@ void TestWrite()
     s.model.intensity.value = 0.8f;
     s.statsSeconds = 0.0f;
     s.colourStrength = 1.25f;
+    s.globalColour = 0.35f;
     s.menuKey = 0x7B; // F12
     size_t length = 0;
     char* merged = SettingsMergeIni(text, s, &length);
@@ -240,6 +241,8 @@ void TestWrite()
     Check(strstr(merged, "ColourStrength = 1.25\r\n") != nullptr && strstr(merged, "ColorStrength") == nullptr,
           "write: a line under the other spelling of a key becomes the key's own line");
     Check(strstr(merged, "Intensity = 0.8\r\n") != nullptr, "write: a set model parameter is added");
+    Check(strstr(merged, "GlobalColour = 0.35\r\n") != nullptr && strstr(merged, "GlobalBrightness") == nullptr,
+          "write: GlobalColour away from its default (0) is added, GlobalBrightness at its own (1) is not");
     Check(strstr(merged, "MenuKey = F12\r\n") != nullptr, "write: a key away from its default is added");
     Check(strstr(merged, "Shoulder") == nullptr, "write: a value at its default is not added");
     Check(strstr(merged, "\n\n") == nullptr && strchr(merged, '\n') != nullptr && strstr(merged, "\r\n") != nullptr,
@@ -255,6 +258,8 @@ void TestWrite()
           "write: Intensity read back");
     Check(Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog 2 read back");
     Check(Near(loaded->colourStrength, 1.25f, 1e-6f), "write: ColourStrength read back");
+    Check(Near(loaded->globalColour, 0.35f, 1e-6f) && loaded->globalBrightness == 1.0f,
+          "write: GlobalColour read back, GlobalBrightness at its default");
     Check(loaded->menuKey == 0x7B, "write: MenuKey F12 read back");
 
     // A new file: the header and only the keys away from their defaults.

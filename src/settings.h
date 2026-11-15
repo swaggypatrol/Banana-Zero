@@ -99,6 +99,10 @@ struct Settings
     float colourStrength = 1.0f;   // ColourStrength: 0 .. 2
     float maxGainEV = 1.0f;        // MaxGainEV: 0 .. 2
     float highlightRestore = 0.0f; // HighlightRestore: 0 .. 1; 0 since the first playtest
+    // How much of the model's change to the frame as a whole is kept (nr.hlsl, TakeCastOff): its mean colour change,
+    // which drifts with the scene (Forza Horizon 6, The Witcher 3's sky), and its mean brightness change.
+    float globalColour = 0.0f;     // GlobalColour: 0 .. 1
+    float globalBrightness = 1.0f; // GlobalBrightness: 0 .. 1
 
     // The tuning aids.
     Preview preview = Preview::Off;       // Preview

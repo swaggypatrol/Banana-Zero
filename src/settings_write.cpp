@@ -137,6 +137,9 @@ Plan MakePlan(const Settings& s)
     plan.keys[plan.count - 1].alternative = "ColorStrength";
     AddFloat(&plan, "MaxGainEV", s.maxGainEV, d.maxGainEV);
     AddFloat(&plan, "HighlightRestore", s.highlightRestore, d.highlightRestore);
+    AddFloat(&plan, "GlobalColour", s.globalColour, d.globalColour);
+    plan.keys[plan.count - 1].alternative = "GlobalColor";
+    AddFloat(&plan, "GlobalBrightness", s.globalBrightness, d.globalBrightness);
     AddChoice(&plan, "Preview", nullptr, unsigned(s.preview), unsigned(d.preview), kPreviewText, 3);
     AddBool(&plan, "Zebra", s.zebra, d.zebra);
     AddChoice(&plan, "CardCorner", nullptr, unsigned(s.cardCorner), unsigned(d.cardCorner), kCornerText, 4);

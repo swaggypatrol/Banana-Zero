@@ -920,6 +920,7 @@ struct Setup
     ref::Rect cardRect = { 6, 5, 96, 40 };
     uint32_t frame = 12345;
     UINT modelWidth = 0, modelHeight = 0; // ModelScale: the model's picture; 0 = the frame's size
+    float castColour = 0.0f, castBrightness = 0.0f; // 1 - GlobalColour, 1 - GlobalBrightness
 };
 
 UINT ModelW(const Scene& s, const Setup& u) { return u.modelWidth != 0 ? u.modelWidth : s.width; }
@@ -958,6 +959,10 @@ NrConstants Constants(const Scene& s, const Setup& u, uint32_t mode)
     c.stepY = float(s.height) / float(c.modelHeight);
     if (c.modelWidth != s.width || c.modelHeight != s.height)
         c.flags |= NR_FLAG_SCALED;
+    c.castColour = u.castColour;
+    c.castBrightness = u.castBrightness;
+    if (u.castColour > 0.0f || u.castBrightness > 0.0f)
+        c.flags |= NR_FLAG_CAST;
     return c;
 }
 
@@ -1390,7 +1395,7 @@ CpuStats ExpectedStats(const Scene& s, const Setup& u, const std::vector<Pixel>&
             ++c.counts[NR_C_COLOUR];
         const double weight = ref::Dot(p, ref::kLuma);
         c.global[NR_G_WEIGHT] += weight;
-        c.global[NR_G_GAIN] += weight * std::clamp(gain, -u.knobs.maxGain, u.knobs.maxGain);
+        c.global[NR_G_GAIN] += weight * std::clamp(ref::ModelGain(p, o, u.linear, u.knobs), -2.0f, 2.0f);
         c.global[NR_G_CHROMA_R] += weight * std::clamp(chroma.r, -2.0f, 2.0f);
         c.global[NR_G_CHROMA_B] += weight * std::clamp(chroma.b, -2.0f, 2.0f);
         c.global[NR_G_IN_R] += p.r;
@@ -1499,6 +1504,89 @@ void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes
           "statistics, %s: white point %g (want %g), exposure %g, largest value %g (want %g)", s.format->name,
           double(Bits(c[NR_C_WHITE])), double(WhiteOf(u)), double(Bits(c[NR_C_EXPOSURE])),
           double(Bits(c[NR_C_MAX_BITS])), double(e.largest));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// GlobalColour and GlobalBrightness (nr.hlsl's TakeCastOff): the cast pass sums the model's change over its picture,
+// as the statistics' frame-wide sums, and the composite of the same frame takes that much of the mean off each pixel.
+
+void CheckCast(Scene& s, const Setup& base)
+{
+    Setup u = base;
+    u.castColour = 1.0f;     // GlobalColour 0
+    u.castBrightness = 0.5f; // GlobalBrightness 0.5
+    // A model that warms the whole frame and brightens it a little, and brightens every seventh pixel more: a cast and
+    // a local change.
+    const std::vector<Pixel> proxy = DecodeAll(kHalf, EncodeAndReadProxy(s, u));
+    const std::vector<Pixel> model = MakeModel(proxy, [](ref::F3 p, size_t i) {
+        const float local = i % 7 == 0 ? 1.3f : 1.0f;
+        return ref::F3 { p.r * 1.08f, p.g * 1.02f, p.b * 0.88f } * local;
+    });
+    const std::vector<uint8_t> modelBytes = Encode(model);
+
+    const UINT64 bytes = NR_S_WORDS * 4;
+    ID3D12Resource* cast = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+    Reset(s, u);
+    RecordEncode(s, u);
+    Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(cast, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT }, { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                 ExposureView(s, u), OutputView(s), cast, bytes);
+    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CLEAR), 1, 1);
+    UavBarrier(cast);
+    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CAST), Groups(s.width, 32), Groups(s.height, 32));
+    UavBarrier(cast);
+    Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<uint32_t> w = ReadBuffer(cast, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cast->Release();
+
+    // The pass's sums are the statistics' (checked against the CPU there), with no histogram or count beside them.
+    const CpuStats e = ExpectedStats(s, u, proxy, model);
+    int32_t sum[NR_GLOBALS];
+    bool sumsRight = true;
+    for (unsigned i = 0; i < NR_GLOBALS; ++i)
+    {
+        sum[i] = int32_t(w[NR_S_GLOBAL + i]);
+        sumsRight = sumsRight && std::fabs(double(sum[i]) / NR_G_SCALE - e.global[i]) <= 0.5 + 1.0e-4 * std::fabs(e.global[i]);
+    }
+    bool nothingElse = true;
+    for (unsigned i = NR_S_TAG_FIRST + 1; i < NR_S_GLOBAL; ++i)
+        nothingElse = nothingElse && w[i] == 0;
+    const double r = double(sum[NR_G_CHROMA_R]) / double(sum[NR_G_WEIGHT]);
+    const double b = double(sum[NR_G_CHROMA_B]) / double(sum[NR_G_WEIGHT]);
+    const double gain = double(sum[NR_G_GAIN]) / double(sum[NR_G_WEIGHT]);
+    Check(sumsRight && nothingElse && r > 0.01 && b < -0.01,
+          "cast, %s: the cast pass's sums as the CPU's, and nothing else written; the model's mean colour change R %+.4f "
+          "B %+.4f, brightness %+.4f EV",
+          s.format->name, r, b, gain);
+
+    // Each changed pixel: its own change less that share of the mean, then the composite as ever.
+    const ref::F3 meanChroma = ref::ChromaFromRedBlue(float(r), float(b));
+    CheckOutput(
+        s, output,
+        [&](UINT tx, UINT ty, bool* exact) {
+            const size_t i = size_t(ty) * s.textureWidth + tx;
+            *exact = true;
+            if (tx < s.baseX || tx >= s.baseX + s.width || ty < s.baseY || ty >= s.baseY + s.height)
+                return s.texture[i];
+            const size_t k = size_t(ty - s.baseY) * s.width + (tx - s.baseX);
+            const Pixel& frame = s.texture[i];
+            const Pixel& pe = proxy[k];
+            const Pixel& me = model[k];
+            if (!Finite(frame) || (me.r == pe.r && me.g == pe.g && me.b == pe.b))
+                return frame;
+            const ref::F3 p = ref::ProxyLinear(Rgb(pe));
+            const ref::F3 o = ref::ModelLinear(Rgb(me), Rgb(pe));
+            const float change = ref::ModelGain(p, o, u.linear, u.knobs) - u.castBrightness * float(gain);
+            const ref::F3 chroma = ref::ModelChroma(p, o) - meanChroma * u.castColour;
+            const ref::F3 out = ref::ApplyChange(Rgb(frame), change, chroma, u.linear, u.knobs);
+            *exact = false;
+            return Quantise(*s.format, Pixel { out.r, out.g, out.b, frame.a });
+        },
+        "GlobalColour 0, GlobalBrightness 0.5: the model's frame-wide mean taken off each pixel's change");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2311,6 +2399,7 @@ void TestLinear(const Format& f, UINT border)
     statsExposure.frame = 777;
     CheckStats(s, statsExposure, Encode(mixed));
     CheckMeter(s);
+    CheckCast(s, base);
     CheckDump(s, base, brighterBytes);
     CheckPreview(s, base);
     TestScaled(s, base, 140, 78); // about 0.69 of each side
