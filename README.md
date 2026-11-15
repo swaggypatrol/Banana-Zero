@@ -127,13 +127,12 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
 
 ### Tuning
 
-Four knobs. For most people, these are plenty.
+Three knobs. For most people, three knobs is plenty.
 
 | Control | Range | What it does |
 |---|---|---|
 | **Strength** | 0 to 1.5, default 1 | How much of the model's change lands on screen. **0 is bit-for-bit what DLSS made.** 1 is the model's change as it is; 1.5 adds half again. Want more or less? This one |
 | **Colour** | 0 to 1.5, default 1 | How much of the model's colour change comes along. 0 keeps the game's own colours and takes only brightness |
-| **Global colour** | 0 to 1, default 0 | How much of the model's colour change to the *whole frame* comes along. The model shifts the white balance of the whole picture as the scene changes (cooler whenever there is a lot of sky in The Witcher 3; in Forza Horizon 6 a grey's red-to-blue moved by up to a third within two seconds), so the colours drift as you drive or look around. At 0 that shift is measured every frame where a white balance shows, on the greyish parts of the picture, as a gain per colour channel, and divided out of every pixel's colour change: greys stay grey, the model's local colour changes stay; 1 keeps it, as before v0.3.0 |
 | **Style** | Standard, Natural, Cinematic | The model's three built-in styles. NVIDIA has not documented what they do, so audition them. Takes effect on the next frame |
 
 ### Model: weights, masks and strengths
@@ -178,8 +177,8 @@ folded into a smooth **shoulder**.
 | Control | Range | What it does |
 |---|---|---|
 | **Max gain (EV)** | 0 to 1.5, default 1 | The hard limit on how far any one pixel may move. Bright specks, noise or white fringes? Lower this first |
-| **Highlight restore** | 0 to 1, default 0 | Scales the model's change inside compressed highlights back up. Made the Witcher 3 sky noisy once, hence 0 |
-| **Global brightness** | 0 to 1, default 1 | The same as Global colour for brightness: how much of the model's brightening or darkening of the whole frame comes along. Lower it if the picture as a whole pumps brighter and darker as the scene changes |
+| **Model white balance** | 0 to 1, default 0 | How much of the model's own white balance comes along (ini key `GlobalColour`). The model shifts the white balance of the whole picture as the scene changes (cooler whenever there is a lot of sky in The Witcher 3; in Forza Horizon 6 the greys of a road went yellow and blue by turns within seconds), so the colours drift as you drive or look around. At 0 it is measured every frame on the greyish parts of the picture, as a gain per colour channel, and divided out of every pixel's colour change: greys stay grey, the model's local colour changes stay. A frame with very little grey in it (a loading screen) has less of it taken off. 1 keeps it, as before v0.3.0 |
+| **Highlight colour (EV)** | 0 to 4, default 2 | How far above the white point the model's colour change still goes in at full strength. Above it a pixel gets only as much colour as a display that tops out there would show, so a light hundreds of times as bright as the white point does not take on the colour of the model's glow around it (Forza Horizon 6's tail lights went purple). 0 stops at the white point; lower it if bright lights take on odd colours |
 
 ### Compare
 
@@ -263,7 +262,7 @@ writes it for you; this is for people who like to open the back panel.
 | `Enabled` | 1 / 0 | 1 | NR on |
 | `DetailStrength` | 0 to 2 | 1 | Strength |
 | `ColourStrength` | 0 to 2 | 1 | Colour |
-| `GlobalColour` | 0 to 1 | 0 | Global colour |
+| `GlobalColour` | 0 to 1 | 0 | Model white balance |
 | `Style` | 0 standard, 1 natural, 2 cinematic | not set (standard) | Style |
 | `Intensity` | 0 to 1; more acts as 1 | not set (1) | Model intensity |
 | `LocalStructure` | 0 to 2 | not set (1) | Local structure |
@@ -277,8 +276,7 @@ writes it for you; this is for people who like to open the back panel.
 | `WhiteEV` | -4 to +4 | 0 | White point (EV) |
 | `Shoulder` | 0.5 to 0.95 | 0.70 | Highlight shoulder |
 | `MaxGainEV` | 0 to 2 | 1 | Max gain (EV) |
-| `HighlightRestore` | 0 to 1 | 0 | Highlight restore |
-| `GlobalBrightness` | 0 to 1 | 1 | Global brightness |
+| `HighlightColour` | 0 to 6 | 2 | Highlight colour (EV) |
 | `Compare` | 1 / 0 | 0 | Split screen |
 | `CompareSplit` | 10 to 90 | 50 | Divider |
 | `Preview` | `off` / `input` / `output` | `off` | Preview window |
@@ -366,7 +364,8 @@ file next to the game (that one is not picked up then, and the menu's next save 
   model 1:1 at display size (no upscaling, it does not replace DLSS), and composites the result back.
 - The composite takes only the model's *ratio* of change per pixel and applies it to the untouched HDR frame, capped
   by Max gain. That is why the model cannot make the whole picture blow out or go dark. Its colour change goes in at
-  the brightness the model saw the pixel at, so a light far above the white point gets no more colour than one at it.
+  most at the brightness Highlight colour sets above the white point, so a light far brighter than that gets no more
+  colour than one at it.
 - With Model input size below 100% the model gets a smaller copy instead, each of its pixels the average of the frame
   pixels it covers. Its change comes back to full size through a guided filter: fitted in small windows against the
   brightness of the model's input, applied to the brightness of each full-size pixel, and never more than the model

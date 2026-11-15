@@ -541,9 +541,7 @@ struct FrameInfo
     float detail = 0.0f;
     float colour = 0.0f;
     float maxGain = 0.0f;
-    float highlight = 0.0f;
     float globalColour = 0.0f;
-    float globalBrightness = 0.0f;
 };
 
 // The statistics of one frame, handed from the render thread to the background thread that logs them.
@@ -695,7 +693,7 @@ struct Nr
     bool maskFailed = false;
     bool saidDepth = false; // what the depth's passes read has been logged
 
-    // The cast pass's sums (GlobalColour, GlobalBrightness): made the first frame either is below 1. Rests in COMMON.
+    // The cast pass's sums (GlobalColour): made the first frame it is below 1. Rests in COMMON.
     Buffer cast;
     bool castFailed = false;
 
@@ -1694,7 +1692,7 @@ bool EnsureCast()
     if (MakeBuffer(&g_nr.cast, D3D12_HEAP_TYPE_DEFAULT, NR_S_WORDS * 4, "frame-wide cast"))
         return true;
     g_nr.castFailed = true;
-    Log("NR: no buffer for the frame-wide cast; GlobalColour and GlobalBrightness keep all of it");
+    Log("NR: no buffer for the frame-wide cast; GlobalColour keeps all of the model's white balance");
     return false;
 }
 
@@ -2264,9 +2262,8 @@ NrConstants FrameConstants(const Frame& f, const Settings& s, WhiteSource source
     c.detail = s.detailStrength;
     c.colour = s.colourStrength;
     c.maxGain = s.maxGainEV;
-    c.highlight = s.highlightRestore;
+    c.peak = std::exp2(s.highlightColour);
     c.castColour = 1.0f - s.globalColour;
-    c.castBrightness = 1.0f - s.globalBrightness;
     c.whiteScale = 1.0f;
     if (s.compare) // the split screen (M3): the original's share of the width, never the whole of it
         c.splitX = Min(unsigned(float(f.width) * s.compareSplit / 100.0f + 0.5f), f.width - 2) | 1u;
@@ -2342,9 +2339,7 @@ FrameInfo Info(const Frame& f, const Settings& s, WhiteSource source, const NrCo
     info.detail = s.detailStrength;
     info.colour = s.colourStrength;
     info.maxGain = s.maxGainEV;
-    info.highlight = s.highlightRestore;
     info.globalColour = s.globalColour;
-    info.globalBrightness = s.globalBrightness;
     return info;
 }
 
@@ -2405,8 +2400,8 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     if (!meter)
         g_nr.meterFresh = true;
     NrConstants constants = FrameConstants(f, s, source, frameIndex, modelWidth, modelHeight);
-    // The frame-wide cast, taken off in the composite (TakeCastOff): only when some of it is to go.
-    const bool cast = (constants.castColour > 0.0f || constants.castBrightness > 0.0f) && EnsureCast();
+    // The model's white balance, divided out in the composite (TakeCastOff): only when some of it is to go.
+    const bool cast = constants.castColour > 0.0f && EnsureCast();
     if (cast)
         constants.flags |= NR_FLAG_CAST;
     ID3D12Resource* exposure = nullptr;
@@ -2963,6 +2958,9 @@ void LogSample(const Sample& sample)
             const double grey = global[NR_G_GREY];
             const double tr = grey > 0.0 ? global[NR_G_TINT_R] / grey : 0.0;
             const double tb = grey > 0.0 ? global[NR_G_TINT_B] / grey : 0.0;
+            // What TakeCastOff divides out: 1 - GlobalColour of it, less where little grey was found (NR_GREY_PRIOR).
+            const double found = grey > 0.0 ? grey / (grey + NR_GREY_PRIOR * double(c[NR_C_GAIN_PIXELS])) : 0.0;
+            const double taken = (1.0 - double(info.globalColour)) * found;
             // A grey under a share of the tint: its colour (2^tr, 1, 2^tb) over its luminance, then k of the change.
             auto shown = [k](double share, double tR, double tB, double* rg, double* bg) {
                 const double r = std::exp2(share * tR), b = std::exp2(share * tB);
@@ -2972,17 +2970,16 @@ void LogSample(const Sample& sample)
                 *bg = (1.0 + k * (b / y - 1.0)) / gr;
             };
             double rg, bg, keptRg, keptBg;
-            const double kept = double(info.globalColour);
             shown(1.0, tr, tb, &rg, &bg);
-            shown(kept, tr, tb, &keptRg, &keptBg);
+            shown(1.0 - taken, tr, tb, &keptRg, &keptBg);
             const double brightness = double(info.detail) * global[NR_G_GAIN] / weight;
             add("; frame: input R/G %.4f B/G %.4f; the model's cast at DetailStrength x ColourStrength %.2f: grey R/G "
                 "x%.4f B/G x%.4f (white balance R/G x%.4f B/G x%.4f, measured on %.1f%% of its picture in greys); its "
-                "mean brightness change %+.3f EV; kept (GlobalColour %.2f, GlobalBrightness %.2f): grey R/G x%.4f B/G "
-                "x%.4f, %+.3f EV",
+                "mean brightness change %+.3f EV; kept (GlobalColour %.2f, %.0f%% of the white balance taken off): grey "
+                "R/G x%.4f B/G x%.4f",
                 global[NR_G_IN_R] / global[NR_G_IN_G], global[NR_G_IN_B] / global[NR_G_IN_G], k, rg, bg, std::exp2(tr),
-                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), brightness, kept,
-                double(info.globalBrightness), keptRg, keptBg, double(info.globalBrightness) * brightness);
+                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), brightness, double(info.globalColour),
+                100.0 * taken, keptRg, keptBg);
         }
     }
     Log("%s", line);
@@ -3075,7 +3072,7 @@ void WriteDump(unsigned index)
     header.detail = info.detail;
     header.colour = info.colour;
     header.maxGain = info.maxGain;
-    header.highlight = info.highlight;
+    header.highlight = 0.0f; // HighlightRestore, retired in v0.3.0: the field stays so that older dumps still read
     WideCharToMultiByte(CP_UTF8, 0, exe, -1, header.exe, int(sizeof header.exe) - 1, nullptr, nullptr);
 
     const HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

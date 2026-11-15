@@ -33,9 +33,9 @@
 // nr_fit.hlsl writes three textures over the model's picture through u0-u2 (u1 is a texture there, not the buffer),
 // and the composite then reads them through t4-t6 (slope, value, raw) instead of the proxy and the model's output.
 //
-// The cast (NR_FLAG_CAST, GlobalColour or GlobalBrightness below 1): every frame, the cast pass sums the model's change
-// over its picture into a buffer laid out as the statistics' (NR_S_GLOBAL), and the composite reads it through u1 and
-// takes that much of the frame-wide mean off each pixel's change.
+// The cast (NR_FLAG_CAST, GlobalColour below 1): every frame, the cast pass sums the model's white balance over the
+// greyish parts of its picture into a buffer laid out as the statistics' (NR_S_GLOBAL), and the composite reads it
+// through u1 and divides that much of it out of each pixel's colour change.
 
 #ifdef __cplusplus
 #include <cstdint>
@@ -76,7 +76,7 @@
 #define NR_FLAG_SHOW_SKY 0x100      // the composite stripes what counts as sky (Show sky); t0 holds the depth
 #define NR_FLAG_SCALED 0x200        // the model works on a smaller copy of the frame (ModelScale): modelWidth x
                                     // modelHeight at the top left of the proxy and of the model's output
-#define NR_FLAG_CAST 0x400          // the composite takes the model's frame-wide cast off (castColour, castBrightness),
+#define NR_FLAG_CAST 0x400          // the composite divides the model's white balance out (castColour),
                                     // from the sums the cast pass left in u1
 
 struct NrConstants
@@ -95,7 +95,7 @@ struct NrConstants
     NR_FLOAT detail;     // DetailStrength
     NR_FLOAT colour;     // ColourStrength
     NR_FLOAT maxGain;    // MaxGainEV
-    NR_FLOAT highlight;  // HighlightRestore
+    NR_FLOAT peak;       // 2^HighlightColour: the top of the display a colour change is shown on, in white points
 
     NR_UINT cardX;     // the calibration card's rectangle inside the frame; cardW 0 = no card
     NR_UINT cardY;
@@ -130,12 +130,12 @@ struct NrConstants
     NR_FLOAT stepX;
     NR_FLOAT stepY;
 
-    // How much of the model's frame-wide change the composite takes off each pixel's (NR_FLAG_CAST): 1 - GlobalColour
-    // of its mean colour change, 1 - GlobalBrightness of its mean brightness change.
+    // How much of the model's white balance the composite divides out of each pixel's colour (NR_FLAG_CAST):
+    // 1 - GlobalColour.
     NR_FLOAT castColour;
-    NR_FLOAT castBrightness;
     NR_UINT unused0;
     NR_UINT unused1;
+    NR_UINT unused2;
 };
 
 #ifdef __cplusplus
@@ -199,6 +199,9 @@ static_assert(sizeof(NrConstants) == 160, "NrConstants is passed as root constan
 #define NR_G_IN_B 7
 #define NR_GLOBALS 8
 #define NR_G_SCALE 64.0
+// The grey taken for granted as untinted when the white balance is divided out (nr.hlsl's TakeCastOff), as a share of
+// the model's picture.
+#define NR_GREY_PRIOR (1.0 / 256.0)
 #define NR_S_TAG_LAST (NR_S_GLOBAL + NR_GLOBALS)       // frame + 1 again
 #define NR_S_WORDS (NR_S_TAG_LAST + 1)
 

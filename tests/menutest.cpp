@@ -165,7 +165,7 @@ int LogCount(const char* needle)
                                  FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE)
         return -1;
-    static char text[65536];
+    static char text[1 << 20];
     DWORD read = 0;
     const BOOL ok = ReadFile(f, text, sizeof text - 1, &read, nullptr);
     CloseHandle(f);
@@ -227,6 +227,7 @@ void TestWrite()
     s.statsSeconds = 0.0f;
     s.colourStrength = 1.25f;
     s.globalColour = 0.35f;
+    s.highlightColour = 1.5f;
     s.menuKey = 0x7B; // F12
     size_t length = 0;
     char* merged = SettingsMergeIni(text, s, &length);
@@ -241,8 +242,8 @@ void TestWrite()
     Check(strstr(merged, "ColourStrength = 1.25\r\n") != nullptr && strstr(merged, "ColorStrength") == nullptr,
           "write: a line under the other spelling of a key becomes the key's own line");
     Check(strstr(merged, "Intensity = 0.8\r\n") != nullptr, "write: a set model parameter is added");
-    Check(strstr(merged, "GlobalColour = 0.35\r\n") != nullptr && strstr(merged, "GlobalBrightness") == nullptr,
-          "write: GlobalColour away from its default (0) is added, GlobalBrightness at its own (1) is not");
+    Check(strstr(merged, "GlobalColour = 0.35\r\n") != nullptr && strstr(merged, "HighlightColour = 1.5\r\n") != nullptr,
+          "write: GlobalColour and HighlightColour away from their defaults are added");
     Check(strstr(merged, "MenuKey = F12\r\n") != nullptr, "write: a key away from its default is added");
     Check(strstr(merged, "Shoulder") == nullptr, "write: a value at its default is not added");
     Check(strstr(merged, "\n\n") == nullptr && strchr(merged, '\n') != nullptr && strstr(merged, "\r\n") != nullptr,
@@ -258,8 +259,8 @@ void TestWrite()
           "write: Intensity read back");
     Check(Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog 2 read back");
     Check(Near(loaded->colourStrength, 1.25f, 1e-6f), "write: ColourStrength read back");
-    Check(Near(loaded->globalColour, 0.35f, 1e-6f) && loaded->globalBrightness == 1.0f,
-          "write: GlobalColour read back, GlobalBrightness at its default");
+    Check(Near(loaded->globalColour, 0.35f, 1e-6f) && Near(loaded->highlightColour, 1.5f, 1e-6f),
+          "write: GlobalColour and HighlightColour read back");
     Check(loaded->menuKey == 0x7B, "write: MenuKey F12 read back");
 
     // A new file: the header and only the keys away from their defaults.
@@ -351,6 +352,17 @@ void TestWrite()
           "write: written from another file, its comments and unknown keys come along (error %lu)", error);
     Check(FileHas("Shoulder = 0.75", 0.0), "write: the file it came from not touched");
     DeleteFileW(other);
+
+    // Keys retired in v0.3.0 are still in older files: read and dropped without a word.
+    const int ignoredBefore = LogCount("ignored");
+    Check(WriteAll(g_ini, "HighlightRestore = 0.5\r\nGlobalBrightness = 0.2\r\nHighlightColour = 0.5\r\n"),
+          "retired: the test's ini written");
+    const Settings* retired = SettingsLoad(g_ini);
+    const int ignoredAfter = LogCount("ignored");
+    Check(ignoredBefore >= 0 && ignoredAfter == ignoredBefore && Near(retired->highlightColour, 0.5f, 1e-6f),
+          "retired: HighlightRestore and GlobalBrightness read without a word (%d lines ignored before, %d after), "
+          "HighlightColour 0.5 read",
+          ignoredBefore, ignoredAfter);
 }
 
 // ModelScale's steps: a third, each whole percent from 34, two thirds in place of 67; anything else goes to the

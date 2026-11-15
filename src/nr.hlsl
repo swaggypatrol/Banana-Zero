@@ -120,17 +120,19 @@ uint2 DepthTexel(uint2 p, uint2 size)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The composite: the model's brightness change as a gain on the frame, its colour change added at the light the model
-// saw the pixel at. `frame` is the game's value, in its own units; the result is in the same units. `change` is the
-// brightness change in EV before DetailStrength and MaxGainEV (ModelGain), `chroma` the colour change (ModelChroma).
+// The composite: the model's brightness change as a gain on the frame, its colour change added at the pixel's own
+// light up to the top of the display it assumes (Shown). `frame` is the game's value, in its own units; the result is
+// in the same units. `change` is the brightness change in EV before DetailStrength and MaxGainEV (ModelGain),
+// `chroma` the colour change (ModelChroma).
 
-// The share of a linear HDR pixel's luminance its colour change is added at: the encode's own scale, so all of it
-// below the shoulder and, above, only the light the encode held the pixel to, at most the white point. The model
-// judged a tail light 500 times as bright as the white point at that light; added at the light's own, the cast
-// GlobalColour takes off, or a glow of the model's, came back 500 times as strong, as purple (Forza Horizon 6).
+// The share of a linear HDR pixel's luminance its colour change is added at: all of it while the pixel's largest
+// channel fits the display the composite assumes (the encode's own curve, its top at g.peak = 2^HighlightColour white
+// points), above that only what such a display would show. Added at a light's own luminance, which has no top, the
+// model's glow around a tail light hundreds of times as bright as the white point came back hundreds of times as
+// strong, as purple (Forza Horizon 6). HighlightColour 0 is the top of the model's own picture.
 float Shown(float3 c, float white)
 {
-    const float m = Max3(Clean(c)) / white;
+    const float m = Max3(Clean(c)) / (white * g.peak);
     return m > g.shoulder ? Shoulder(m, g.shoulder) / m : 1.0;
 }
 
@@ -147,32 +149,29 @@ float3 ApplyChange(float3 frame, float change, float3 chroma, float white, bool 
     return linearHdr ? result : SrgbEncode(saturate(result));
 }
 
-// GlobalColour and GlobalBrightness (NR_FLAG_CAST): the model's change to the frame as a whole, measured on this frame
-// by the cast pass (nr_stats.hlsl), taken off each pixel's by castColour and castBrightness, so that what it changes
-// here against there stays and what it changes everywhere at once goes. Its brightness: the luminance-weighted mean
-// of its change in EV, taken off the pixel's. Its colour: its white balance, a gain per channel measured on the
-// greyish parts of its picture (Greyness, Tint), divided out of the model's colour at this pixel, whose light in the
-// model's input is `light`. So greys stay grey, a white-balance cast comes off every pixel exactly, and a saturated
-// colour loses only its own share of it (a red light has no blue to lose). The model can white-balance only what its
-// output has room for, so the share divided out fades from all of it below the shoulder to none where the model's
-// input is at its top (a white highlight it left white keeps its colour). In Forza Horizon 6 the model's
-// white balance moves a grey's B/G by several per cent within seconds as the scene changes; a mean of its colour
-// change by luminance, taken off instead, left the greys most of that, the sky outweighing them.
+// GlobalColour (NR_FLAG_CAST): the model's white balance, measured on this frame by the cast pass (nr_stats.hlsl) as a
+// gain per channel on the greyish parts of its picture (Greyness, Tint), castColour of it divided out of the model's
+// colour at this pixel, whose light in the model's input is `light`. So greys stay grey, a white-balance cast comes
+// off every pixel exactly, a saturated colour loses only its own share of it (a red light has no blue to lose), and
+// what the model changes here against there stays. In Forza Horizon 6 the model's white balance moves a grey's B/G by
+// several per cent within seconds as the scene changes. The model can white-balance only what its output has room
+// for, so the share divided out fades from all of it below the shoulder to none where the model's input is at its top
+// (a white highlight it left white keeps its colour). And a white balance measured on little grey is mostly left
+// alone: NR_GREY_PRIOR of the picture counts as grey that is untinted, so a loading screen with 0.1% of grey loses a
+// fifth of it, a road with 18% nearly all.
 float CastSum(uint i) { return float(asint(gDump.Load((NR_S_GLOBAL + i) * 4))); }
 
-void TakeCastOff(inout float change, inout float3 chroma, float3 light)
+void TakeCastOff(inout float3 chroma, float3 light)
 {
     if ((g.flags & NR_FLAG_CAST) == 0)
         return;
-    const float weight = CastSum(NR_G_WEIGHT);
-    if (weight > 0.0)
-        change -= g.castBrightness * CastSum(NR_G_GAIN) / weight;
     const float grey = CastSum(NR_G_GREY);
     const float luminance = dot(light, kLuma);
-    if (g.castColour == 0.0 || !(grey > 0.0) || !(luminance > kChromaFloor))
+    if (!(grey > 0.0) || !(luminance > kChromaFloor))
         return;
+    const float prior = float(NR_GREY_PRIOR * NR_G_SCALE) * float(g.modelWidth) * float(g.modelHeight);
     const float room = saturate((1.0 - Max3(light)) / (1.0 - g.shoulder));
-    const float2 tint = g.castColour * room * float2(CastSum(NR_G_TINT_R), CastSum(NR_G_TINT_B)) / grey;
+    const float2 tint = g.castColour * room * float2(CastSum(NR_G_TINT_R), CastSum(NR_G_TINT_B)) / (grey + prior);
     const float3 own = light / luminance;
     const float3 c = (own + chroma) * float3(exp2(-tint.x), 1.0, exp2(-tint.y));
     const float y = dot(c, kLuma);
@@ -512,7 +511,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             const float3 light = ProxyLight(frame.rgb, white, linearHdr);
             if (ScaledChange(id.xy, Guide(light), change, chroma))
             {
-                TakeCastOff(change, chroma, light);
+                TakeCastOff(chroma, light);
                 result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }
@@ -525,9 +524,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             {
                 const float3 p = ProxyLinear(proxyEncoded);
                 const float3 o = ModelLinear(modelEncoded, proxyEncoded);
-                float change = ModelGain(p, o, linearHdr);
+                const float change = ModelGain(p, o);
                 float3 chroma = ModelChroma(p, o);
-                TakeCastOff(change, chroma, p);
+                TakeCastOff(chroma, p);
                 result.rgb = ApplyChange(frame.rgb, change, chroma, white, linearHdr);
                 write = true;
             }

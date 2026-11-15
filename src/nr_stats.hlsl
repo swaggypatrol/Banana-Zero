@@ -243,7 +243,7 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             const float3 pe = gProxy.Load(int3(q, 0)).rgb;
             const float3 p = ProxyLinear(pe);
             const float3 o = ModelLinear(gModel.Load(int3(q, 0)).rgb, pe);
-            const float change = ModelGain(p, o, linearHdr);
+            const float change = ModelGain(p, o);
             const float gain = change * g.detail;
             if (gain < -g.maxGain)
                 ++count[NR_C_GAIN_LOW];
