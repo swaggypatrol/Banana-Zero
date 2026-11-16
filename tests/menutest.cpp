@@ -41,6 +41,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -735,9 +736,31 @@ void TestPanel()
           "panel: with the auto mask on, a click on skin structure sets it (%.2f)",
           double(SettingsCurrent()->model.skinStructure.value));
 
+    // The overlay composites only where the panel drew (MenuDrawnBounds): around the panel, not the whole frame; with
+    // the confirmation's modal up, whose dimming covers the frame, all of it.
+    {
+        Frame();
+        const ImVec2 size = ImGui::GetIO().DisplaySize;
+        const MenuRect drawn = MenuDrawnBounds(ImGui::GetDrawData(), unsigned(size.x), unsigned(size.y));
+        float cx0, cy0, cx1, cy1, tx0, ty0, tx1, ty1;
+        const bool shown = MenuItemRect("Close", &cx0, &cy0, &cx1, &cy1) && MenuItemRect("AB", &tx0, &ty0, &tx1, &ty1);
+        const double area = double(drawn.right - drawn.left) * double(drawn.bottom - drawn.top);
+        Check(shown && drawn.left <= long(std::min(cx0, tx0)) && drawn.top <= long(std::min(cy0, ty0)) &&
+                  drawn.right >= long(std::max(cx1, tx1)) && drawn.bottom >= long(std::max(cy1, ty1)) &&
+                  area < 0.5 * double(size.x) * double(size.y),
+              "panel: the drawn part is the panel's (%ld,%ld to %ld,%ld of %.0fx%.0f)", drawn.left, drawn.top,
+              drawn.right, drawn.bottom, double(size.x), double(size.y));
+    }
     // All defaults, through the confirmation.
     Check(Click("Defaults"), "panel: click all defaults");
     Frame();
+    {
+        const ImVec2 size = ImGui::GetIO().DisplaySize;
+        const MenuRect drawn = MenuDrawnBounds(ImGui::GetDrawData(), unsigned(size.x), unsigned(size.y));
+        Check(drawn.left == 0 && drawn.top == 0 && drawn.right == long(size.x) && drawn.bottom == long(size.y),
+              "panel: with the modal confirmation up the whole frame is drawn (%ld,%ld to %ld,%ld)", drawn.left,
+              drawn.top, drawn.right, drawn.bottom);
+    }
     Check(Click("DefaultsYes"), "panel: confirm");
     Check(Generation() == g2 + 3 && !SettingsCurrent()->model.intensity.set &&
               !SettingsCurrent()->model.autoMask.set && !SettingsCurrent()->model.skinStructure.set &&

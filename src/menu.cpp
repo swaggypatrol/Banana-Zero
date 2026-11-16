@@ -5,8 +5,10 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cmath>
 
 #include "freeze.h"
+#include "imgui.h"
 #include "log.h"
 #include "menu_model.h"
 #include "overlay_dx12.h"
@@ -303,4 +305,25 @@ void MenuBeforeCoreShutdown()
         }
     }
     ReleaseSRWLockExclusive(&g_lock);
+}
+
+MenuRect MenuDrawnBounds(const ImDrawData* data, unsigned width, unsigned height)
+{
+    float x0 = 1.0e30f, y0 = 1.0e30f, x1 = -1.0e30f, y1 = -1.0e30f;
+    for (int i = 0; data != nullptr && i < data->CmdLists.Size; ++i)
+    {
+        for (const ImDrawVert& v : data->CmdLists[i]->VtxBuffer)
+        {
+            x0 = v.pos.x < x0 ? v.pos.x : x0;
+            y0 = v.pos.y < y0 ? v.pos.y : y0;
+            x1 = v.pos.x > x1 ? v.pos.x : x1;
+            y1 = v.pos.y > y1 ? v.pos.y : y1;
+        }
+    }
+    if (!(x1 > x0 && y1 > y0))
+        return {};
+    auto held = [](float v, unsigned top) { return v < 0.0f ? 0L : v > float(top) ? long(top) : long(v); };
+    const ImVec2 at = data->DisplayPos;
+    return { held(std::floor(x0 - at.x), width), held(std::floor(y0 - at.y), height), held(std::ceil(x1 - at.x), width),
+             held(std::ceil(y1 - at.y), height) };
 }

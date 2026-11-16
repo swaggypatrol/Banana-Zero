@@ -51,5 +51,15 @@ bool MenuPanelListening();
 bool MenuItemRect(const char* key, float* x0, float* y0, float* x1, float* y1);
 #endif
 
+// The part of a frame `width` x `height` the menu drew in: the bounds of every vertex of ImGui's draw data, rounded
+// outward and held to the frame (a modal's dimming spans the whole frame, and so does this then); empty (right <= left)
+// when nothing was drawn. The overlay composites its picture over the game's frame only there.
+struct MenuRect
+{
+    long left, top, right, bottom;
+};
+struct ImDrawData;
+MenuRect MenuDrawnBounds(const ImDrawData* data, unsigned width, unsigned height);
+
 // The game is shutting the NGX core down: the menu closes, the overlay goes, the file is written now if it is due.
 void MenuBeforeCoreShutdown();

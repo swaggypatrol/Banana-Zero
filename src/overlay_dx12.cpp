@@ -1020,7 +1020,10 @@ void DrawLocked(IDXGISwapChain* chain)
     Barrier(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     g.list->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
     const D3D12_VIEWPORT viewport = { 0.0f, 0.0f, float(g.width), float(g.height), 0.0f, 1.0f };
-    const D3D12_RECT scissor = { 0, 0, LONG(g.width), LONG(g.height) };
+    // Only where the menu drew: the rest of its picture is transparent.
+    const MenuRect drawn = MenuDrawnBounds(ImGui::GetDrawData(), g.width, g.height);
+    const D3D12_RECT scissor = { drawn.left, drawn.top, drawn.right > drawn.left ? drawn.right : drawn.left,
+                                 drawn.bottom > drawn.top ? drawn.bottom : drawn.top };
     g.list->RSSetViewports(1, &viewport);
     g.list->RSSetScissorRects(1, &scissor);
     g.list->SetGraphicsRootSignature(g.rootSignature);
