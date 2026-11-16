@@ -655,6 +655,17 @@ struct Nr
     bool markersFailed = false;
     uint64_t recordings = 0;            // recordings into a game's list so far, each ended with a marker
     uint64_t ringRecording[kRing] = {}; // per descriptor slot, the recording of the frame that last used it
+    // What each descriptor last had written to it, so that the same view is not made again (Unchanged); valid while
+    // `generation` is as it was then. Every texture or buffer of ours made, and the heap, starts a new generation.
+    struct Written
+    {
+        ID3D12Resource* resource;
+        DXGI_FORMAT format;
+        uint8_t kind; // 0 nothing known, else a ViewKind
+        uint64_t generation;
+    };
+    Written written[kRing * kDescriptorsPerFrame] = {};
+    uint64_t generation = 1;
 
     // ModelScale: the model's picture as last evaluated (the frame's size, or smaller; 0 before the feature's first
     // evaluation), since which frame, and the size last logged. The fit's three textures (nr_fit.hlsl), at the
@@ -1160,6 +1171,7 @@ bool MakePipeline()
         return false;
     }
     g_nr.descriptorSize = g_nr.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ++g_nr.generation;
     return true;
 }
 
@@ -1245,6 +1257,7 @@ bool MakeTexture(Texture* texture, DXGI_FORMAT format, unsigned width, unsigned 
         return false;
     }
     *texture = { resource, format, width, height };
+    ++g_nr.generation;
     return true;
 }
 
@@ -1287,6 +1300,7 @@ bool MakeBuffer(Buffer* buffer, D3D12_HEAP_TYPE type, uint64_t size, const char*
         }
     }
     *buffer = { resource, static_cast<const uint8_t*>(mapped), size };
+    ++g_nr.generation;
     return true;
 }
 
@@ -2047,9 +2061,38 @@ D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle(unsigned slot)
     return handle;
 }
 
-// A texture SRV at `slot`; a null one (reads as zero) when `resource` is null.
-void WriteSrv(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format)
+enum ViewKind : uint8_t
 {
+    kSrvView = 1,
+    kTextureUavView,
+    kBufferUavView,
+};
+
+// True when `slot` already holds this view, of a texture or buffer of ours or of nothing, made since our last
+// texture, buffer or heap was made; else notes it as about to be written. A view of the game's (`game`) is written
+// every time: a texture of its made again can come back at the same address. Run writes only a frame's own slots,
+// once the GPU is done with them, so a view left alone is the one the frame needs.
+bool Unchanged(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, ViewKind kind, bool game)
+{
+    Nr::Written& w = g_nr.written[slot];
+    if (game)
+    {
+        w = {};
+        return false;
+    }
+    if (resource == nullptr)
+        format = DXGI_FORMAT_UNKNOWN;
+    if (w.kind == kind && w.resource == resource && w.format == format && w.generation == g_nr.generation)
+        return true;
+    w = { resource, format, uint8_t(kind), g_nr.generation };
+    return false;
+}
+
+// A texture SRV at `slot`; a null one (reads as zero) when `resource` is null.
+void WriteSrv(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, bool game = false)
+{
+    if (Unchanged(slot, resource, format, kSrvView, game))
+        return;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
     srv.Format = resource != nullptr ? format : DXGI_FORMAT_R16G16B16A16_FLOAT;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2058,8 +2101,10 @@ void WriteSrv(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format)
     g_nr.device->CreateShaderResourceView(resource, &srv, CpuHandle(slot));
 }
 
-void WriteTextureUav(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format)
+void WriteTextureUav(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, bool game = false)
 {
+    if (Unchanged(slot, resource, format, kTextureUavView, game))
+        return;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.Format = resource != nullptr ? format : DXGI_FORMAT_R16G16B16A16_FLOAT;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -2069,6 +2114,8 @@ void WriteTextureUav(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format
 // A raw (byte address) buffer UAV; a null one when the buffer has no resource.
 void WriteBufferUav(unsigned slot, const Buffer* buffer)
 {
+    if (Unchanged(slot, buffer != nullptr ? buffer->resource : nullptr, DXGI_FORMAT_R32_TYPELESS, kBufferUavView, false))
+        return;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.Format = DXGI_FORMAT_R32_TYPELESS;
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -2079,10 +2126,12 @@ void WriteBufferUav(unsigned slot, const Buffer* buffer)
 }
 
 // One slot of a descriptor table: a texture and the format to view it with; null where the pass reads nothing.
+// `game`: the game's texture, whose view is written every frame (Unchanged).
 struct View
 {
     ID3D12Resource* resource;
     DXGI_FORMAT format;
+    bool game = false;
 };
 
 // A table of nr.hlsl or nr_stats.hlsl (nr_shared.h): the seven SRVs, the texture in u0, the buffer in u1, nothing in
@@ -2090,8 +2139,8 @@ struct View
 void WriteTable(unsigned table, const View (&srvs)[kSrvs], View target, const Buffer* buffer)
 {
     for (unsigned i = 0; i < kSrvs; ++i)
-        WriteSrv(table + i, srvs[i].resource, srvs[i].format);
-    WriteTextureUav(table + kUav0, target.resource, target.format);
+        WriteSrv(table + i, srvs[i].resource, srvs[i].format, srvs[i].game);
+    WriteTextureUav(table + kUav0, target.resource, target.format, target.game);
     WriteBufferUav(table + kUav1, buffer);
     WriteTextureUav(table + kUav2, nullptr, DXGI_FORMAT_UNKNOWN);
 }
@@ -2476,11 +2525,11 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
 
     // The descriptor tables (nr_shared.h has which pass reads which slot).
     const View none = { nullptr, DXGI_FORMAT_UNKNOWN };
-    const View frameView = { f.output, outputView };
-    const View exposureV = { exposure, exposureView };
+    const View frameView = { f.output, outputView, true };
+    const View exposureV = { exposure, exposureView, !meter }; // the game's, or the scene meter's own
     const View proxyV = { g_nr.proxy.resource, g_nr.proxy.format };
     const View modelV = { g_nr.modelOutput.resource, g_nr.modelOutput.format };
-    const View depthV = { f.depth, depthView };
+    const View depthV = { f.depth, depthView, true };
     const Buffer* const statsBuffer = stats ? &g_nr.stats : nullptr;
     // The composite's white balance sums: on a statistics frame the gain and spread passes' (the same words), else the
     // cast pass's own buffer.
@@ -2518,7 +2567,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         WriteTable(meterTable, { frameView, none, none, none, none, none, none },
                    { g_nr.scene.resource, DXGI_FORMAT_R32_FLOAT }, &g_nr.meter);
     if (dilate)
-        WriteTable(dilateTable, { depthV, { f.motion, motionView }, none, none, none, none, none },
+        WriteTable(dilateTable, { depthV, { f.motion, motionView, true }, none, none, none, none, none },
                    { g_nr.dilated.resource, g_nr.dilated.format }, nullptr);
     if (sky)
         WriteTable(skyTable, { depthV, none, none, none, none, none, none }, { g_nr.mask.resource, g_nr.mask.format },
