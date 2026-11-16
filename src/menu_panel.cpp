@@ -65,88 +65,13 @@ void RecordRect(const char*, ImVec2, ImVec2) {}
 void Record(const char*) {}
 #endif
 
-constexpr float kPi = 3.14159265f;
-
-// ImGui's arrows are sharp triangles; the rounded look wants rounded corners on them. A triangle `height` tall
-// pointing down or right, each corner replaced by an arc of `radius`, filled.
-void RoundedTriangle(ImDrawList* draw, ImVec2 centre, float height, float radius, ImGuiDir dir, ImU32 colour)
-{
-    const float half = height * 0.5f;
-    const float side = height * 0.57735f; // half the base of an equilateral triangle
-    ImVec2 p[3];
-    if (dir == ImGuiDir_Down)
-    {
-        p[0] = ImVec2(centre.x - side, centre.y - half);
-        p[1] = ImVec2(centre.x + side, centre.y - half);
-        p[2] = ImVec2(centre.x, centre.y + half);
-    }
-    else
-    {
-        p[0] = ImVec2(centre.x - half, centre.y - side);
-        p[1] = ImVec2(centre.x + half, centre.y);
-        p[2] = ImVec2(centre.x - half, centre.y + side);
-    }
-    draw->PathClear();
-    for (int i = 0; i < 3; ++i)
-    {
-        const ImVec2 prev = p[(i + 2) % 3], cur = p[i], next = p[(i + 1) % 3];
-        ImVec2 a(prev.x - cur.x, prev.y - cur.y), b(next.x - cur.x, next.y - cur.y);
-        const float la = sqrtf(a.x * a.x + a.y * a.y), lb = sqrtf(b.x * b.x + b.y * b.y);
-        a = ImVec2(a.x / la, a.y / la);
-        b = ImVec2(b.x / lb, b.y / lb);
-        const float theta = acosf(a.x * b.x + a.y * b.y);  // the corner's angle
-        const float tangent = radius / tanf(theta * 0.5f); // from the corner to where the arc meets each edge
-        ImVec2 bisector(a.x + b.x, a.y + b.y);
-        const float lbis = sqrtf(bisector.x * bisector.x + bisector.y * bisector.y);
-        const float toCentre = radius / sinf(theta * 0.5f);
-        const ImVec2 c(cur.x + bisector.x / lbis * toCentre, cur.y + bisector.y / lbis * toCentre);
-        const ImVec2 t1(cur.x + a.x * tangent, cur.y + a.y * tangent);
-        const ImVec2 t2(cur.x + b.x * tangent, cur.y + b.y * tangent);
-        const float a1 = atan2f(t1.y - c.y, t1.x - c.x);
-        float a2 = atan2f(t2.y - c.y, t2.x - c.x);
-        if (a2 - a1 > kPi)
-            a2 -= 2.0f * kPi;
-        if (a2 - a1 < -kPi)
-            a2 += 2.0f * kPi;
-        draw->PathArcTo(c, radius, a1, a2, 6);
-    }
-    draw->PathFillConvex(colour);
-}
-
-// The title bar's collapse arrow drawn again with rounded corners over ImGui's: its square sits a frame padding
-// in from the window's corner and is a font size wide (imgui.cpp, RenderWindowDecorations and CollapseButton).
-// Right after Begin, whether or not the window is collapsed.
-void RoundedCollapseArrow()
-{
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const float fs = ImGui::GetFontSize();
-    const ImVec2 wp = ImGui::GetWindowPos();
-    const ImVec2 min(wp.x + style.FramePadding.x, wp.y + style.FramePadding.y);
-    const ImVec2 max(min.x + fs, min.y + fs);
-    const bool collapsed = ImGui::IsWindowCollapsed();
-    const bool hovered = ImGui::IsMouseHoveringRect(min, max, false);
-    const bool held = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-    ImU32 background = ImGui::GetColorU32(collapsed                  ? ImGuiCol_TitleBgCollapsed
-                                          : ImGui::IsWindowFocused() ? ImGuiCol_TitleBgActive
-                                                                     : ImGuiCol_TitleBg);
-    if (hovered)
-        background = ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered);
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->PushClipRectFullScreen();
-    draw->AddRectFilled(min, max, background);
-    RoundedTriangle(draw, ImVec2(min.x + fs * 0.5f, min.y + fs * 0.5f), fs * 0.6f, fs * 0.09f,
-                    collapsed ? ImGuiDir_Right : ImGuiDir_Down, ImGui::GetColorU32(ImGuiCol_Text));
-    draw->PopClipRect();
-}
-
-// A choice: ImGui's combo without its arrow button, a rounded arrow at the right end of the frame instead.
+// A choice: ImGui's combo, its options recorded for menutest.
 bool ComboBox(const char* key, const char* label, int* v, const char* const* names, int count)
 {
     const ImVec2 min = ImGui::GetCursorScreenPos();
-    const float height = ImGui::GetFrameHeight();
-    const ImVec2 max(min.x + ImGui::CalcItemWidth(), min.y + height);
+    const ImVec2 max(min.x + ImGui::CalcItemWidth(), min.y + ImGui::GetFrameHeight());
     bool changed = false;
-    if (ImGui::BeginCombo(label, names[*v], ImGuiComboFlags_NoArrowButton))
+    if (ImGui::BeginCombo(label, names[*v]))
     {
         for (int i = 0; i < count; ++i)
         {
@@ -166,18 +91,15 @@ bool ComboBox(const char* key, const char* label, int* v, const char* const* nam
         ImGui::EndCombo();
     }
     RecordRect(key, min, max);
-    const float fs = ImGui::GetFontSize();
-    RoundedTriangle(ImGui::GetWindowDrawList(), ImVec2(max.x - height * 0.5f, min.y + height * 0.5f), fs * 0.55f,
-                    fs * 0.08f, ImGuiDir_Down, ImGui::GetColorU32(ImGuiCol_Text));
     return changed;
 }
 
 // A slider with notches: `notches` positions from lo to hi, the value snapping to them; when `centred` the middle
 // notch is the neutral value and the fill runs from it. With `stops` (Stops below) the value moves in its steps
-// instead and the notches are its stops. No number on the slider: the value shows while the mouse rests on it or
-// drags, Ctrl+click types one (not snapped, but for stops), a right-click is the caller's (the default back). `text`
-// stands in for the grab when the value is not set (the model's default). The grab is a rounded rectangle with the
-// frame's own rounding.
+// instead and the notches are its stops. The value is written small in the trough, at the end away from the grab;
+// Ctrl+click types one (not snapped, but for stops), a right-click is the caller's (the default back). `text` stands
+// in for the value when it is not set (the model's default). The grab is a rounded rectangle with the frame's own
+// rounding.
 struct SliderState
 {
     bool edited = false;   // the value changed under the mouse this frame: a step of the drag
@@ -243,7 +165,7 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
     const ImGuiID id = ImGui::GetItemID();
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
-    const bool showValue = active || ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    const bool explain = ghost && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
     const float inset = fs * 0.1f;
     const float grabWidth = fs * 1.0f;
     const float x0 = min.x + inset + grabWidth * 0.5f; // the grab's centre at lo
@@ -324,9 +246,15 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
         draw->AddRectFilled(grabMin, grabMax,
                             ImGui::GetColorU32(active ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab), rounding);
     }
+    char number[32];
+    if (text == nullptr && !ghost)
+    {
+        snprintf(number, sizeof number, format, double(*v));
+        text = number;
+    }
     if (text != nullptr)
     {
-        // A word in the trough ("model default", "follows local structure"), small, at the end away from the grab.
+        // The value, or a word for it ("model default", "follows local structure"), small, away from the grab.
         ImFont* font = ImGui::GetFont();
         const float hintSize = fs * 0.78f; // not "small": a Windows SDK header defines that name
         const ImVec2 size = font->CalcTextSizeA(hintSize, FLT_MAX, 0.0f, text);
@@ -336,16 +264,8 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
         draw->AddText(font, hintSize, ImVec2(tx, min.y + (height - size.y) * 0.5f),
                       ImGui::GetColorU32(ImGuiCol_TextDisabled, 0.9f), text);
     }
-    if (showValue && !typing)
-    {
-        if (ghost)
-            ImGui::SetTooltip("%s",
-                              "The model's own default. Click or drag to take over, right-click to hand it back.");
-        else if (text == nullptr)
-            ImGui::SetTooltip(format, double(*v));
-        else
-            ImGui::SetTooltip("%s", text);
-    }
+    if (explain && !typing)
+        ImGui::SetTooltip("%s", "The model's own default. Click or drag to take over, right-click to hand it back.");
 
     if (ImGui::BeginPopup("type"))
     {
@@ -530,6 +450,7 @@ bool KeyBinding(const char* key, int slot, const char* label, unsigned* vk)
     return commit;
 }
 
+// The head of the panel: what NR works on and what it costs on the GPU beyond the model, and what holds it back.
 void StatusLines(const MenuModel& m, const NrStatusState& st, bool have)
 {
     if (!have)
@@ -543,44 +464,60 @@ void StatusLines(const MenuModel& m, const NrStatusState& st, bool have)
                            st.offReason != nullptr ? st.offReason : "?");
         return;
     }
-    ImGui::TextDisabled("%ux%u %s%s%s  frames %llu  failed %llu  model builds %u", st.width, st.height,
-                        st.feature == 13 ? "RR" : "SR", st.hdr ? " HDR" : "", st.linear ? "" : " (tone-mapped)",
-                        static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.failed),
-                        st.creates);
+    char what[64];
+    snprintf(what, sizeof what, "%ux%u %s%s%s", st.width, st.height, st.feature == 13 ? "RR" : "SR", st.hdr ? " HDR" : "",
+             st.linear ? "" : " (tone-mapped)");
+    if (st.haveTiming)
+        ImGui::TextDisabled("%s   NR's own processing %.2f ms on the GPU, the model %.2f ms", what,
+                            double(st.gpuMs - st.modelMs), double(st.modelMs));
+    else
+        ImGui::TextDisabled("%s", what);
     if (m.abOff)
         ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s", "A/B: showing the original, NR paused");
     else if (!m.draft.enabled)
         ImGui::TextColored(MenuToneColour(MenuTone::Attention), "%s", "NR is switched off");
     if (FreezeActive())
         ImGui::TextColored(MenuToneColour(MenuTone::Info), "%s", "Frame frozen");
-    if (st.model.major != 0)
-        ImGui::TextDisabled("DLL %u.%u.%u.%u  preset request %u / active %u (%s)%s", st.model.major, st.model.minor,
-                            st.model.build, st.model.revision, st.requestedPreset, st.activePreset,
-                            ModelPresetName(st.activePreset),
-                            st.presetPending ? " (switch pending)" : st.model.Known() ? "" : " (unverified profile)");
     if (!st.haveFeature)
         ImGui::TextDisabled("%s", "The model is not built yet");
 }
 
-// The sky mask and the model's auto mask together, on the Depth page under the sky sliders (MaskBlendMode). Auto
-// (not set, the default) picks the mode from the sliders (ModelMaskBlendResolve); the line under it says what is in
-// use now and why, with the numbers it went by, so nothing has to be remembered.
+// The counts and versions behind the head's line, on the Compare page. The GPU time is the whole NR pass, the model's
+// part of it and the rest; the CPU's work in the hooks and the overlay's own drawing are not in it.
+void Diagnostics(const NrStatusState& st, bool have)
+{
+    if (!have)
+        return;
+    ImGui::TextDisabled("Frames %llu, failed %llu, model builds %u", static_cast<unsigned long long>(st.frames),
+                        static_cast<unsigned long long>(st.failed), st.creates);
+    if (st.model.major != 0)
+        ImGui::TextDisabled("DLL %u.%u.%u.%u, preset request %u / active %u (%s)%s", st.model.major, st.model.minor,
+                            st.model.build, st.model.revision, st.requestedPreset, st.activePreset,
+                            ModelPresetName(st.activePreset),
+                            st.presetPending ? " (switch pending)" : st.model.Known() ? "" : " (unverified profile)");
+    if (st.modelWidth != 0)
+    {
+        if (st.modelWidth == st.width && st.modelHeight == st.height)
+            ImGui::TextDisabled("Model input: the whole %ux%u frame", st.width, st.height);
+        else
+            ImGui::TextDisabled("Model input: %ux%u of %ux%u", st.modelWidth, st.modelHeight, st.width, st.height);
+    }
+    if (st.haveTiming)
+        ImGui::TextDisabled("NR pass on the GPU %.2f ms: the model %.2f ms, NR's own processing %.2f ms", double(st.gpuMs),
+                            double(st.modelMs), double(st.gpuMs - st.modelMs));
+    else
+        ImGui::TextDisabled("%s", "NR pass on the GPU: no measurement yet");
+    ImGui::TextDisabled("Overlay: %s", OverlayState());
+}
+
+// The sky mask and the model's auto mask together, under the sky sliders (MaskBlendMode); the auto mask itself is in
+// the Masks part of the page. Auto (not set, the default) picks the mode from the sliders (ModelMaskBlendResolve); the
+// line under it says what is in use now and why, with the numbers it went by, so nothing has to be remembered.
 void SkyAutoMask(Settings& d, const NrStatusState& st, bool* commit)
 {
     ModelSettings& mm = d.model;
     const ModelSkyMask sky { d.skyTone != 1.0f || d.skyStructure != 1.0f, d.skyStructure };
-    ImGui::SeparatorText("Sky + Auto mask");
-    const char* const masks[] = { "Off", "On" };
-    const bool excludes = ModelExternalExcludesAuto(st.model, mm, sky);
-    ImGui::BeginDisabled(excludes);
-    *commit |= TunableChoice("AutoMask", "Auto mask (skin)", &mm.autoMask, 0, masks, 2);
-    ImGui::EndDisabled();
-    // The same Skin structure as on the Model page, here because it is one of the two numbers Auto goes by.
-    const bool skinLive = !excludes && ModelAutoMaskOn(mm);
-    ImGui::BeginDisabled(!skinLive);
-    *commit |= TunableFloat("SkinStructure", "Skin structure", &mm.skinStructure, 0.0f, 1.5f, 25, -1.0f, "%.2f",
-                            "follows local structure");
-    ImGui::EndDisabled();
+    ImGui::SeparatorText("Sky mask with the auto mask");
     if (!st.model.MaskBlend())
     {
         ImGui::TextDisabled("%s", "This DLL turns Auto mask off while a sky slider is away from 1.");
@@ -647,7 +584,6 @@ void PreviewWindow(MenuModel& m)
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - io.DisplaySize.x / 5.0f - fs * 2.0f, fs * 2.0f),
                             ImGuiCond_FirstUseEver);
     const bool open = ImGui::Begin("Model preview", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    RoundedCollapseArrow();
     if (!open)
     {
         ImGui::End();
@@ -743,7 +679,6 @@ void MenuDraw()
     ImGui::SetNextWindowPos(ImVec2(fs * 2.0f, fs * 2.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(fs * 36.0f, 0.0f), ImVec2(fs * 36.0f, io.DisplaySize.y * 0.9f));
     const bool open = ImGui::Begin("Banana-Zero Neural Rendering", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    RoundedCollapseArrow();
     if (!open)
     {
         ImGui::End();
@@ -780,12 +715,13 @@ void MenuDraw()
         Record("Freeze");
     }
 
-    // The pages: the tuning, the aids, the keys, the menu itself. Each fits a 1080-line frame.
+    // Four pages: the picture, the model, comparing and what is going on, the keys and the menu. Each fits a 1080-line
+    // frame with its folded parts open.
     if (ImGui::BeginTabBar("##pages", ImGuiTabBarFlags_NoTooltip))
     {
-        const bool tune = ImGui::BeginTabItem("Tuning");
-        Record("TabTune");
-        if (tune)
+        const bool picture = ImGui::BeginTabItem("Picture");
+        Record("TabPicture");
+        if (picture)
         {
             // Three things are taste: how much of the model's picture reaches the frame, whether its colour comes
             // along, and the model's style. Weights/masks have their own Model page; image-processing controls
@@ -805,6 +741,14 @@ void MenuDraw()
                 const char* const styles[] = { "Standard", "Natural", "Cinematic" };
                 commit |= TunableChoice("Style", "Style", &mm.style, 0, styles, 3);
             }
+
+            // The model on a smaller copy of the frame (ModelScale), after DLSS as always: its time follows its pixels
+            // (nrprobe on the RTX 5090 at 4K: 7.1 ms whole, 4.4 at 75%, 3.8 at 66.7%, 2.9 at 50%, 2.4 for 1280x720, a
+            // third), and its change comes back to the full frame along the frame's own edges (nr_fit.hlsl). The slider
+            // moves in 1% steps and holds at the stops 50, 66.7 and 80%.
+            static constexpr Stops kSizes = { ModelScaleStep, kModelScaleStops,
+                                              int(sizeof kModelScaleStops / sizeof kModelScaleStops[0]), 2.0f };
+            commit |= SteppedFloat("ModelScale", "Model input size", &d.modelScale, kSizes, def.modelScale, "%.3g%%");
 
             const bool advanced = ImGui::CollapsingHeader("Advanced (rarely needed)");
             Record("Advanced");
@@ -841,7 +785,11 @@ void MenuDraw()
             ImGui::EndTabItem();
         }
 
-        // Model controls are a first-class page, never hidden in Advanced and never INI-only.
+        // Model controls are a first-class page, never hidden in Advanced and never INI-only. What the game's depth
+        // adds is folded at its end, as experiments to judge by eye: the motion vectors dilated by depth (in nrprobe's
+        // T7 worse right on thin moving things and better over the rest of the frame), and the sky's own Local tone and
+        // Local structure through a control mask (in T8 the mask does exactly what the sliders do, and what one part
+        // of the picture is given moves the rest by about a fifth as much).
         const bool modelPage = ImGui::BeginTabItem("Model");
         Record("TabModel");
         if (modelPage)
@@ -881,10 +829,10 @@ void MenuDraw()
             ImGui::EndDisabled();
             if (excludesAuto)
                 ImGui::TextDisabled("%s", st.model.MaskBlend()
-                                              ? "Sky mask active and Sky + Auto mask is \"Sky mask only\" (Depth page)."
+                                              ? "Sky mask active and Combine is \"Sky mask only\" (Depth and sky, below)."
                                               : "Sky mask active: this DLL disables automatic masking.");
             else if (sky.present && st.model.MaskBlend() && ModelAutoMaskOn(mm))
-                ImGui::TextDisabled("With the sky mask: %s (Depth page)",
+                ImGui::TextDisabled("With the sky mask: %s (Depth and sky, below)",
                                     ModelBlendName(ModelMaskBlendMode(st.model, mm, sky)));
             const bool skin = !excludesAuto && mm.autoMask.set && mm.autoMask.value != 0;
             ImGui::BeginDisabled(!skin);
@@ -905,12 +853,29 @@ void MenuDraw()
                 why = "model defaults";
             }
             Record("ModelDefaults");
+            const bool depthSky = ImGui::CollapsingHeader("Depth and sky (experimental)");
+            Record("DepthSky");
+            if (depthSky)
+            {
+                ImGui::SeparatorText("Motion vectors");
+                commit |= Bool("DilateMotion", "Dilate by depth", &d.dilateMotion, def.dilateMotion);
+                ImGui::TextDisabled("%s", "Moving edges take the motion of what is in front. Judge it in motion.");
+
+                ImGui::SeparatorText("Sky");
+                commit |= Float("SkyTone", "Sky local tone", &d.skyTone, 0.0f, 1.5f, 25, false, def.skyTone, "%.2f");
+                commit |= Float("SkyStructure", "Sky local structure", &d.skyStructure, 0.0f, 1.5f, 25, false,
+                                def.skyStructure, "%.2f");
+                commit |= Bool("ShowSky", "Show what counts as sky (purple stripes)", &d.showSky, def.showSky);
+                ImGui::TextDisabled("%s", "1 = as the rest of the picture (times Local tone / Local structure).");
+                ImGui::TextDisabled("%s", "Sky = the far end of the game's depth. Stripes are never saved.");
+                SkyAutoMask(d, st, &commit);
+            }
             ImGui::TextDisabled("%s", "Right-click for defaults. No INI editing needed.");
             ImGui::PopItemWidth();
             ImGui::EndTabItem();
         }
 
-        // The aids.
+        // The aids, and the counts behind the head's line.
         const bool aids = ImGui::BeginTabItem("Compare");
         Record("TabCompare");
         if (aids)
@@ -944,75 +909,21 @@ void MenuDraw()
             if (haveStatus && !st.linear)
                 ImGui::TextDisabled("%s",
                                     "SDR or tone-mapped input: the card, zebra and histogram have nothing to say");
+            ImGui::SeparatorText("Diagnostics");
+            Diagnostics(st, haveStatus);
             ImGui::EndTabItem();
         }
 
-        // What the game's depth adds, as experiments to judge by eye. The motion vectors dilated by depth: in
-        // nrprobe's T7 worse right on thin moving things and better over the rest of the frame. The sky's own Local
-        // tone and Local structure, through a control mask: in T8 the mask does exactly what the sliders do, and
-        // what one part of the picture is given moves the rest by about a fifth as much.
-        const bool depthPage = ImGui::BeginTabItem("Depth (experimental)");
-        Record("TabDepth");
-        if (depthPage)
+        // The keys and the menu itself.
+        const bool settingsPage = ImGui::BeginTabItem("Settings");
+        Record("TabSettings");
+        if (settingsPage)
         {
-            ImGui::SeparatorText("Motion vectors");
-            commit |= Bool("DilateMotion", "Dilate by depth", &d.dilateMotion, def.dilateMotion);
-            ImGui::TextDisabled("%s", "Moving edges take the motion of what is in front. Judge it in motion.");
-
-            ImGui::SeparatorText("Sky");
-            commit |= Float("SkyTone", "Sky local tone", &d.skyTone, 0.0f, 1.5f, 25, false, def.skyTone, "%.2f");
-            commit |= Float("SkyStructure", "Sky local structure", &d.skyStructure, 0.0f, 1.5f, 25, false,
-                            def.skyStructure, "%.2f");
-            commit |= Bool("ShowSky", "Show what counts as sky (purple stripes)", &d.showSky, def.showSky);
-            ImGui::TextDisabled("%s", "1 = as the rest of the picture (times Local tone / Local structure).");
-            ImGui::TextDisabled("%s", "Sky = the far end of the game's depth. Stripes are never saved.");
-            SkyAutoMask(d, st, &commit);
-            ImGui::EndTabItem();
-        }
-
-        // The model on a smaller copy of the frame (ModelScale), after DLSS as always: its time follows its pixels
-        // (nrprobe on the RTX 5090 at 4K: 7.1 ms whole, 4.4 at 75%, 3.8 at 66.7%, 2.9 at 50%, 2.4 for 1280x720,
-        // a third), and its change comes back to the full frame along the frame's own edges (nr_fit.hlsl). 100% is
-        // the model on the whole frame. The slider moves in 1% steps and holds at the stops 50, 66.7 and 80%.
-        const bool speedPage = ImGui::BeginTabItem("Speed (experimental)");
-        Record("TabSpeed");
-        if (speedPage)
-        {
-            static constexpr Stops kSizes = { ModelScaleStep, kModelScaleStops,
-                                              int(sizeof kModelScaleStops / sizeof kModelScaleStops[0]), 2.0f };
-            commit |= SteppedFloat("ModelScale", "Model input size", &d.modelScale, kSizes, def.modelScale, "%.3g%%");
-            ImGui::TextDisabled("%s", "Below 100% the model works on a smaller copy of the frame, and what it");
-            ImGui::TextDisabled("%s", "changes is carried back to full size along the frame's own edges.");
-            if (haveStatus && st.modelWidth != 0)
-            {
-                if (st.modelWidth == st.width && st.modelHeight == st.height)
-                    ImGui::Text("Model input: the whole %ux%u frame", st.width, st.height);
-                else
-                    ImGui::Text("Model input: %ux%u of %ux%u", st.modelWidth, st.modelHeight, st.width, st.height);
-            }
-            if (haveStatus && st.haveTiming)
-                ImGui::Text("NR on the GPU: %.2f ms, of which the model %.2f ms", double(st.gpuMs), double(st.modelMs));
-            else
-                ImGui::TextDisabled("%s", "NR on the GPU: no measurement yet");
-            ImGui::EndTabItem();
-        }
-
-        // The keys.
-        const bool keys = ImGui::BeginTabItem("Keys");
-        Record("TabKeys");
-        if (keys)
-        {
+            ImGui::SeparatorText("Keys");
             commit |= KeyBinding("MenuKey", 0, "Menu", &d.menuKey);
             commit |= KeyBinding("ToggleKey", 1, "A/B toggle", &d.toggleKey);
             commit |= KeyBinding("FreezeKey", 2, "Freeze frame", &d.freezeKey);
-            ImGui::EndTabItem();
-        }
-
-        // The menu itself.
-        const bool menu = ImGui::BeginTabItem("Menu");
-        Record("TabMenu");
-        if (menu)
-        {
+            ImGui::SeparatorText("Menu");
             {
                 const char* const themes[] = { "Dark", "Kraft paper" };
                 commit |= Choice("MenuTheme", "Theme", &d.menuTheme, def.menuTheme, themes, 2);
@@ -1025,7 +936,6 @@ void MenuDraw()
                             def.menuNits, "%.0f");
             commit |= Float("Badge", "Green badge (seconds)", &d.badgeSeconds, 0.0f, 10.0f, 21, false, def.badgeSeconds,
                             "%.1f");
-            ImGui::TextDisabled("Overlay: %s", OverlayState());
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();

@@ -113,9 +113,11 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
   the game runs and it is picked up too. If the menu cannot write that file (in GTA V something holds it open while
   the game runs), it saves a copy in `%LOCALAPPDATA%\Banana-Zero` instead, and from the next start on that copy is
   the file to edit (see [dlssnr.ini](#dlssnrini)).
-- The status line at the top reads like `3840x2160 RR HDR  frames N  failed N  model builds N`: resolution, which DLSS
-  the game uses, HDR or not, frames processed, failures, and how many times the model was built. A second line shows
-  the model DLL version and the requested/active preset from its known version profile, including pending switches.
+- The status line at the top reads like `3840x2160 RR HDR   NR's own processing 0.22 ms on the GPU, the model 7.17 ms`:
+  resolution, which DLSS the game uses, HDR or not, and the GPU time of the NR pass apart from the model's (the encode,
+  the white balance and the composite) next to the model's own. Below it, what holds NR back, if anything (A/B, off,
+  frozen). The counts and versions are under Diagnostics on the Compare page.
+- Four pages: **Picture**, **Model**, **Compare** and **Settings**. The rarely needed parts are folded.
 
 ### The top row
 
@@ -125,9 +127,10 @@ Press **`End`**. The menu only opens while the game is actually running DLSS, so
 | **A/B: show original** | Shows the untouched picture until you click again. Not saved. The best tool in the box |
 | **Freeze frame** | Every frame reuses one captured frame, so every slider is judged on the same picture. Closing the menu unfreezes |
 
-### Tuning
+### Picture
 
-Three knobs. For most people, three knobs is plenty.
+Three knobs. For most people, three knobs is plenty. Under them, Model input size (see
+[Model input size](#model-input-size-experimental)).
 
 | Control | Range | What it does |
 |---|---|---|
@@ -154,12 +157,12 @@ frame or two after you let go.
 | **Local structure** | 0 to 1.5 | Fine texture and small light-and-shade detail |
 | **Local tone** | 0 to 1.5 | Local contrast |
 | **Model weights** | dropdown: DLL default, HT (1), CC Small FP8 (2) | Enabled for 310.9.16.0, and for later DLLs whose file still carries both weight resources (shown as unverified); 310.8 shows a disabled control with an explanation. Changing weights rebuilds the model after the existing 30-evaluation cooldown; the old model keeps running while a same-size switch waits. Choices that select the same weights (310.9.16.0: DLL default and CC Small FP8) do not rebuild. Right-click restores DLL default: preset 1 in 310.8, preset 2 in 310.9.16.0. Rebuilding may briefly use more VRAM; the existing 64-creation safety limit still applies |
-| **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else. Also on the Depth page, next to the sky sliders and **Combine**. With a sky slider in use it is disabled on 310.8; on 310.9.16.0 and later it stays usable unless Combine is set to \"Sky mask only\" |
+| **Auto mask** | Off, On | Lets the model pick out skin by itself, so that Skin structure can treat it apart from everything else. **Combine**, in Depth and sky, says how it works with the sky sliders. With a sky slider in use it is disabled on 310.8; on 310.9.16.0 and later it stays usable unless Combine is set to \"Sky mask only\" |
 | **Skin structure** | follows local structure, or 0 to 1.5 | Texture on skin. Only does anything with Auto mask on (greyed out otherwise). Turn it down for less texture on faces |
 
 ### Advanced image processing
 
-Back on **Tuning**, **Advanced (rarely needed)** holds HDR encode and composite controls.
+On **Picture**, **Advanced (rarely needed)** holds HDR encode and composite controls.
 
 *HDR encode.* The Witcher 3 and TLOU2 hand DLSS linear HDR values with no upper limit, even with Windows in SDR mode
 (GTA V hands it linear HDR too), but the model expects a finished-looking picture. So Banana-Zero shows it a
@@ -189,11 +192,12 @@ folded into a smooth **shoulder**.
 | **Zebra stripes** | On the Model input preview: purple where highlights enter the shoulder, red where they are squeezed more than 3 EV. Purple belongs on skies, lamps and reflections, not on walls and faces. Healthy scenes showed roughly 3 to 16% purple |
 | **Calibration card** | Draws a test chart onto a frozen frame, with grey steps, mid grey, white, a bright dot and colour patches, all in units of the white point. Put the split-screen divider through the middle: the two halves should look the same. Where they differ, that knob has gone too far |
 | **Card corner** | Where the card goes |
+| **Diagnostics** | Frames processed, failures, how many times the model was built, the model DLL's version and the requested/active preset, the size the model gets, and the GPU time: the whole NR pass, the model's part and NR's own processing. Not in it: the CPU time in the hooks and the menu's own drawing |
 
-### Depth (experimental)
+### Depth and sky (experimental)
 
-Two experiments with something the game hands DLSS anyway: how far away every pixel is. Neither does anything until
-you touch it, and Reset all puts both back.
+Folded at the end of the **Model** page. Two experiments with something the game hands DLSS anyway: how far away every
+pixel is. Neither does anything until you touch it, and Reset all puts both back.
 
 | Control | Range | What it does |
 |---|---|---|
@@ -201,7 +205,6 @@ you touch it, and Reset all puts both back.
 | **Sky local tone** | 0 to 1.5, default 1 | Local tone on the sky alone, as a multiple of Local tone. 1 is the same as the rest of the picture, 0.5 half as much, 0 none. Watch cloud contrast and smooth gradients |
 | **Sky local structure** | 0 to 1.5, default 1 | The same for Local structure: the fine texture in clouds. Turn it down if the sky looks grainy |
 | **Show what counts as sky** | Off, On | Purple stripes over what the sky sliders work on. Not saved |
-| **Auto mask (skin)**, **Skin structure** | as on the Model page | The same two settings as on the Model page, here because Combine goes by them |
 | **Combine** | Auto (default), Sky mask only, Average, Keep the lower, Keep the higher | 310.9.16.0 and later (DLLs with the `DLSSNR.MaskBlendMode` key). How Sky local structure and Auto mask's Skin structure work together while both are in use: both set a structure strength, and the model gets one. **Auto** picks for you from the sliders: anything turned down and nothing up, keep the lower (each lowered setting is kept exactly); anything up and nothing down, keep the higher; one up and one down, average (no choice keeps both, each gets half). A line under it says what is in use now and why, with the numbers. **Sky mask only** is the old rule: the sky mask turns Auto mask off. Only structure is combined; Sky local tone always applies. Without Auto mask or with both sky sliders at 1 there is nothing to combine. Taken from the DLL's GPU code and confirmed on an RTX 5090 (`nrprobe --mask-tests`) |
 
 The sky is whatever sits at the far end of the game's depth: the sky dome, and anything else the game never gave a
@@ -209,26 +212,27 @@ depth. Indoors, unless a window shows the sky, there is none and the sky sliders
 counts as sky tells you. The model looks at the picture as a whole, so what the sky gets moves the rest of the
 picture too, by about a fifth as much.
 
-### Speed (experimental)
+### Model input size (experimental)
 
-The 310.8 model costs about 7 ms a frame at 4K on an RTX 5090, nearly all of it inside the model, and its time follows the
-number of pixels it looks at. This page trades some of its effect for some of that time. DLSS is not touched: the game
+On the **Picture** page. The 310.8 model costs about 7 ms a frame at 4K on an RTX 5090, nearly all of it inside the
+model, and its time follows the number of pixels it looks at. This slider trades some of its effect for some of that
+time. DLSS is not touched: the game
 renders and upscales exactly as before, and only the model's own copy of the frame gets smaller.
 
 | Control | Range | What it does |
 |---|---|---|
 | **Model input size** | 33.3% to 100%, default 100% | The model looks at a copy of the frame this big on each side. What it changes is carried back to the full frame along the full frame's own edges, so outlines stay sharp; what thins out is the finest of the model's own detail. 100% is the model on the whole frame, as before. The slider has notches at 33.3%, 50%, 66.7% and 80%: it clicks into one and stays there for a little more mouse travel, so they are easy to hit. Between them it moves in 1% steps. A notch holds on to the grab, so the step just past it is reached by coming back from the other side. Applies while you drag; each new size restarts the model's memory of earlier frames, so the picture looks a touch rougher for a frame or two |
 
-Under the slider: the size the model actually gets, and **NR on the GPU**, the whole pass and the model's share of it in
-milliseconds, measured on the GPU at every frame (the median of the last 16 frames; the log's 10-second lines carry it
-too).
+The model's time is on the status line at the top; the size the model actually gets, and the whole pass, are under
+Diagnostics on the Compare page. Both are measured on the GPU at every frame (the median of the last 16 frames; the
+log's 10-second lines carry them too).
 
 `nrprobe` timed the model alone on an RTX 5090 at 4K: 7.1 ms at 100%, 4.4 at 75%, 3.8 at 66.7%, 2.9 at 50%, and 2.4 for
 a 1280x720 picture, which is 33.3%. The slider stops at a third because about 1.7 ms of the model's time does not
 shrink with the picture: below that, the picture would keep thinning for very little time back. Judge the trade with
 A/B and Split screen.
 
-### Keys and Menu
+### Settings
 
 | Control | Default | What it does |
 |---|---|---|
@@ -270,7 +274,7 @@ writes it for you; this is for people who like to open the back panel.
 | `SkinStructure` | 0 to 2, -1 follows local structure; only with `AutoMask = 1` | not set (-1) | Skin structure |
 | `AutoMask` | 1 / 0 | not set (0) | Auto mask |
 | `Preset` | 0 DLL default, 1 HT, 2 CC Small FP8 | not set (0) | Model weights; creation-only, so changing it rebuilds the feature (unless it selects the same weights). 310.8 always falls back to 1; 310.9.16.0 falls back to 2 for other numbers |
-| `MaskBlendMode` | `auto`, 0 to 3 | not set (Auto) | Combine (Depth page): not set or `auto` picks from the sliders; 0 sky mask only, 1 average, 2 keep the lower, 3 keep the higher. Not sent to DLLs without the key (310.8) |
+| `MaskBlendMode` | `auto`, 0 to 3 | not set (Auto) | Combine (Model page, Depth and sky): not set or `auto` picks from the sliders; 0 sky mask only, 1 average, 2 keep the lower, 3 keep the higher. Not sent to DLLs without the key (310.8) |
 | `InputType` | `auto` / `linear` / `tonemapped` | `auto` | file only; `auto` follows the game's own HDR flag |
 | `WhiteSource` | `auto` / `exposure` / `scene` / `manual` | `auto` | White point from |
 | `WhiteEV` | -4 to +4 | 0 | White point (EV) |
@@ -328,7 +332,7 @@ file next to the game (that one is not picked up then, and the menu's next save 
 - **Tested in exactly five games.** The `dxgi.dll` export list comes from Windows 11; other Windows versions are
   untested.
 - **It costs frame time.** About 7 ms per frame for the whole NR pass on an RTX 5090 at 4K output, nearly all of it
-  inside the model. The Speed page shows what it costs on your machine, and its Model input size trades some of the
+  inside the model. The status line shows what it costs on your machine, and Model input size trades some of the
   effect for time.
 - **The model's knobs are undocumented.** `nrprobe --tuning` measured that they act and what their defaults are; what
   each one does to the picture is our best guess from its name.
@@ -351,8 +355,8 @@ file next to the game (that one is not picked up then, and the menu's next save 
 | v0.1.6 | Grand Theft Auto V Enhanced works. The mouse works in the game after the menu closes: the menu's mouse no longer goes through Dear ImGui's Win32 backend, which took and released the mouse capture on GTA V's window at a click in the menu (v0.1.3 did at every click; v0.1.5 still could before the first raw mouse data). A key or mouse button held as the menu opens keeps its device the game's until it is let go, ten seconds at most. NR no longer skips a frame at each command list's first pass: GTA V records DLSS on many different command lists, so v0.1.5 skipped 1,001 of 19,707 frames there, most of them in the first minute and then one every few seconds, seen as walls and pale surfaces flashing brighter; v0.1.6 skipped 2 of 33,960, both before NR had run once. When the menu cannot replace `dlssnr.ini` next to the game (in GTA V something holds it open while the game runs), it saves a copy in `%LOCALAPPDATA%\Banana-Zero`, and the newer of the two is read at the next start. The log says much more while Banana-Zero is being developed: why NR skipped a frame and why Banana-Zero restarted the model's memory (the first 20 times for each reason, then the 32nd, 64th and so on), a line every 10 seconds that counts them all, and `StatsLog` on by default. The picture is the same as v0.1.5 wherever NR ran before |
 | v0.1.5 | NR runs on every frame in games whose command lists each carry a function table of their own: in Gears of War E-Day v0.1.4 ran it on about 2.5% of the frames, v0.1.5 on 99.8%. The menu reads the mouse (and, where it has to, the keyboard) from raw input on a thread of its own, so it works in games whose window messages no hook sees, and while it is open Windows makes no mouse messages for the game, so a click in the menu is not also a click in the game. The picture is the same as v0.1.4 wherever NR ran before |
 | v0.1.4 | Resident Evil Requiem works, with [REFramework](#re-engine-games-and-reframework). The NR pass now puts back what the game had bound on its command list (some games, RE Engine among them, rely on it surviving the DLSS call, and crashed), and the menu opens, works and closes alongside REFramework's own hooks. `dlssnr.ini` is read next to the game's `.exe` first. The menu reads its input without touching the game's window procedure. The picture is the same as v0.1.3 |
-| v0.1.3 | The release candidate held up in play and is now the current release: [Speed (experimental)](#speed-experimental) and [Depth (experimental)](#depth-experimental) are in. New since the candidate: Model input size goes down to 33.3%, with notches at 33.3%, 50%, 66.7% and 80% and 1% steps between them. Leave both pages as they come and the picture is the same as v0.1.2 |
-| v0.1.3-rc.1 | A release candidate, published as a pre-release: v0.1.2 stays the current release until this one has seen more games. New: [Speed (experimental)](#speed-experimental), the model on a smaller copy of the frame for less GPU time, with the pass's GPU time on the page; [Depth (experimental)](#depth-experimental), motion vectors dilated by depth and the sky's own Local tone and Local structure. New for builders: `nrprobe --subrects`. Leave both pages as they come and the picture is the same as v0.1.2 |
+| v0.1.3 | The release candidate held up in play and is now the current release: [Speed (experimental)](#model-input-size-experimental) and [Depth (experimental)](#depth-and-sky-experimental) are in. New since the candidate: Model input size goes down to 33.3%, with notches at 33.3%, 50%, 66.7% and 80% and 1% steps between them. Leave both pages as they come and the picture is the same as v0.1.2 |
+| v0.1.3-rc.1 | A release candidate, published as a pre-release: v0.1.2 stays the current release until this one has seen more games. New: [Speed (experimental)](#model-input-size-experimental), the model on a smaller copy of the frame for less GPU time, with the pass's GPU time on the page; [Depth (experimental)](#depth-and-sky-experimental), motion vectors dilated by depth and the sky's own Local tone and Local structure. New for builders: `nrprobe --subrects`. Leave both pages as they come and the picture is the same as v0.1.2 |
 | v0.1.2 | The knobs are connected now. Style and the five Model knobs were handed to the model only when it was created, but the model reads them every frame, so in v0.1.1 they did nothing. They now act from the next frame, every slider applies while you drag, and turning a knob no longer rebuilds the model. New: `nrprobe --tuning` measures what the knobs do |
 | v0.1.1 | The first public release. The menu and this manual learned English |
 

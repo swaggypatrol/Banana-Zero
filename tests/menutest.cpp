@@ -16,8 +16,8 @@
 //   - the panel: a slider dragged with the mouse publishes every step at once and logs the drag once, when the mouse
 //     lets go; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
 //     box unfreezes it, unticking the card undoes the freeze it made; skin structure takes no input until the auto
-//     mask is on; "all defaults"; the depth page: a sky slider away from 1 greys out the auto mask until it is back,
-//     the stripes and the dilation commit at once; the speed page: the model's input size publishes at once, a
+//     mask is on; "all defaults"; the Model page's depth and sky part: a sky slider away from 1 greys out the auto mask until it is back,
+//     the stripes and the dilation commit at once; the Picture page: the model's input size publishes at once, a
 //     right-click puts 100% back, a drag across and back moves in its steps, holds at its stops and finds every
 //     step one way or the other, the pass's model size and GPU time are drawn; closing the menu writes the file,
 //     and so does a second after a commit while it is open
@@ -53,6 +53,7 @@
 
 #include <atomic>
 #include <thread>
+#include <vector>
 
 #include "backends/imgui_impl_win32.h"
 #include "freeze.h"
@@ -63,6 +64,7 @@
 #include "menu.h"
 #include "menu_input.h"
 #include "menu_model.h"
+#include "menu_style.h"
 #include "nr_dx12.h"
 #include "overlay_dx12.h"
 #include "settings.h"
@@ -614,6 +616,13 @@ bool Click(const char* key, float atX = 0.5f, int button = 0)
     return true;
 }
 
+// The Model page with its depth and sky part unfolded (the fold stays as it was left).
+bool DepthSky()
+{
+    float x, y;
+    return Click("TabModel") && (Centre("SkyTone", &x, &y) || (Click("DepthSky") && Centre("SkyTone", &x, &y)));
+}
+
 // Open a real combo popup and click the recorded selectable, rather than assigning the draft in the test.
 bool Choose(const char* key, unsigned index)
 {
@@ -811,11 +820,11 @@ void TestPanel()
               Near(SettingsCurrent().whiteEV, 0.0f, 1e-6f),
           "panel: all defaults published");
 
-    // The depth page. A sky slider away from 1 gives the model a control mask, and with one the model keeps its own
+    // The Model page's depth and sky part. A sky slider away from 1 gives the model a control mask, and with one the model keeps its own
     // auto mask off: the auto mask takes no input until both sky sliders are back at 1.
     const unsigned g3 = Generation();
-    Check(!Centre("SkyStructure", &x, &y), "panel: the sky sliders wait on the depth page");
-    Check(Click("TabDepth"), "panel: open the depth page");
+    Check(!Centre("SkyStructure", &x, &y), "panel: the sky sliders wait in the Model page's depth and sky part");
+    Check(DepthSky(), "panel: open the depth and sky part of the Model page");
     Check(!Centre("DetailStrength", &x, &y), "panel: the tuning page is hidden now");
     Check(Click("SkyStructure", 0.1f), "panel: click sky local structure near its left end");
     Check(Generation() == g3 + 1 && SettingsCurrent().skyStructure < 0.3f,
@@ -825,15 +834,15 @@ void TestPanel()
     Check(Click("TabModel") && Centre("AutoMask", &x, &y), "panel: back on Model, the auto mask is drawn");
     Check(Click("AutoMask", 0.5f, 1) && Generation() == g3 + 2,
           "panel: the auto mask takes no right-click while a sky slider is away from 1");
-    Check(Click("TabDepth") && Click("SkyStructure", 0.5f, 1), "panel: right-click sky local structure");
+    Check(DepthSky() && Click("SkyStructure", 0.5f, 1), "panel: right-click sky local structure");
     Check(Generation() == g3 + 3 && SettingsCurrent().skyStructure == 1.0f, "panel: sky local structure back to 1");
     Check(Click("TabModel") && Click("AutoMask", 0.5f, 1) && Generation() == g3 + 4,
           "panel: with both sky sliders at 1 the auto mask takes a right-click again");
-    Check(Click("TabDepth") && Click("DilateMotion") && SettingsCurrent().dilateMotion && Generation() == g3 + 5,
+    Check(DepthSky() && Click("DilateMotion") && SettingsCurrent().dilateMotion && Generation() == g3 + 5,
           "panel: dilate by depth on, published at once");
     Check(Click("TabModel"), "panel: back to the Model page");
 
-    // The speed page: the model's input size is a slider like the others, under it the size the pass gives the model
+    // The Picture page: the model's input size is a slider like the others, under it the size the pass gives the model
     // and its time on the GPU, as the pass reports them.
     const unsigned g4 = Generation();
     g_fakeStatus.modelWidth = 2560;
@@ -841,9 +850,8 @@ void TestPanel()
     g_fakeStatus.haveTiming = true;
     g_fakeStatus.gpuMs = 4.1f;
     g_fakeStatus.modelMs = 3.8f;
-    Check(!Centre("ModelScale", &x, &y), "panel: the model's input size waits on the speed page");
-    Check(Click("TabSpeed"), "panel: open the speed page");
-    Check(!Centre("DetailStrength", &x, &y), "panel: the tuning page is hidden now");
+    Check(!Centre("ModelScale", &x, &y), "panel: the model's input size waits on the Picture page");
+    Check(Click("TabPicture"), "panel: the model's input size on the Picture page");
     Check(Click("ModelScale", 0.1f), "panel: click the model's input size near its left end");
     Check(Generation() == g4 + 1 && SettingsCurrent().modelScale < 60.0f,
           "panel: the click publishes the size under the mouse at once (%.0f%%, generation %u)",
@@ -947,13 +955,14 @@ void TestPanel()
     Frame();
     Check(Click("TabModel"), "panel: back to the Model page");
 
-    // New model controls: weights on the Model page; the sky + auto mask combination on the Depth page under the
-    // sky sliders. Auto (the default) and modes 1..3 permit the automatic mask with sky; mode 0 by hand keeps the
+    // New model controls: weights on the Model page; the sky + auto mask combination in its depth and sky part under
+    // the sky sliders. Auto (the default) and modes 1..3 permit the automatic mask with sky; mode 0 by hand keeps the
     // legacy restriction.
     g_fakeStatus.model = { 310, 9, 16, 0 };
     Frame();
-    Check(Centre("Preset", &x, &y) && !Centre("MaskBlendMode", &x, &y),
-          "panel: the new profile shows model weights on the Model page, the mask combination elsewhere");
+    Check(Centre("Preset", &x, &y) && Centre("MaskBlendMode", &x, &y),
+          "panel: the new profile shows model weights on the Model page, and the mask combination in its depth and "
+          "sky part");
     {
         MenuLock();
         auto& settings = MenuModelLocked().draft;
@@ -970,18 +979,18 @@ void TestPanel()
           "panel: new nonzero blend mode permits skin structure with a sky mask");
     Check(Click("Preset", 0.5f, 1) && !SettingsCurrent().model.preset.set,
           "panel: preset right-click restores DLL default");
-    Check(Click("TabDepth") && Centre("MaskBlendMode", &x, &y) && Centre("AutoMask", &x, &y),
-          "panel: the Depth page has the mask combination and the auto mask under the sky sliders");
+    Check(DepthSky() && Centre("MaskBlendMode", &x, &y) && Centre("AutoMask", &x, &y),
+          "panel: the Model page has the mask combination under the sky sliders and the auto mask");
     Check(Click("MaskBlendMode", 0.5f, 1) && !SettingsCurrent().model.maskBlendMode.set,
           "panel: mask combination right-click restores Auto");
     modesGeneration = Generation();
     Check(Click("AutoMask", 0.5f, 1) && Generation() == modesGeneration + 1 && !SettingsCurrent().model.autoMask.set,
           "panel: with Auto the auto mask stays usable while a sky slider is away from 1");
-    Check(Choose("AutoMask", 1) && SettingsCurrent().model.autoMask.value == 1, "panel: auto mask on from the Depth page");
+    Check(Choose("AutoMask", 1) && SettingsCurrent().model.autoMask.value == 1, "panel: auto mask on, the sky part open");
     modesGeneration = Generation();
     Check(Click("SkinStructure", 0.3f) && Generation() == modesGeneration + 1 &&
               SettingsCurrent().model.skinStructure.set,
-          "panel: the Depth page's skin structure slider applies next to the sky sliders");
+          "panel: the skin structure slider applies with the sky part open");
     Check(Choose("MaskBlendMode", 1) && SettingsCurrent().model.maskBlendMode.set &&
               SettingsCurrent().model.maskBlendMode.value == 0,
           "panel: \"Sky mask only\" chosen by hand is MaskBlendMode 0");
@@ -990,7 +999,7 @@ void TestPanel()
           "panel: mode 0 by hand still disables automatic mask with a sky mask");
     Check(Choose("MaskBlendMode", 0) && !SettingsCurrent().model.maskBlendMode.set,
           "panel: choosing Auto in the dropdown clears the setting");
-    Check(Click("TabModel"), "panel: back to the Model page after the Depth page");
+    Check(Click("TabModel"), "panel: back to the Model page after its depth and sky part");
     {
         MenuLock();
         auto& settings = MenuModelLocked().draft;
@@ -1063,8 +1072,8 @@ void TestModelPageFirstRun()
           "first run: actual weights dropdown selects HT and publishes it");
     Check(Choose("AutoMask", 1) && SettingsCurrent().model.autoMask.value == 1,
           "first run: actual automatic-mask dropdown enables it");
-    Check(Click("TabDepth") && Choose("MaskBlendMode", 3) && SettingsCurrent().model.maskBlendMode.value == 2,
-          "first run: the Depth page's combination dropdown selects Keep the lower (mode 2) and publishes it");
+    Check(DepthSky() && Choose("MaskBlendMode", 3) && SettingsCurrent().model.maskBlendMode.value == 2,
+          "first run: the combination dropdown selects Keep the lower (mode 2) and publishes it");
     Check(Click("TabModel"), "first run: back to the Model page");
     Check(Click("SkinStructure", 0.7f) && SettingsCurrent().model.skinStructure.set,
           "first run: the skin slider applies with automatic mask enabled");
@@ -1085,7 +1094,7 @@ void TestModelPageFirstRun()
     for (unsigned preset : { 2u, 0u, 1u })
         Check(Choose("Preset", preset) && SettingsCurrent().model.preset.value == preset,
               "first run: the weights dropdown selects request %u", preset);
-    Check(Click("TabDepth"), "first run: the Depth page");
+    Check(DepthSky(), "first run: the depth and sky part of the Model page");
     Check(Choose("MaskBlendMode", 0) && !SettingsCurrent().model.maskBlendMode.set,
           "first run: the combination dropdown selects Auto");
     for (unsigned mode = 0; mode <= 3; ++mode)
@@ -1686,12 +1695,183 @@ void TestCopy()
 }
 } // namespace
 
+// ---------------------------------------------------------------------------------------------------------------
+// menutest --shots <folder>: the panel's pages as pictures, for looking at the layout without a game. ImGui's draw data
+// is filled on the CPU (nearest texel, blended as the overlay's 8-bit picture is), with the overlay's font (Segoe UI at
+// 20 px, 1080 lines) and the dark theme, over mid grey. Each page goes to <folder>\<name>.rgba: the width and height
+// (uint32 each), then RGBA8 rows from the top. Not a test: nothing is checked.
+
+namespace
+{
+void Raster(std::vector<uint8_t>& picture, int width, int height, const ImDrawData* data)
+{
+    for (ImTextureData* t : *data->Textures)
+    {
+        if (t->Status == ImTextureStatus_WantDestroy)
+        {
+            t->SetTexID(ImTextureID_Invalid);
+            t->SetStatus(ImTextureStatus_Destroyed);
+        }
+        else if (t->Status != ImTextureStatus_OK)
+        {
+            t->SetTexID(ImTextureID(intptr_t(t)));
+            t->SetStatus(ImTextureStatus_OK);
+        }
+    }
+    const ImVec2 at = data->DisplayPos;
+    for (const ImDrawList* list : data->CmdLists)
+    {
+        for (const ImDrawCmd& cmd : list->CmdBuffer)
+        {
+            if (cmd.UserCallback != nullptr || cmd.ElemCount == 0)
+                continue;
+            const ImTextureData* tex = cmd.TexRef._TexData;
+            const int cx0 = std::max(0, int(cmd.ClipRect.x - at.x)), cy0 = std::max(0, int(cmd.ClipRect.y - at.y));
+            const int cx1 = std::min(width, int(cmd.ClipRect.z - at.x)), cy1 = std::min(height, int(cmd.ClipRect.w - at.y));
+            for (unsigned i = 0; i + 2 < cmd.ElemCount; i += 3)
+            {
+                const ImDrawVert* v[3];
+                for (int k = 0; k < 3; ++k)
+                    v[k] = &list->VtxBuffer[int(cmd.VtxOffset + list->IdxBuffer[int(cmd.IdxOffset + i + k)])];
+                const float x0 = v[0]->pos.x - at.x, y0 = v[0]->pos.y - at.y, x1 = v[1]->pos.x - at.x,
+                            y1 = v[1]->pos.y - at.y, x2 = v[2]->pos.x - at.x, y2 = v[2]->pos.y - at.y;
+                const float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+                if (area == 0.0f)
+                    continue;
+                const int bx0 = std::max(cx0, int(std::floor(std::min({ x0, x1, x2 }))));
+                const int by0 = std::max(cy0, int(std::floor(std::min({ y0, y1, y2 }))));
+                const int bx1 = std::min(cx1, int(std::ceil(std::max({ x0, x1, x2 }))));
+                const int by1 = std::min(cy1, int(std::ceil(std::max({ y0, y1, y2 }))));
+                for (int y = by0; y < by1; ++y)
+                {
+                    for (int x = bx0; x < bx1; ++x)
+                    {
+                        const float px = x + 0.5f, py = y + 0.5f;
+                        const float w0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) / area;
+                        const float w1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) / area;
+                        const float w2 = 1.0f - w0 - w1;
+                        if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f)
+                            continue;
+                        float c[4];
+                        for (int k = 0; k < 4; ++k)
+                            c[k] = (w0 * float((v[0]->col >> (8 * k)) & 0xFF) + w1 * float((v[1]->col >> (8 * k)) & 0xFF) +
+                                    w2 * float((v[2]->col >> (8 * k)) & 0xFF)) / 255.0f;
+                        if (tex != nullptr && tex->Pixels != nullptr)
+                        {
+                            const float u = w0 * v[0]->uv.x + w1 * v[1]->uv.x + w2 * v[2]->uv.x;
+                            const float t = w0 * v[0]->uv.y + w1 * v[1]->uv.y + w2 * v[2]->uv.y;
+                            const int tx = std::clamp(int(u * tex->Width), 0, tex->Width - 1);
+                            const int ty = std::clamp(int(t * tex->Height), 0, tex->Height - 1);
+                            const unsigned char* texel = static_cast<const unsigned char*>(const_cast<ImTextureData*>(tex)->GetPixelsAt(tx, ty));
+                            if (tex->Format == ImTextureFormat_Alpha8)
+                                c[3] *= texel[0] / 255.0f;
+                            else
+                                for (int k = 0; k < 4; ++k)
+                                    c[k] *= texel[k] / 255.0f;
+                        }
+                        uint8_t* d = &picture[(size_t(y) * width + x) * 4];
+                        for (int k = 0; k < 3; ++k)
+                            d[k] = uint8_t(std::lround(c[k] * c[3] * 255.0f + d[k] * (1.0f - c[3])));
+                    }
+                }
+            }
+        }
+    }
+}
+
+int Shots(const wchar_t* folder)
+{
+    WriteAll(g_ini, "StatsLog = 0\r\n");
+    SettingsLoad(g_ini);
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1920.0f, 1080.0f);
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    io.IniFilename = nullptr;
+    char font[MAX_PATH * 3] = {};
+    wchar_t fontPath[MAX_PATH];
+    GetWindowsDirectoryW(fontPath, MAX_PATH);
+    wcscat_s(fontPath, MAX_PATH, L"\\Fonts\\segoeui.ttf");
+    WideCharToMultiByte(CP_UTF8, 0, fontPath, -1, font, sizeof font, nullptr, nullptr);
+    if (io.Fonts->AddFontFromFileTTF(font, 20.0f) == nullptr)
+        io.Fonts->AddFontDefault();
+    MenuStyleApply(MenuTheme::Dark, 1.0f);
+
+    g_fakeStatus = {};
+    g_fakeStatus.attempted = true;
+    g_fakeStatus.haveFeature = true;
+    g_fakeStatus.ready = true;
+    g_fakeStatus.model = { 310, 9, 16, 0 };
+    g_fakeStatus.width = 3840;
+    g_fakeStatus.height = 2160;
+    g_fakeStatus.modelWidth = 3840;
+    g_fakeStatus.modelHeight = 2160;
+    g_fakeStatus.feature = 1;
+    g_fakeStatus.hdr = true;
+    g_fakeStatus.linear = true;
+    g_fakeStatus.havePreExposure = true;
+    g_fakeStatus.frames = 45158;
+    g_fakeStatus.haveTiming = true;
+    g_fakeStatus.gpuMs = 7.39f;
+    g_fakeStatus.modelMs = 7.17f;
+    MenuOnEvaluate(nullptr);
+    MenuSetOpen(true);
+    for (int i = 0; i < 3; ++i)
+        Frame();
+
+    unsigned written = 0;
+    auto shot = [&](const char* name) {
+        Frame();
+        Frame();
+        std::vector<uint8_t> picture(size_t(1920) * 1080 * 4, 0);
+        for (size_t i = 0; i < picture.size(); i += 4)
+        {
+            picture[i] = picture[i + 1] = picture[i + 2] = 96;
+            picture[i + 3] = 255;
+        }
+        Raster(picture, 1920, 1080, ImGui::GetDrawData());
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, MAX_PATH, L"%ls\\%hs.rgba", folder, name);
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"wb") != 0 || f == nullptr)
+            return;
+        const uint32_t size[2] = { 1920, 1080 };
+        fwrite(size, sizeof size, 1, f);
+        fwrite(picture.data(), 1, picture.size(), f);
+        fclose(f);
+        ++written;
+    };
+    // The pages, and each folded part of them unfolded: the keys of this version and the last.
+    const char* const pages[] = { "TabTune", "TabPicture", "TabModel", "TabCompare", "TabDepth", "TabSpeed", "TabKeys", "TabMenu",
+                                  "TabSettings" };
+    const char* const folds[] = { "Advanced", "DepthSky" };
+    for (const char* page : pages)
+    {
+        if (!Click(page))
+            continue;
+        shot(page);
+        for (const char* fold : folds)
+        {
+            if (!Click(fold))
+                continue;
+            char name[64];
+            snprintf(name, sizeof name, "%s-%s", page, fold);
+            shot(name);
+            Click(fold);
+        }
+    }
+    std::printf("menutest: %u pictures in %ls\n", written, folder);
+    return written != 0 ? 0 : 1;
+}
+} // namespace
+
 int main(int argc, char** argv)
 {
     const bool noInput = argc == 2 && strcmp(argv[1], "--no-input") == 0;
-    if (argc != 1 && !noInput)
+    const bool shots = argc == 3 && strcmp(argv[1], "--shots") == 0;
+    if (argc != 1 && !noInput && !shots)
     {
-        std::puts("usage: menutest [--no-input]");
+        std::puts("usage: menutest [--no-input | --shots <folder>]");
         return 1;
     }
     const DWORD length = GetTempPathW(MAX_PATH, g_directory);
@@ -1719,6 +1899,12 @@ int main(int argc, char** argv)
     wcscpy_s(local, MAX_PATH, g_directory);
     local[wcslen(local) - 1] = L'\0';
     SetEnvironmentVariableW(L"LOCALAPPDATA", local);
+    if (shots)
+    {
+        wchar_t folder[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, folder, MAX_PATH);
+        return Shots(folder);
+    }
 
     TestKeys();
     TestWrite();
