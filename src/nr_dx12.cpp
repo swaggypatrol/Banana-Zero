@@ -77,6 +77,11 @@ constexpr uint64_t kDumpGiveUp = 240;
 constexpr unsigned kMaxDumps = 16;            // per process: each is about 25 MB at 4K
 constexpr unsigned kPreviewWidth = 768;       // the preview picture's width to aim for: a fifth of a 4K frame
 constexpr double kPreviewHold = 0.5;          // seconds the preview is kept after the menu last asked for it
+// While the menu shows the preview: its picture at most this often, and the statistics behind its readouts (the
+// histogram, the counts) at most this often; each at once when the preview opens or shows something else. The log's
+// statistics come when they are due, apart from these.
+constexpr double kPreviewSeconds = 1.0 / 30.0;
+constexpr double kPanelStatsSeconds = 0.1;
 constexpr unsigned kTimestamps = 4;           // per frame: the pass begins, the model begins, the model ends, the
                                               // pass ends
 constexpr unsigned kTimingSamples = 16;       // the menu and the log get the median of the last this many
@@ -713,6 +718,9 @@ struct Nr
     Buffer statsReadback; // kStatsSlots slots of kStatsSlotBytes
     bool statsFailed = false;
     bool statsPending = false;
+    double panelStatsAt = 0.0; // when the menu's readouts last asked for statistics (kPanelStatsSeconds)
+    double previewAt = 0.0;    // when the preview picture was last rendered (kPreviewSeconds), and what it showed
+    unsigned previewKind = 0;
     bool statsForLog = false; // the copy in flight was asked for by the log; else by the preview alone
     FrameInfo statsInfo;
 
@@ -1610,6 +1618,7 @@ void DropPreview()
     ID3D12Resource* const resources[1] = { g_nr.preview.resource };
     Park(nullptr, resources, 1);
     g_nr.preview = {};
+    g_nr.previewAt = g_nr.panelStatsAt = 0.0; // the next one at once
     AcquireSRWLockExclusive(&g_previewLock);
     g_preview = {};
     g_preview.generation = ++g_nr.previewGeneration;
@@ -2492,17 +2501,23 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     g_nr.encodeKey = key;
     g_nr.haveEncodeKey = true;
 
-    // What this frame carries besides the pass itself: the statistics when the log asked for them or the menu shows
-    // the preview (whenever the last copy has landed), a dump (the request is only taken once the dump is recorded),
-    // the preview picture while the menu asks for it.
+    // What this frame carries besides the pass itself: the statistics when the log asked for them or the menu's
+    // readouts are due (once the last copy has landed), a dump (the request is only taken once the dump is recorded),
+    // the preview picture when it is due (kPreviewSeconds, kPanelStatsSeconds).
+    const double now = LogClock();
     const bool logStats = g_nr.statsWanted.load(std::memory_order_relaxed);
-    const bool stats = !g_nr.statsPending && (logStats || previewing) && EnsureStats();
+    const bool panelStats = previewing && now - g_nr.panelStatsAt >= kPanelStatsSeconds;
+    const bool stats = !g_nr.statsPending && (logStats || panelStats) && EnsureStats();
     if (stats && logStats)
         g_nr.statsWanted.store(false, std::memory_order_relaxed);
+    if (stats && previewing)
+        g_nr.panelStatsAt = now;
+    const unsigned previewKind = 1u + (s.preview == Preview::Output ? 1u : 0u) + (s.zebra ? 2u : 0u);
     const bool dumpDue = g_nr.dumpState.load(std::memory_order_acquire) == kDumpIdle &&
                          g_nr.dumpWanted.load(std::memory_order_relaxed) && EnsureDump(f);
     const DumpLayout layout = dumpDue ? Layout(f.width, f.height) : DumpLayout {};
-    const bool preview = previewing && EnsurePreview(f);
+    const bool preview = previewing && (now - g_nr.previewAt >= kPreviewSeconds || previewKind != g_nr.previewKind) &&
+                         EnsurePreview(f);
 
     // What the game's depth adds: the motion vectors dilated by it (DilateMotion), the control mask that sets the sky
     // apart (the sky sliders), the stripes over the sky (ShowSky, in the constants already). Each needs the depth in
@@ -2845,6 +2860,8 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, barriers);
         PublishPicture(frameIndex);
+        g_nr.previewAt = now;
+        g_nr.previewKind = previewKind;
     }
 
     // The copies the CPU reads a few frames from now.
