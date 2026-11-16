@@ -511,18 +511,22 @@ void TestSnapshots()
     std::thread a(reader), b(reader);
     const double before = privateBytes();
     Settings s = SettingsCurrent();
-    for (unsigned k = 1; k <= kPublishes; ++k)
+    unsigned published = 0;
+    // At least kPublishes, and on until the readers have read a thousand times (a small machine may not run them
+    // before that many are done), at most 20 times as many.
+    while ((published < kPublishes || reads < 1000) && published < 20 * kPublishes)
     {
-        s.whiteEV = s.compareSplit = s.menuNits = float(k);
+        ++published;
+        s.whiteEV = s.compareSplit = s.menuNits = float(published);
         SettingsPublish(s);
     }
     const double grown = privateBytes() - before;
     stop = true;
     a.join();
     b.join();
-    Check(torn == 0 && reads > 1000 && SettingsCurrent().whiteEV == float(kPublishes),
-          "snapshots: %u reads during %u publishes, %u of them a mix of two", reads.load(), kPublishes, torn.load());
-    Check(grown < 1024.0 * 1024.0, "snapshots: %u publishes grew the process by %.0f KB", kPublishes, grown / 1024.0);
+    Check(torn == 0 && reads >= 1000 && SettingsCurrent().whiteEV == float(published),
+          "snapshots: %u reads during %u publishes, %u of them a mix of two", reads.load(), published, torn.load());
+    Check(grown < 1024.0 * 1024.0, "snapshots: %u publishes grew the process by %.0f KB", published, grown / 1024.0);
     SettingsLoad(g_ini);
 }
 
@@ -1696,7 +1700,7 @@ void TestCopy()
 } // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
-// menutest --shots <folder>: the panel's pages as pictures, for looking at the layout without a game. ImGui's draw data
+// menutest --shots dark|paper <folder>: the panel's pages as pictures, for looking at the layout without a game. ImGui's draw data
 // is filled on the CPU (nearest texel, blended as the overlay's 8-bit picture is), with the overlay's font (Segoe UI at
 // 20 px, 1080 lines) and the dark theme, over mid grey. Each page goes to <folder>\<name>.rgba: the width and height
 // (uint32 each), then RGBA8 rows from the top. Not a test: nothing is checked.
@@ -1779,9 +1783,9 @@ void Raster(std::vector<uint8_t>& picture, int width, int height, const ImDrawDa
     }
 }
 
-int Shots(const wchar_t* folder)
+int Shots(const wchar_t* folder, MenuTheme theme)
 {
-    WriteAll(g_ini, "StatsLog = 0\r\n");
+    WriteAll(g_ini, theme == MenuTheme::Dark ? "StatsLog = 0\r\nMenuTheme = dark\r\n" : "StatsLog = 0\r\nMenuTheme = paper\r\n");
     SettingsLoad(g_ini);
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -1795,7 +1799,8 @@ int Shots(const wchar_t* folder)
     WideCharToMultiByte(CP_UTF8, 0, fontPath, -1, font, sizeof font, nullptr, nullptr);
     if (io.Fonts->AddFontFromFileTTF(font, 20.0f) == nullptr)
         io.Fonts->AddFontDefault();
-    MenuStyleApply(MenuTheme::Dark, 1.0f);
+    MenuStyleApply(theme, 1.0f);
+    ImGui::GetStyle().AntiAliasedLinesUseTex = false; // lines drawn as triangles: the atlas's line texels need filtering
 
     g_fakeStatus = {};
     g_fakeStatus.attempted = true;
@@ -1841,9 +1846,8 @@ int Shots(const wchar_t* folder)
         fclose(f);
         ++written;
     };
-    // The pages, and each folded part of them unfolded: the keys of this version and the last.
-    const char* const pages[] = { "TabTune", "TabPicture", "TabModel", "TabCompare", "TabDepth", "TabSpeed", "TabKeys", "TabMenu",
-                                  "TabSettings" };
+    // The pages, and each folded part of them unfolded.
+    const char* const pages[] = { "TabPicture", "TabModel", "TabCompare", "TabSettings" };
     const char* const folds[] = { "Advanced", "DepthSky" };
     for (const char* page : pages)
     {
@@ -1860,6 +1864,15 @@ int Shots(const wchar_t* folder)
             Click(fold);
         }
     }
+    // The tallest: the Model page unfolded, A/B on and a sky slider away from 1 (the longer lines under Combine).
+    if (Click("AB") && Click("TabModel"))
+    {
+        float x, y;
+        if (!Centre("SkyTone", &x, &y))
+            Click("DepthSky");
+        Click("SkyStructure", 0.2f);
+        shot("Tallest");
+    }
     std::printf("menutest: %u pictures in %ls\n", written, folder);
     return written != 0 ? 0 : 1;
 }
@@ -1868,10 +1881,10 @@ int Shots(const wchar_t* folder)
 int main(int argc, char** argv)
 {
     const bool noInput = argc == 2 && strcmp(argv[1], "--no-input") == 0;
-    const bool shots = argc == 3 && strcmp(argv[1], "--shots") == 0;
+    const bool shots = argc == 4 && strcmp(argv[1], "--shots") == 0;
     if (argc != 1 && !noInput && !shots)
     {
-        std::puts("usage: menutest [--no-input | --shots <folder>]");
+        std::puts("usage: menutest [--no-input | --shots dark|paper <folder>]");
         return 1;
     }
     const DWORD length = GetTempPathW(MAX_PATH, g_directory);
@@ -1902,8 +1915,8 @@ int main(int argc, char** argv)
     if (shots)
     {
         wchar_t folder[MAX_PATH];
-        MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, folder, MAX_PATH);
-        return Shots(folder);
+        MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, folder, MAX_PATH);
+        return Shots(folder, strcmp(argv[2], "paper") == 0 ? MenuTheme::Paper : MenuTheme::Dark);
     }
 
     TestKeys();

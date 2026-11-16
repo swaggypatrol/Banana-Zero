@@ -291,6 +291,13 @@ SliderState Notches(const char* key, const char* label, float* v, float lo, floa
 
 bool RightClicked() { return ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right); }
 
+// A word on the control just drawn, shown while the mouse rests on it: what it does, never what state it is in.
+void Explain(const char* text)
+{
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("%s", text);
+}
+
 // A slider's drag, for the end of the panel: each step is published as it happens, the end is logged.
 void Dragged(const SliderState& state)
 {
@@ -677,14 +684,15 @@ void MenuDraw()
     g_dragEnded = false;
 
     ImGui::SetNextWindowPos(ImVec2(fs * 2.0f, fs * 2.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(fs * 36.0f, 0.0f), ImVec2(fs * 36.0f, io.DisplaySize.y * 0.9f));
+    // As tall as the frame below where the window opens, less a margin: the Model page unfolded, in the paper theme.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(fs * 36.0f, 0.0f), ImVec2(fs * 36.0f, io.DisplaySize.y - fs * 3.0f));
     const bool open = ImGui::Begin("Banana-Zero Neural Rendering", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     if (!open)
     {
         ImGui::End();
         return;
     }
-    ImGui::PushItemWidth(fs * 13.0f);
+    ImGui::PushItemWidth(fs * 17.0f); // one column for every page: the Model page's names need it
     StatusLines(m, st, haveStatus);
 
     // The row that is always there: NR on, A/B, the freeze.
@@ -716,7 +724,7 @@ void MenuDraw()
     }
 
     // Four pages: the picture, the model, comparing and what is going on, the keys and the menu. Each fits a 1080-line
-    // frame with its folded parts open.
+    // frame with its folded parts open, in either theme (menutest --shots draws them).
     if (ImGui::BeginTabBar("##pages", ImGuiTabBarFlags_NoTooltip))
     {
         const bool picture = ImGui::BeginTabItem("Picture");
@@ -795,8 +803,6 @@ void MenuDraw()
         if (modelPage)
         {
             ModelSettings& mm = d.model;
-            ImGui::PushItemWidth(fs * 17.0f);
-            ImGui::TextDisabled("%s", "Changes apply now; your settings are saved automatically.");
             ImGui::SeparatorText("Weights");
             const char* const presets[] = {
                 st.model.KnownMulti() ? "DLL default (CC Small FP8)"
@@ -859,19 +865,17 @@ void MenuDraw()
             {
                 ImGui::SeparatorText("Motion vectors");
                 commit |= Bool("DilateMotion", "Dilate by depth", &d.dilateMotion, def.dilateMotion);
-                ImGui::TextDisabled("%s", "Moving edges take the motion of what is in front. Judge it in motion.");
+                Explain("Moving edges take the motion of what is in front. Judge it in motion.");
 
                 ImGui::SeparatorText("Sky");
                 commit |= Float("SkyTone", "Sky local tone", &d.skyTone, 0.0f, 1.5f, 25, false, def.skyTone, "%.2f");
                 commit |= Float("SkyStructure", "Sky local structure", &d.skyStructure, 0.0f, 1.5f, 25, false,
                                 def.skyStructure, "%.2f");
                 commit |= Bool("ShowSky", "Show what counts as sky (purple stripes)", &d.showSky, def.showSky);
-                ImGui::TextDisabled("%s", "1 = as the rest of the picture (times Local tone / Local structure).");
-                ImGui::TextDisabled("%s", "Sky = the far end of the game's depth. Stripes are never saved.");
+                Explain("Sky = the far end of the game's depth. The sky sliders at 1 are as the rest of the picture (times\n"
+                        "Local tone / Local structure). The stripes are never saved.");
                 SkyAutoMask(d, st, &commit);
             }
-            ImGui::TextDisabled("%s", "Right-click for defaults. No INI editing needed.");
-            ImGui::PopItemWidth();
             ImGui::EndTabItem();
         }
 
