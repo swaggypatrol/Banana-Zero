@@ -19,8 +19,29 @@ RWByteAddressBuffer gStats : register(u1); // the statistics buffer, or for the 
 
 groupshared uint sHist[NR_HIST_BINS * 2];
 groupshared uint sCount[NR_COUNTS];
-groupshared int sGlobal[NR_GLOBALS];
 groupshared uint sMeter[NR_METER_BINS];
+// The frame-wide sums of each wave of the group, in floats, and how many waves have put theirs in: the group adds them
+// up and rounds once into the buffer's fixed point (AddToGroup). 64 waves at most: 256 threads in waves of 4.
+static const uint kMaxWaves = 64;
+groupshared float sWave[NR_GLOBALS * kMaxWaves];
+groupshared uint sWaves;
+
+// Into the group's frame-wide sums: across the wave in floats, into the wave's own slot. The merge after the group's
+// barrier adds the slots up, still in floats, and rounds once per group: rounding per wave, in v0.3.1, made the fit's
+// sums of a frame of little grey mostly rounding.
+void AddToGroup(float global[NR_GLOBALS])
+{
+    uint slot = 0;
+    if (WaveIsFirstLane())
+        InterlockedAdd(sWaves, 1u, slot);
+    slot = WaveReadLaneFirst(slot);
+    [unroll] for (uint k = 0; k < NR_GLOBALS; ++k)
+    {
+        const float sum = WaveActiveSum(global[k]);
+        if (WaveIsFirstLane())
+            sWave[k * kMaxWaves + slot] = sum;
+    }
+}
 
 // The scene white point: the frame's middle brightness, the mean log2 luminance of the middle half of its pixels (the
 // 25th to the 75th percentile, which moves smoothly as a bright sky comes into view or leaves it, where a median
@@ -168,8 +189,8 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         sHist[i] = 0;
     if (gi < NR_COUNTS)
         sCount[gi] = 0;
-    if (gi < NR_GLOBALS)
-        sGlobal[gi] = 0;
+    if (gi == 0)
+        sWaves = 0;
     GroupMemoryBarrierWithGroupSync();
 
     const bool linearHdr = (g.flags & NR_FLAG_LINEAR_HDR) != 0;
@@ -261,12 +282,12 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             if (abs(chroma.r) + abs(chroma.g) + abs(chroma.b) > 0.05)
                 ++count[NR_C_COLOUR];
             // The brightness by the proxy's luminance, the white balance by greyness; each weight at most 1 and each
-            // value held to +-2, so that no sum can leave an int32 at 4K.
+            // value held to +-2, so that no sum can leave an int32 at 4K (the spread pass's are bounded by these).
             const float weight = dot(p, kLuma);
             global[NR_G_WEIGHT] += weight;
             global[NR_G_GAIN] += weight * clamp(change, -2.0, 2.0);
-            // The fit's sums (nr.hlsl's CastTint): the chroma of a pixel greyness weighs is within its own +-log2 of
-            // (smallest / largest), so that weight times chroma, its square, or its product with the tint stays under 1.
+            // The chroma of a pixel greyness weighs is within its own +-log2 of (smallest / largest), so weight times
+            // chroma stays under 1 (the spread pass sums its squares and products).
             const float grey = Greyness(p, o);
             if (grey > 0.0)
             {
@@ -277,25 +298,56 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 global[NR_G_TINT_B] += grey * tint.y;
                 global[NR_G_CHROMA_R] += grey * c.x;
                 global[NR_G_CHROMA_B] += grey * c.y;
-                global[NR_G_RR] += grey * c.x * c.x;
-                global[NR_G_RB] += grey * c.x * c.y;
-                global[NR_G_BB] += grey * c.y * c.y;
-                global[NR_G_R_TINT_R] += grey * c.x * tint.x;
-                global[NR_G_B_TINT_R] += grey * c.y * tint.x;
-                global[NR_G_R_TINT_B] += grey * c.x * tint.y;
-                global[NR_G_B_TINT_B] += grey * c.y * tint.y;
             }
             global[NR_G_IN_R] += p.r;
             global[NR_G_IN_G] += p.g;
             global[NR_G_IN_B] += p.b;
         }
-        // Summed across the wave in floats, then into the group in fixed point, one rounding per wave.
-        [unroll] for (uint k = 0; k < NR_GLOBALS; ++k)
+        AddToGroup(global);
+    }
+    else if (g.mode == NR_STATS_SPREAD)
+    {
+        // The fit's second sums (nr.hlsl's CastTint): the greyish pixels' chroma and tint each less its mean, the mean
+        // being the sums the gain or cast pass left in this buffer over their greyness, worked out as CastTint does.
+        // Around 0 instead, as v0.3.1 summed them, a frame of one saturated colour gave chroma squares of about 10 whose
+        // rounding at every wave added up beyond the ridge, and the fit took several EV of white balance off it.
+        // No sum of these, whole or in part, can leave an int32 at 4K: weight x (chroma - mean)^2 summed over any pixels is
+        // at most weight x chroma^2 summed over all (under 0.3 a pixel), weight x (tint - mean)^2 likewise under 4, and a
+        // product of the two under half their sum.
+        float global[NR_GLOBALS];
+        [unroll] for (uint z = 0; z < NR_GLOBALS; ++z)
+            global[z] = 0.0;
+        const float total = float(asint(gStats.Load((NR_S_GLOBAL + NR_G_GREY) * 4)));
+        if (total > 0.0)
         {
-            const float sum = WaveActiveSum(global[k]);
-            if (WaveIsFirstLane())
-                InterlockedAdd(sGlobal[k], int(round(sum * NR_G_SCALE)));
+            const float2 meanC = float2(float(asint(gStats.Load((NR_S_GLOBAL + NR_G_CHROMA_R) * 4))),
+                                        float(asint(gStats.Load((NR_S_GLOBAL + NR_G_CHROMA_B) * 4)))) / total;
+            const float2 meanT = float2(float(asint(gStats.Load((NR_S_GLOBAL + NR_G_TINT_R) * 4))),
+                                        float(asint(gStats.Load((NR_S_GLOBAL + NR_G_TINT_B) * 4)))) / total;
+            [unroll] for (uint n = 0; n < 4; ++n)
+            {
+                const uint2 q = id.xy * 2 + uint2(n & 1, n >> 1);
+                if (q.x >= g.width || q.y >= g.height)
+                    continue;
+                const float3 pe = gProxy.Load(int3(q, 0)).rgb;
+                const float3 p = ProxyLinear(pe);
+                const float3 o = ModelLinear(gModel.Load(int3(q, 0)).rgb, pe);
+                const float grey = Greyness(p, o);
+                if (grey > 0.0)
+                {
+                    const float2 c = GreyChroma(p) - meanC;
+                    const float2 t = Tint(p, o) - meanT;
+                    global[NR_G_RR] += grey * c.x * c.x;
+                    global[NR_G_RB] += grey * c.x * c.y;
+                    global[NR_G_BB] += grey * c.y * c.y;
+                    global[NR_G_R_TINT_R] += grey * c.x * t.x;
+                    global[NR_G_B_TINT_R] += grey * c.y * t.x;
+                    global[NR_G_R_TINT_B] += grey * c.x * t.y;
+                    global[NR_G_B_TINT_B] += grey * c.y * t.y;
+                }
+            }
         }
+        AddToGroup(global);
     }
 
     [unroll] for (uint w = 0; w < NR_COUNTS; ++w)
@@ -307,8 +359,8 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         InterlockedMax(sCount[NR_C_MAX_BITS], largest);
     GroupMemoryBarrierWithGroupSync();
 
-    // Merge: every non-empty bin and count once per group (the cast pass: its sums alone).
-    if (g.mode != NR_STATS_CAST)
+    // Merge: every non-empty bin and count once per group (the cast and spread passes: their sums alone).
+    if (g.mode != NR_STATS_CAST && g.mode != NR_STATS_SPREAD)
     {
         const uint histWords = g.mode == NR_STATS_INPUT ? NR_HIST_BINS * 2 : NR_GAIN_BINS;
         const uint histStart = g.mode == NR_STATS_INPUT ? NR_S_MAX_HIST : NR_S_GAIN_HIST;
@@ -322,8 +374,15 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         if (gi == NR_C_MAX_BITS && sCount[gi] != 0)
             gStats.InterlockedMax((NR_S_COUNTS + gi) * 4, sCount[gi]);
     }
-    if (g.mode != NR_STATS_INPUT && gi < NR_GLOBALS && sGlobal[gi] != 0)
-        gStats.InterlockedAdd((NR_S_GLOBAL + gi) * 4, uint(sGlobal[gi]));
+    if (g.mode != NR_STATS_INPUT && gi < NR_GLOBALS)
+    {
+        float sum = 0.0;
+        for (uint w = 0; w < sWaves; ++w)
+            sum += sWave[gi * kMaxWaves + w];
+        const int fixed = int(round(sum * NR_G_SCALE));
+        if (fixed != 0)
+            gStats.InterlockedAdd((NR_S_GLOBAL + gi) * 4, uint(fixed));
+    }
 
     // The values the counts are relative to, once per dispatch.
     if (g.mode == NR_STATS_INPUT && all(id.xy == 0))

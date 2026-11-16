@@ -159,31 +159,40 @@ float3 ApplyChange(float3 frame, float change, float3 chroma, float white, bool 
 // (a white highlight it left white keeps its colour).
 float CastSum(uint i) { return float(asint(gDump.Load((NR_S_GLOBAL + i) * 4))); }
 
-// The white balance from the cast pass's sums, R and B over G in EV: the intercept b of the tint as a linear function
-// of the greyish pixel's own chroma c (GreyChroma), tint = b + A c, by least squares weighted by greyness. The model
-// changes saturation too, and a near-grey colour shows that as a tint of its own (a warm-lit near-grey loses some of
-// its warmth, which reads as blue): the mean tint over the greyish pixels mixes the two, and swung the greys' colour
-// from frame to frame more than no correction at all (Quake II RTX through tools/nrloop.py); the intercept is the tint
-// of a grey. A ridge of NR_GREY_SPREAD^2 on A: greyish pixels with little spread of chroma give no slope, and b is
-// then their mean tint. In means: b = mean t - (Cov(c) + spread^2)^-1 Cov(c, t) . mean c. Then shrunk as a white
-// balance measured on little grey should be: NR_GREY_PRIOR of the picture counts as grey that is untinted, so a
-// loading screen with 0.1% of grey loses a fifth of it, a road with 18% nearly all. `grey` is the weights' sum, above
-// 0; `prior` the prior's, in the same units.
+// The white balance from the cast and spread passes' sums, R and B over G in EV: the intercept b of the tint as a
+// linear function of the greyish pixel's own chroma c (GreyChroma), tint = b + A c, by least squares weighted by
+// greyness. The model changes saturation too, and a near-grey colour shows that as a tint of its own (a warm-lit
+// near-grey loses some of its warmth, which reads as blue): the mean tint over the greyish pixels mixes the two, and
+// swung the greys' colour from frame to frame more than no correction at all (Quake II RTX through tools/nrloop.py);
+// the intercept is the tint of a grey. A ridge of NR_GREY_SPREAD^2 on A: greyish pixels with little spread of chroma
+// give no slope, and b is then their mean tint; nor do covariances the sums' rounding could make up: each of the
+// cast pass's groups rounds its sums once to 1/NR_G_SCALE, so the ridge grows by that much over the greyness at most.
+// In means: b = mean t - Cov(c, t)' (Cov(c) + ridge)^-1 mean c. The
+// slope's share counts only as far as the fit is trusted to reach grey from its pixels: times NR_GREY_REACH /
+// (NR_GREY_REACH + d^2), d^2 = mean c' (Cov(c) + spread^2)^-1 mean c, so that greyish pixels all far from grey, a frame
+// of one saturated colour, give their mean tint. Then shrunk as a white balance measured on little grey should be:
+// NR_GREY_PRIOR of the picture counts as grey that is untinted, so a loading screen with 0.1% of grey loses a fifth of
+// it, a road with 18% nearly all. `grey` is the weights' sum, above 0; `prior` the prior's, in the same units.
 float2 CastTint(float grey, float prior)
 {
     const float2 c = float2(CastSum(NR_G_CHROMA_R), CastSum(NR_G_CHROMA_B)) / grey;
     const float2 t = float2(CastSum(NR_G_TINT_R), CastSum(NR_G_TINT_B)) / grey;
-    const float ridge = NR_GREY_SPREAD * NR_GREY_SPREAD;
-    const float rr = CastSum(NR_G_RR) / grey - c.x * c.x + ridge;
-    const float rb = CastSum(NR_G_RB) / grey - c.x * c.y;
-    const float bb = CastSum(NR_G_BB) / grey - c.y * c.y + ridge;
-    // Cov(c, t), one column per tint: R, then B.
-    const float2 ctR = float2(CastSum(NR_G_R_TINT_R), CastSum(NR_G_B_TINT_R)) / grey - c * t.x;
-    const float2 ctB = float2(CastSum(NR_G_R_TINT_B), CastSum(NR_G_B_TINT_B)) / grey - c * t.y;
-    // (Cov + ridge)^-1 mean c: symmetric, so its product with Cov(c, t) gives the slope's share of b.
+    const float shrink = grey / (grey + prior);
+    // Cov(c) + ridge, and Cov(c, t) one column per tint (R, then B): the spread pass summed them around the means.
+    const float groups = float((g.modelWidth + 31) / 32) * float((g.modelHeight + 31) / 32);
+    const float ridge = NR_GREY_SPREAD * NR_GREY_SPREAD + 0.5 * groups / grey;
+    const float rr = CastSum(NR_G_RR) / grey + ridge;
+    const float rb = CastSum(NR_G_RB) / grey;
+    const float bb = CastSum(NR_G_BB) / grey + ridge;
+    const float2 ctR = float2(CastSum(NR_G_R_TINT_R), CastSum(NR_G_B_TINT_R)) / grey;
+    const float2 ctB = float2(CastSum(NR_G_R_TINT_B), CastSum(NR_G_B_TINT_B)) / grey;
     const float det = rr * bb - rb * rb;
-    const float2 m = det > 0.0 ? float2(bb * c.x - rb * c.y, rr * c.y - rb * c.x) / det : float2(0.0, 0.0);
-    return (t - float2(dot(m, ctR), dot(m, ctB))) * (grey / (grey + prior));
+    if (!(det > 0.0))
+        return t * shrink;
+    // (Cov + ridge)^-1 mean c: symmetric, so its product with Cov(c, t) gives the slope's share of b, and with mean c d^2.
+    const float2 m = float2(bb * c.x - rb * c.y, rr * c.y - rb * c.x) / det;
+    const float trust = NR_GREY_REACH / (NR_GREY_REACH + max(dot(m, c), 0.0));
+    return (t - trust * float2(dot(m, ctR), dot(m, ctB))) * shrink;
 }
 
 void TakeCastOff(inout float3 chroma, float3 light)

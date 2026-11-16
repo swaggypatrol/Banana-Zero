@@ -37,6 +37,7 @@
 #include <d3d12.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -381,13 +382,26 @@ float TintOf(float oc, float pc, F3 p, F3 o)
 
 // CastTint's white balance from the frame-wide sums (in units of 1, or all in NR_G_SCALE's: the ratios are the same),
 // worked out the textbook way, in doubles: the weighted least squares of tint = b + A chroma with the ridge on A, as a
-// 3x3 system solved by Cramer's rule; then times grey / (grey + prior). Not CastTint's means and covariances.
-void CastTint(const double* sum, double prior, double* tintR, double* tintB)
+// 3x3 system in the raw moments (put back together from the spread pass's centered ones) solved by Cramer's rule; the
+// slope's share of b weighed by NR_GREY_REACH / (NR_GREY_REACH + d^2), d^2 from a 2x2 solve of its own; then times
+// grey / (grey + prior). Not CastTint's means and covariances. `rounding` is what CastTint adds to the ridge for the
+// sums' rounding: half a fixed-point step per group of the cast pass, over the greyness in fixed point.
+void CastTint(const double* sum, double prior, double rounding, double* tintR, double* tintB, bool reach = true)
 {
-    const double ridge = NR_GREY_SPREAD * NR_GREY_SPREAD * sum[NR_G_GREY];
-    const double m[3][3] = { { sum[NR_G_GREY], sum[NR_G_CHROMA_R], sum[NR_G_CHROMA_B] },
-                             { sum[NR_G_CHROMA_R], sum[NR_G_RR] + ridge, sum[NR_G_RB] },
-                             { sum[NR_G_CHROMA_B], sum[NR_G_RB], sum[NR_G_BB] + ridge } };
+    const double s = sum[NR_G_GREY];
+    const double cr = s > 0.0 ? sum[NR_G_CHROMA_R] / s : 0.0, cb = s > 0.0 ? sum[NR_G_CHROMA_B] / s : 0.0;
+    const double mr = s > 0.0 ? sum[NR_G_TINT_R] / s : 0.0, mb = s > 0.0 ? sum[NR_G_TINT_B] / s : 0.0;
+    const double ridge = (NR_GREY_SPREAD * NR_GREY_SPREAD + rounding) * s;
+    const double m[3][3] = { { s, sum[NR_G_CHROMA_R], sum[NR_G_CHROMA_B] },
+                             { sum[NR_G_CHROMA_R], sum[NR_G_RR] + s * cr * cr + ridge, sum[NR_G_RB] + s * cr * cb },
+                             { sum[NR_G_CHROMA_B], sum[NR_G_RB] + s * cr * cb, sum[NR_G_BB] + s * cb * cb + ridge } };
+    // d^2: mean chroma' (Cov + ridge)^-1 mean chroma, Cov from the centered sums.
+    const double covRr = sum[NR_G_RR] / s + NR_GREY_SPREAD * NR_GREY_SPREAD + rounding, covRb = sum[NR_G_RB] / s,
+                 covBb = sum[NR_G_BB] / s + NR_GREY_SPREAD * NR_GREY_SPREAD + rounding;
+    const double det2 = covRr * covBb - covRb * covRb;
+    const double xr = det2 > 0.0 ? (cr * covBb - cb * covRb) / det2 : 0.0,
+                 xb = det2 > 0.0 ? (cb * covRr - cr * covRb) / det2 : 0.0;
+    const double trust = reach ? NR_GREY_REACH / (NR_GREY_REACH + std::max(xr * cr + xb * cb, 0.0)) : 1.0;
     auto det3 = [](const double (&a)[3][3]) {
         return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
                a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
@@ -401,9 +415,11 @@ void CastTint(const double* sum, double prior, double* tintR, double* tintB)
         a[2][0] = bt;
         return d != 0.0 ? det3(a) / d : 0.0;
     };
-    const double shrink = sum[NR_G_GREY] / (sum[NR_G_GREY] + prior);
-    *tintR = intercept(sum[NR_G_TINT_R], sum[NR_G_R_TINT_R], sum[NR_G_B_TINT_R]) * shrink;
-    *tintB = intercept(sum[NR_G_TINT_B], sum[NR_G_R_TINT_B], sum[NR_G_B_TINT_B]) * shrink;
+    const double shrink = s / (s + prior);
+    const double fitR = intercept(sum[NR_G_TINT_R], sum[NR_G_R_TINT_R] + s * cr * mr, sum[NR_G_B_TINT_R] + s * cb * mr);
+    const double fitB = intercept(sum[NR_G_TINT_B], sum[NR_G_R_TINT_B] + s * cr * mb, sum[NR_G_B_TINT_B] + s * cb * mb);
+    *tintR = (mr + trust * (fitR - mr)) * shrink;
+    *tintB = (mb + trust * (fitB - mb)) * shrink;
 }
 
 // TakeCastOff's colour: the tint (red and blue over green, in EV) divided out of the model's colour at a pixel whose
@@ -941,7 +957,8 @@ Pixel SceneValue(const Format& f, UINT x, UINT y, UINT width)
     return { v * hue[0], v * hue[1], v * hue[2], 0.75f };
 }
 
-Scene MakeScene(const Format& f, UINT width, UINT height, UINT border)
+// A scene whose frame is value(x, y), in a texture `border` wider on each side (and half that above and below).
+Scene MakeSceneOf(const Format& f, UINT width, UINT height, UINT border, const std::function<Pixel(UINT, UINT)>& value)
 {
     Scene s;
     s.format = &f;
@@ -958,7 +975,7 @@ Scene MakeScene(const Format& f, UINT width, UINT height, UINT border)
         for (UINT x = 0; x < s.textureWidth; ++x)
         {
             const bool inside = x >= s.baseX && x < s.baseX + width && y >= s.baseY && y < s.baseY + height;
-            const Pixel p = inside ? SceneValue(f, x - s.baseX, y - s.baseY, width) : Pixel { 0.5f, 0.25f, 0.125f, 0.5f };
+            const Pixel p = inside ? value(x - s.baseX, y - s.baseY) : Pixel { 0.5f, 0.25f, 0.125f, 0.5f };
             const size_t i = size_t(y) * s.textureWidth + x;
             Encode(f, p, s.bytes.data() + i * f.bytes);
             s.texture[i] = Decode(f, s.bytes.data() + i * f.bytes);
@@ -969,6 +986,11 @@ Scene MakeScene(const Format& f, UINT width, UINT height, UINT border)
     s.model = MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     s.exposure = MakeTexture(DXGI_FORMAT_R32_FLOAT, 1, 1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return s;
+}
+
+Scene MakeScene(const Format& f, UINT width, UINT height, UINT border)
+{
+    return MakeSceneOf(f, width, height, border, [&f, width](UINT x, UINT y) { return SceneValue(f, x, y, width); });
 }
 
 void Drop(Scene& s)
@@ -1470,24 +1492,39 @@ CpuStats ExpectedStats(const Scene& s, const Setup& u, const std::vector<Pixel>&
         const float grey = ref::Greyness(p, o, u.knobs.shoulder);
         if (grey > 0.0f)
         {
-            const double tr = ref::TintOf(o.r, p.r, p, o), tb = ref::TintOf(o.b, p.b, p, o);
-            const double cr = std::log2(double(p.r) / double(p.g)), cb = std::log2(double(p.b) / double(p.g));
             c.global[NR_G_GREY] += grey;
-            c.global[NR_G_TINT_R] += grey * tr;
-            c.global[NR_G_TINT_B] += grey * tb;
-            c.global[NR_G_CHROMA_R] += grey * cr;
-            c.global[NR_G_CHROMA_B] += grey * cb;
-            c.global[NR_G_RR] += grey * cr * cr;
-            c.global[NR_G_RB] += grey * cr * cb;
-            c.global[NR_G_BB] += grey * cb * cb;
-            c.global[NR_G_R_TINT_R] += grey * cr * tr;
-            c.global[NR_G_B_TINT_R] += grey * cb * tr;
-            c.global[NR_G_R_TINT_B] += grey * cr * tb;
-            c.global[NR_G_B_TINT_B] += grey * cb * tb;
+            c.global[NR_G_TINT_R] += grey * ref::TintOf(o.r, p.r, p, o);
+            c.global[NR_G_TINT_B] += grey * ref::TintOf(o.b, p.b, p, o);
+            c.global[NR_G_CHROMA_R] += grey * std::log2(double(p.r) / double(p.g));
+            c.global[NR_G_CHROMA_B] += grey * std::log2(double(p.b) / double(p.g));
         }
         c.global[NR_G_IN_R] += p.r;
         c.global[NR_G_IN_G] += p.g;
         c.global[NR_G_IN_B] += p.b;
+    }
+    // The spread pass: the same pixels' chroma and tint around the means of the sums above.
+    const double grey = c.global[NR_G_GREY];
+    if (grey > 0.0)
+    {
+        const double mcr = c.global[NR_G_CHROMA_R] / grey, mcb = c.global[NR_G_CHROMA_B] / grey;
+        const double mtr = c.global[NR_G_TINT_R] / grey, mtb = c.global[NR_G_TINT_B] / grey;
+        for (size_t i = 0; i < proxy.size(); ++i)
+        {
+            const ref::F3 p = ref::ProxyLinear(Rgb(proxy[i]));
+            const ref::F3 o = ref::ModelLinear(Rgb(model[i]), Rgb(proxy[i]));
+            const float w = ref::Greyness(p, o, u.knobs.shoulder);
+            if (!(w > 0.0f))
+                continue;
+            const double cr = std::log2(double(p.r) / double(p.g)) - mcr, cb = std::log2(double(p.b) / double(p.g)) - mcb;
+            const double tr = ref::TintOf(o.r, p.r, p, o) - mtr, tb = ref::TintOf(o.b, p.b, p, o) - mtb;
+            c.global[NR_G_RR] += w * cr * cr;
+            c.global[NR_G_RB] += w * cr * cb;
+            c.global[NR_G_BB] += w * cb * cb;
+            c.global[NR_G_R_TINT_R] += w * cr * tr;
+            c.global[NR_G_B_TINT_R] += w * cb * tr;
+            c.global[NR_G_R_TINT_B] += w * cr * tb;
+            c.global[NR_G_B_TINT_B] += w * cb * tb;
+        }
     }
     return c;
 }
@@ -1533,6 +1570,8 @@ void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes
     Dispatch(g.stats, input, Constants(s, u, NR_STATS_INPUT), Groups(s.width, 32), Groups(s.height, 32));
     UavBarrier(stats);
     Dispatch(g.stats, gain, Constants(s, u, NR_STATS_GAIN), Groups(s.width, 32), Groups(s.height, 32));
+    UavBarrier(stats);
+    Dispatch(g.stats, gain, Constants(s, u, NR_STATS_SPREAD), Groups(s.width, 32), Groups(s.height, 32));
     Barrier(s.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const std::vector<uint32_t> w = ReadBuffer(stats, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1572,7 +1611,7 @@ void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes
               SameHistogram(w.data() + NR_S_LUM_HIST, e.lumHist, NR_HIST_BINS, slack) &&
               SameHistogram(w.data() + NR_S_GAIN_HIST, e.gainHist, NR_GAIN_BINS, slack),
           "statistics, %s: the three histograms", s.format->name);
-    // The frame-wide sums: within a rounding per wave (1/64 each) and the GPU's float sums.
+    // The frame-wide sums: within a rounding per group (1/64 each) and the GPU's float sums.
     bool globalRight = true;
     double worst = 0.0;
     for (unsigned i = 0; i < NR_GLOBALS; ++i)
@@ -1669,6 +1708,8 @@ void CheckCast(Scene& s, const Setup& base)
     UavBarrier(cast);
     Dispatch(g.stats, table, Constants(s, u, NR_STATS_CAST), Groups(s.width, 32), Groups(s.height, 32));
     UavBarrier(cast);
+    Dispatch(g.stats, table, Constants(s, u, NR_STATS_SPREAD), Groups(s.width, 32), Groups(s.height, 32));
+    UavBarrier(cast);
     Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
     Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1698,7 +1739,8 @@ void CheckCast(Scene& s, const Setup& base)
     for (unsigned i = 0; i < NR_GLOBALS; ++i)
         sums[i] = double(sum[i]);
     double fitR = 0.0, fitB = 0.0;
-    ref::CastTint(sums, prior, &fitR, &fitB);
+    const double groups = double(Groups(s.width, 32)) * double(Groups(s.height, 32));
+    ref::CastTint(sums, prior, 0.5 * groups / sums[NR_G_GREY], &fitR, &fitB);
     const double gain = double(sum[NR_G_GAIN]) / double(sum[NR_G_WEIGHT]);
     Check(sumsRight && nothingElse && std::fabs(tintR - std::log2(1.08 / 1.02)) < 0.003 &&
               std::fabs(tintB - std::log2(0.88 / 1.02)) < 0.003,
@@ -1842,125 +1884,150 @@ void CheckGreyPrior(Scene& s, const Setup& base)
     }
 }
 
-// The fit (nr.hlsl's CastTint): the white balance is the intercept of the tint as a linear function of a greyish
-// pixel's own chroma, so that the model's change of saturation, which a near-grey colour shows as a tint of its own
-// (a warm-lit near-grey loses some warmth), is not taken for white balance. The cast pass's sums are written by hand
-// for three kinds of greyish pixel: true greys, warm near-greys and cool near-greys, each tinted by one white balance
-// and a desaturation (A) of its own chroma. A model that only brightens shows on the greys how much the composite
-// took off: the white balance, not the mean tint the near-greys pull it to. One kind alone (no spread of chroma to
-// fit) gives the mean tint, as before the fit. For a display-encoded frame the greys' colours are decoded first, and
-// the 8-bit steps allowed for.
-void CheckCastFit(Scene& s, const Setup& base)
+// GlobalColour through the real reduction: the cast pass, the spread pass after it (NR_STATS_SPREAD), then the
+// composite, on pictures made for it, 128x64 so that every wave of 32 threads covers 32x4 whole pixels. The model
+// brightens by a tenth and tints each pixel by a white balance plus a share (A) of the pixel's own chroma, which is how
+// it changes saturation; what the composite took off a pixel is the model's tint there less the tint left in the
+// Output. Three pictures:
+//   - one saturated colour everywhere, linear (0.05, 0.5, 0.09), greyness 1%: every wave sums the same and rounds the
+//     same, so fixed-point errors add up rather than average out. Its mean tint, shrunk, must come off: v0.3.1, whose
+//     cast pass summed chroma uncentered, took (-2.9, +15.4) EV off a model's (+0.1, -0.2).
+//   - one near-grey colour, desaturated: its mean tint, shrunk, as before the fit.
+//   - greys among warm and cool near-greys the model desaturates: off the greys, the white balance (the CPU's fit of the
+//     CPU's sums, near the model's own), not the near-greys' mean tint.
+//   - the first colour, a redder and a bluer one, all far from grey, the tint changing with chroma among them: nothing
+//     grey to find, so near their mean tint. The fit alone would take its slope a long way to grey (about 1 EV here);
+//     NR_GREY_REACH lets it count only so far.
+void CheckCastScenes(const Format& f)
 {
-    Setup u = base;
+    Setup u;
+    u.linear = f.linear;
+    if (!f.linear)
+        u.whiteScale = 1.0f;
     u.castColour = 1.0f; // GlobalColour 0
-    const std::vector<Pixel> proxy = DecodeAll(kHalf, EncodeAndReadProxy(s, u));
-    const std::vector<uint8_t> modelBytes = Encode(MakeModel(proxy, [](ref::F3 p, size_t) { return p * 1.1f; }));
-    const UINT64 bytes = NR_S_WORDS * 4;
-    const double pixels = double(s.width) * double(s.height);
-    const double balance[2] = { 0.05, -0.5 }; // the white balance, R and B over G in EV
-    const double desaturate = -0.3;          // the tint's share of a pixel's own chroma
-    struct Kind
+    const float white = WhiteOf(u);
+    struct Light
     {
-        double share, r, b; // of the picture, and its chroma (log2 R/G, B/G)
+        float r, g, b;
     };
-    const Kind kinds[] = { { 0.06, 0.0, 0.0 }, { 0.18, 0.3, -0.6 }, { 0.06, -0.4, 0.3 } };
-    for (const bool alone : { false, true })
+    const Light saturated = { 0.05f, 0.5f, 0.09f }, grey = { 0.3f, 0.3f, 0.3f }, warm = { 0.37f, 0.3f, 0.198f },
+                cool = { 0.227f, 0.3f, 0.37f }, redder = { 0.06f, 0.5f, 0.09f }, bluer = { 0.05f, 0.5f, 0.11f };
+    enum Want
     {
-        double sums[NR_GLOBALS] = {};
-        double mean[2] = {};
-        for (const Kind& k : kinds)
-        {
-            if (alone && k.r == 0.0)
-                continue; // the warm and cool kinds have no greys between them; alone: the warm kind only
-            if (alone && k.r < 0.0)
-                continue;
-            const double w = k.share * pixels;
-            const double t[2] = { balance[0] + desaturate * k.r, balance[1] + desaturate * k.b };
-            sums[NR_G_GREY] += w;
-            sums[NR_G_TINT_R] += w * t[0];
-            sums[NR_G_TINT_B] += w * t[1];
-            sums[NR_G_CHROMA_R] += w * k.r;
-            sums[NR_G_CHROMA_B] += w * k.b;
-            sums[NR_G_RR] += w * k.r * k.r;
-            sums[NR_G_RB] += w * k.r * k.b;
-            sums[NR_G_BB] += w * k.b * k.b;
-            sums[NR_G_R_TINT_R] += w * k.r * t[0];
-            sums[NR_G_B_TINT_R] += w * k.b * t[0];
-            sums[NR_G_R_TINT_B] += w * k.r * t[1];
-            sums[NR_G_B_TINT_B] += w * k.b * t[1];
-            mean[0] += w * t[0];
-            mean[1] += w * t[1];
-        }
-        mean[0] /= sums[NR_G_GREY];
-        mean[1] /= sums[NR_G_GREY];
-        std::vector<uint32_t> words(NR_S_WORDS, 0u);
-        for (unsigned i = 0; i < NR_GLOBALS; ++i)
-            words[NR_S_GLOBAL + i] = uint32_t(int32_t(std::lround(sums[i] * NR_G_SCALE)));
+        kMean,   // every pixel: the mean tint, shrunk
+        kFitted, // the greys: the white balance the model made, not the mean tint
+        kNear,   // every pixel: near the mean tint, where the fit alone would reach far from it
+    };
+    struct Picture
+    {
+        const char* name;
+        std::vector<Light> stripes; // 16 pixels wide each, in turn
+        double balance[2], slope;  // the model's tint: balance + slope x the pixel's own chroma
+        Want want;
+    };
+    // The third kind's tint is (+0.1, -0.2) EV on the first colour and rises by half of any difference in chroma.
+    const double c0[2] = { std::log2(0.05 / 0.5), std::log2(0.09 / 0.5) };
+    const Picture pictures[] = {
+        { "one saturated colour", { saturated }, { 0.1, -0.2 }, 0.0, kMean },
+        { "one near-grey colour", { warm }, { 0.05, -0.5 }, -0.3, kMean },
+        { "greys, warm and cool near-greys", { grey, warm, warm, warm, cool }, { 0.05, -0.5 }, -0.3, kFitted },
+        { "three saturated colours", { saturated, redder, bluer }, { 0.1 - 0.5 * c0[0], -0.2 - 0.5 * c0[1] }, 0.5, kNear },
+    };
+    // What the Output's own steps allow in a tint measured on it: half-float; R11G11B10's 6- and 5-bit mantissas, half
+    // a step of blue and of green 0.023 and 0.011 EV (every pixel of a picture of one colour rounds the same way, so
+    // nothing averages out); 8-bit sRGB, half a step of a channel at 0.05 is 0.027 EV.
+    const double tolerance = !f.linear ? 0.035 : f.bytes == 4 ? 0.035 : 0.01;
+    for (const Picture& pic : pictures)
+    {
+        auto lightAt = [&](UINT x) { return pic.stripes[(x / 16) % pic.stripes.size()]; };
+        Scene s = MakeSceneOf(f, 128, 64, 0, [&](UINT x, UINT) {
+            const Light l = lightAt(x);
+            if (f.linear)
+                return Pixel { l.r * white, l.g * white, l.b * white, 1.0f };
+            const ref::F3 e = ref::SrgbEncode(ref::F3 { l.r, l.g, l.b });
+            return Pixel { e.r, e.g, e.b, 1.0f };
+        });
+        const std::vector<Pixel> proxy = DecodeAll(kHalf, EncodeAndReadProxy(s, u));
+        auto chromaOf = [](ref::F3 p) { return std::array<double, 2> { std::log2(double(p.r) / p.g), std::log2(double(p.b) / p.g) }; };
+        const std::vector<Pixel> model = MakeModel(proxy, [&](ref::F3 p, size_t) {
+            const auto c = chromaOf(p);
+            const float tr = float(pic.balance[0] + pic.slope * c[0]), tb = float(pic.balance[1] + pic.slope * c[1]);
+            return ref::F3 { p.r * std::exp2(tr), p.g, p.b * std::exp2(tb) } * 1.1f;
+        });
+
+        // The cast and spread passes, then the composite.
+        const UINT64 bytes = NR_S_WORDS * 4;
         ID3D12Resource* cast = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
         Reset(s, u);
         RecordEncode(s, u);
-        Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Upload(s.model, Encode(model), 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        UploadBuffer(cast, words, D3D12_RESOURCE_STATE_COMMON);
         Barrier(cast, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT },
-                                     { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT }, ExposureView(s, u), OutputView(s),
-                                     cast, bytes);
+        const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT }, { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                     ExposureView(s, u), OutputView(s), cast, bytes);
+        Dispatch(g.stats, table, Constants(s, u, NR_STATS_CLEAR), 1, 1);
+        UavBarrier(cast);
+        Dispatch(g.stats, table, Constants(s, u, NR_STATS_CAST), Groups(s.width, 32), Groups(s.height, 32));
+        UavBarrier(cast);
+        Dispatch(g.stats, table, Constants(s, u, NR_STATS_SPREAD), Groups(s.width, 32), Groups(s.height, 32));
+        UavBarrier(cast);
         Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
         Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const std::vector<uint8_t> output = Read(s.output, f.bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         cast->Release();
 
-        // On the greys below the shoulder: their R/G and B/G over the frame's, which is minus what was taken off.
-        auto light = [&](const Pixel& v) {
-            const ref::F3 c = Rgb(v);
-            return u.linear ? Pixel { c.r, c.g, c.b, v.a } : [&] {
-                const ref::F3 d = ref::SrgbDecode(ref::Saturate(c));
-                return Pixel { d.r, d.g, d.b, v.a };
-            }();
-        };
+        // What should come off: the CPU's fit of the CPU's sums of the same pictures.
+        const CpuStats e = ExpectedStats(s, u, proxy, model);
+        double want[2];
+        const double rounding = 0.5 * double(Groups(s.width, 32)) * double(Groups(s.height, 32)) /
+                                (e.global[NR_G_GREY] * NR_G_SCALE);
+        ref::CastTint(e.global, NR_GREY_PRIOR * double(s.width) * double(s.height), rounding, &want[0], &want[1]);
+        const double share = e.global[NR_G_GREY] / (double(s.width) * double(s.height));
+        const double shrink = share / (share + NR_GREY_PRIOR);
+        const double mean[2] = { e.global[NR_G_TINT_R] / e.global[NR_G_GREY] * shrink,
+                                 e.global[NR_G_TINT_B] / e.global[NR_G_GREY] * shrink };
+        // What came off: on the greys (the third picture) or every pixel, the model's tint less what is left.
         double taken[2] = {};
         size_t counted = 0;
         for (UINT y = 0; y < s.height; ++y)
         {
             for (UINT x = 0; x < s.width; ++x)
             {
-                const Pixel f = light(s.Frame(x, y));
-                const ref::F3 p = ref::ProxyLinear(Rgb(proxy[size_t(y) * s.width + x]));
-                if (!Finite(f) || !(f.g > 0.0f) || !(f.r > 0.0f) || !(f.b > 0.0f) || std::fabs(f.r - f.g) > 0.05f * f.g ||
-                    std::fabs(f.b - f.g) > 0.05f * f.g || !(ref::Max3(p) < u.knobs.shoulder) ||
-                    ref::Dot(p, ref::kLuma) < 0.01f)
+                const Light l = lightAt(x);
+                if (pic.want == kFitted && !(l.r == grey.r && l.b == grey.b))
                     continue;
-                const size_t i = size_t(y + s.baseY) * s.textureWidth + x + s.baseX;
-                const Pixel o = light(Decode(*s.format, output.data() + i * s.format->bytes));
-                if (!(o.g > 0.0f) || !(o.r > 0.0f) || !(o.b > 0.0f))
-                    continue;
-                taken[0] -= std::log2((double(o.r) / double(o.g)) / (double(f.r) / double(f.g)));
-                taken[1] -= std::log2((double(o.b) / double(o.g)) / (double(f.b) / double(f.g)));
+                const size_t k = size_t(y) * s.width + x;
+                const ref::F3 p = ref::ProxyLinear(Rgb(proxy[k]));
+                const ref::F3 o = ref::ModelLinear(Rgb(model[k]), Rgb(proxy[k]));
+                auto lin = [&](const Pixel& v) { return f.linear ? Rgb(v) : ref::SrgbDecode(ref::Saturate(Rgb(v))); };
+                const ref::F3 fr = lin(s.Frame(x, y));
+                const ref::F3 out = lin(Decode(f, output.data() + (size_t(y + s.baseY) * s.textureWidth + x + s.baseX) * f.bytes));
+                taken[0] += ref::TintOf(o.r, p.r, p, o) - std::log2((double(out.r) / out.g) / (double(fr.r) / fr.g));
+                taken[1] += ref::TintOf(o.b, p.b, p, o) - std::log2((double(out.b) / out.g) / (double(fr.b) / fr.g));
                 ++counted;
             }
         }
-        if (counted != 0)
-        {
-            taken[0] /= double(counted);
-            taken[1] /= double(counted);
-        }
-        const double share = sums[NR_G_GREY] / pixels;
-        const double shrink = share / (share + NR_GREY_PRIOR);
-        double want[2];
-        ref::CastTint(sums, NR_GREY_PRIOR * pixels, &want[0], &want[1]);
-        // What the fit should find: the white balance the model made (the mean tint for one kind alone), give or take
-        // the ridge (0.02 EV here), where the mean tint is 0.09 EV off in B/G.
-        const double made[2] = { (alone ? mean[0] : balance[0]) * shrink, (alone ? mean[1] : balance[1]) * shrink };
-        const bool fitted = std::fabs(want[0] - made[0]) < 0.02 && std::fabs(want[1] - made[1]) < 0.02 &&
-                            (alone || std::fabs(mean[1] * shrink - made[1]) > 0.05);
-        const double steps = u.linear ? 0.01 : 0.02; // 8-bit sRGB steps, a few per cent of a dark grey's channel
-        Check(counted > 100 && fitted && std::fabs(taken[0] - want[0]) < steps && std::fabs(taken[1] - want[1]) < steps,
-              "cast fit, %s, %s: R/G %+.4f B/G %+.4f EV taken off the greys (want the fit's %+.4f %+.4f; the white "
-              "balance made %+.4f %+.4f, the mean tint %+.4f %+.4f) over %zu grey pixels",
-              s.format->name, alone ? "one kind of greyish pixel" : "greys, warm and cool near-greys", taken[0],
-              taken[1], want[0], want[1], made[0], made[1], mean[0] * shrink, mean[1] * shrink, counted);
+        taken[0] /= double(std::max<size_t>(counted, 1));
+        taken[1] /= double(std::max<size_t>(counted, 1));
+        // The want itself: the mean for one colour; for the third picture near the model's white balance, where the mean
+        // is not; for the fourth near the mean, where the fit without NR_GREY_REACH is not.
+        const double made[2] = { pic.balance[0] * shrink, pic.balance[1] * shrink };
+        double alone[2];
+        ref::CastTint(e.global, NR_GREY_PRIOR * double(s.width) * double(s.height), rounding, &alone[0], &alone[1], false);
+        const double fromMean = std::max(std::fabs(want[0] - mean[0]), std::fabs(want[1] - mean[1]));
+        const bool wantRight =
+            pic.want == kFitted ? std::fabs(want[0] - made[0]) < 0.03 && std::fabs(want[1] - made[1]) < 0.03 &&
+                                      std::fabs(mean[1] - made[1]) > 0.05
+            : pic.want == kNear ? fromMean < 0.25 && std::max(std::fabs(alone[0] - mean[0]), std::fabs(alone[1] - mean[1])) > 0.5
+                                : fromMean < 0.002;
+        Check(counted > 100 && wantRight && std::fabs(taken[0] - want[0]) < tolerance &&
+                  std::fabs(taken[1] - want[1]) < tolerance,
+              "cast through the passes, %s, %s: R/G %+.4f B/G %+.4f EV taken off %s (want %+.4f %+.4f; the model's white "
+              "balance, or for colours far from grey the fit alone, %+.4f %+.4f; the mean tint %+.4f %+.4f; all shrunk) "
+              "over %zu pixels",
+              f.name, pic.name, taken[0], taken[1], pic.want == kFitted ? "the greys" : "every pixel", want[0], want[1],
+              pic.want == kNear ? alone[0] : made[0], pic.want == kNear ? alone[1] : made[1], mean[0], mean[1], counted);
+        Drop(s);
     }
 }
 
@@ -2797,7 +2864,7 @@ void TestLinear(const Format& f, UINT border)
     CheckMeter(s);
     CheckCast(s, base);
     CheckGreyPrior(s, base);
-    CheckCastFit(s, base);
+    CheckCastScenes(f);
     CheckDump(s, base, brighterBytes);
     CheckPreview(s, base);
     TestScaled(s, base, 140, 78); // about 0.69 of each side
@@ -2824,7 +2891,7 @@ void TestDisplayEncoded(const Format& f)
     off.knobs.detail = 0.0f;
     CheckUntouched(s, RunComposite(s, off, Encode(brighter)), "DetailStrength 0");
     CheckComposite(s, base, proxy, brighter, RunComposite(s, base, Encode(brighter)), "model +0.5 EV");
-    CheckCastFit(s, base);
+    CheckCastScenes(f);
     TestScaled(s, base, 107, 61); // about 0.67 of each side
     Drop(s);
 }
