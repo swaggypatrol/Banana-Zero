@@ -435,80 +435,59 @@ def greyness(p, s=SHOULDER):
 
 
 def estimates(p, t, c):
-    """dxgi.dll's white balance estimate (the weighted mean tint on greyish pixels, shrunk by NR_GREY_PRIOR) and a
-    fit of the tint as an intercept plus a linear function of the input's chroma over the same pixels, whose
-    intercept is the tint of a grey with the saturation changes taken out. Returns both, the grey share and the
-    fit's condition number."""
-    w = greyness(p).reshape(-1)
-    tt, cc = t.reshape(-1, 2), c.reshape(-1, 2)
-    grey = w.sum()
-    prior = len(w) / 256.0
-    current = (w[:, None] * tt).sum(axis=0) / (grey + prior)
-    keep = w > 0
-    x = np.concatenate([np.ones((keep.sum(), 1)), cc[keep]], axis=1)
-    sw = np.sqrt(w[keep])[:, None]
-    xtx = (x * sw).T @ (x * sw)
-    coef = np.linalg.solve(xtx + 1e-9 * np.eye(3), (x * sw).T @ (tt[keep] * sw))
-    return current, coef[0], coef[1:], grey / len(w), float(np.linalg.cond(xtx))
+    """dxgi.dll's white balance (cast_tint, before its shrink) beside v0.3.0's mean tint over the greyish pixels, the
+    grey share, and d^2."""
+    w = greyness(p)
+    mean = (w.reshape(-1)[:, None] * t.reshape(-1, 2)).sum(axis=0) / max(w.sum(), 1e-20)
+    fit, d2 = cast_tint(w, t, c, 0.0)
+    return mean, fit, w.sum() / w.size, d2
 
 
-CURVE_LEVELS = (0.0, 0.04, 0.12, 0.25, 0.45, 0.70)  # the per-level candidate's band edges, up to the shoulder
-RIDGES = (0.0, 0.1, 0.3)  # the fit's ridge on its slope, as a spread of chroma in EV
+REACH = 128.0  # NR_GREY_REACH: how far the fit is trusted to reach grey, d^2 at which it counts half (nr.hlsl's CastTint)
+SPREAD = 0.1  # NR_GREY_SPREAD: the ridge on the slope, as a spread of chroma in EV
 
 
-def fit_intercept(w, t, c, prior, spread):
-    """The intercept b of tint = b + A chroma by weighted least squares over the greyish pixels, from the twelve
-    weighted sums a GPU pass would gather, then shrunk as the mean tint is today: times grey / (grey + prior)
-    (NR_GREY_PRIOR). The ridge adds spread^2 times the grey weight to the slope's diagonal, so that where the greys'
-    chroma does not spread much wider than that, A goes to 0 and b to the mean tint, which is what TakeCastOff
-    divides out today."""
+def cast_tint(w, t, c, prior, reach=REACH, spread=SPREAD):
+    """nr.hlsl's CastTint in doubles: the intercept of tint = b + A chroma over the greyish pixels by weighted least
+    squares (centered moments, a ridge of spread^2 on A), its slope's share of it weighed by reach / (reach + d^2),
+    where d^2 is how far grey lies from the greyish pixels' mean chroma in units of their spread (a fit that has to
+    reach far from its pixels to find grey is not trusted to), then shrunk by grey / (grey + prior). The ridge also
+    takes in the rounding of the sums, half a 1/64 step per 32x32 group of the cast pass over the greyness (w is the
+    picture's own 2-D weights, for its size). reach None: the whole slope and no rounding (v0.3.1). Returns the white
+    balance (R, B in EV) and d^2."""
+    groups = np.ceil(w.shape[0] / 32.0) * np.ceil(w.shape[1] / 32.0)
     w = w.reshape(-1)
     t = t.reshape(-1, 2)
     c = c.reshape(-1, 2)
     s = w.sum()
-    sc = (w[:, None] * c).sum(axis=0)
-    scc = (w[:, None, None] * c[:, :, None] * c[:, None, :]).sum(axis=0)
-    st = (w[:, None] * t).sum(axis=0)
-    sct = (w[:, None, None] * c[:, :, None] * t[:, None, :]).sum(axis=0)
-    m = np.array([[s, sc[0], sc[1]],
-                  [sc[0], scc[0, 0] + spread * spread * s, scc[0, 1]],
-                  [sc[1], scc[0, 1], scc[1, 1] + spread * spread * s]])
-    rhs = np.stack([st, sct[0], sct[1]])
     if s <= 0:
-        return np.zeros(2)
-    return np.linalg.solve(m + 1e-12 * np.eye(3), rhs)[0] * s / (s + prior)
+        return np.zeros(2), 0.0
+    mc = (w[:, None] * c).sum(axis=0) / s
+    mt = (w[:, None] * t).sum(axis=0) / s
+    dc, dt = c - mc, t - mt
+    rounding = 0.0 if reach is None else 0.5 * groups / (s * 64.0)
+    cov = (w[:, None, None] * dc[:, :, None] * dc[:, None, :]).sum(axis=0) / s + (spread * spread + rounding) * np.eye(2)
+    cct = (w[:, None, None] * dc[:, :, None] * dt[:, None, :]).sum(axis=0) / s
+    m = np.linalg.solve(cov, mc)
+    d2 = float(m @ mc)
+    trust = 1.0 if reach is None else reach / (reach + d2)
+    return (mt - trust * (m @ cct)) * s / (s + prior), d2
 
 
 def removal_candidates(p, t, c, use):
-    """What each candidate would divide out at every pixel (R, B tint in EV), estimated from the pixels in use (a mask):
-    current: TakeCastOff as it is, the weighted mean tint over greyish pixels with NR_GREY_PRIOR, faded by room above
-    the shoulder; luminance: the same mean weighted by each pixel's luminance too, the prior scaled by the mean
-    luminance of the frame's greys; fit: the intercept of tint = b + A chroma, faded by room; curve: the mean tint in
-    bands of level (CURVE_LEVELS), each with its own share of the prior, interpolated between band centres and held
-    above the last, with no room."""
+    """What each candidate would divide out at every pixel (R, B tint in EV), estimated from the pixels in use (a mask),
+    each faded by room above the shoulder as TakeCastOff does: "v0.3.0 mean", the weighted mean tint over greyish
+    pixels with NR_GREY_PRIOR; "v0.3.1 fit", the intercept with its whole slope; "fit reach N", the intercept with the
+    slope weighed by N / (N + d^2); "default", what the shipped TakeCastOff does (REACH)."""
     w = greyness(p) * use
     level = p.max(axis=2)
-    y = p @ LUMA
     room = np.clip((1.0 - level) / (1.0 - SHOULDER), 0.0, 1.0)[..., None]
-    pixels = use.sum()
-    prior = pixels / 256.0
-    out = {}
-    current = (w[..., None] * t).sum(axis=(0, 1)) / (w.sum() + prior)
-    out["current"] = room * current
-    wy = w * y
-    mean_y = wy.sum() / max(w.sum(), 1e-20)
-    out["luminance"] = room * ((wy[..., None] * t).sum(axis=(0, 1)) / (wy.sum() + prior * mean_y))
-    for spread in RIDGES:
-        out["fit %.2f" % spread] = room * fit_intercept(w, t, c, prior, spread)
-    centres, values = [], []
-    for lo, hi in zip(CURVE_LEVELS[:-1], CURVE_LEVELS[1:]):
-        band = (level >= lo) & (level < hi)
-        wb = w * band
-        share = band.sum() / max(pixels, 1)
-        values.append((wb[..., None] * t).sum(axis=(0, 1)) / (wb.sum() + prior * max(share, 1e-6)))
-        centres.append(0.5 * (lo + hi))
-    curve = np.stack([np.interp(level, centres, [v[k] for v in values]) for k in (0, 1)], axis=-1)
-    out["curve"] = curve
+    prior = use.sum() / 256.0
+    out = {"v0.3.0 mean": room * ((w[..., None] * t).sum(axis=(0, 1)) / (w.sum() + prior)),
+           "v0.3.1 fit": room * cast_tint(w, t, c, prior, None)[0]}
+    for reach in (32.0, 512.0):
+        out["fit reach %g" % reach] = room * cast_tint(w, t, c, prior, reach)[0]
+    out["default"] = room * cast_tint(w, t, c, prior)[0]
     return out
 
 
@@ -516,10 +495,10 @@ def frames_experiment(args):
     """Real pictures through the rig, each normalised to the white point the scene meter aims at and shown for
     --frames frames after a Reset (the model's history thrown away: each is a frame of its own), once with the
     model's colour kept whole (GlobalColour 1, HighlightColour 6) and once as the default composite (GlobalColour 0).
-    Then offline, per picture: dxgi.dll's estimate (current) and the intercept of tint = b + A chroma (fit), how
-    much tint each candidate of removal_candidates leaves on near-grey pixels (smallest channel over largest above
+    Then offline, per picture: v0.3.0's mean tint and dxgi.dll's white balance (cast_tint) with its d^2, how much
+    tint each candidate of removal_candidates leaves on near-grey pixels (smallest channel over largest above
     0.8; estimated on the even pixels of a checkerboard, scored on the odd ones), the default composite's measured
-    residual next to the current candidate's prediction of it, and, over the whole list, how far each estimate moves
+    residual next to the prediction of it by the algorithm it runs ("default"), and, over the whole list, how far each estimate moves
     from one picture to the next (for a sequence, the swing a player sees)."""
     names = [os.path.splitext(os.path.basename(path))[0] for path in args.pictures]
     pictures = []
@@ -532,15 +511,14 @@ def frames_experiment(args):
                   capture=capture, cuts=True)
     default, _ = run("frames-default", shown, dict(BASE, GlobalColour=0), frames=args.frames, capture=capture,
                      cuts=True)
-    rows, series = [], {"current": [], "fit": []}
+    rows, series = [], {"mean": [], "fit": []}
     for i, name in enumerate(names):
         frame = (i + 1) * args.frames - 1
         after, before = kept[frame]
         p, t, c = model_change(after, before)
-        current, b, a, share, cond = estimates(p, t, c)
-        series["current"].append(current)
+        mean, b, share, d2 = estimates(p, t, c)
+        series["mean"].append(mean)
         series["fit"].append(b)
-        series.setdefault("fit 0.10", []).append(fit_intercept(greyness(p), t, c, p.shape[0] * p.shape[1] / 256.0, 0.1))
         left_after, left_before = default[frame]
         _, left, _ = model_change(left_after, left_before)
         lo, hi = p.min(axis=2), p.max(axis=2)
@@ -548,7 +526,7 @@ def frames_experiment(args):
         yy, xx = np.mgrid[0:p.shape[0], 0:p.shape[1]]
         even = ((yy + xx) % 2 == 0).astype(np.float64)
         odd = near & (even == 0)
-        predicted = t - removal_candidates(p, t, c, np.ones_like(even))["current"]
+        predicted = t - removal_candidates(p, t, c, np.ones_like(even))["default"]
         scores = {"measured default": np.abs(left[near]).mean(axis=0),
                   "predicted default": np.abs(predicted[near]).mean(axis=0),
                   "model alone": np.abs(t[odd]).mean(axis=0)}
@@ -562,19 +540,19 @@ def frames_experiment(args):
         for key, removal in removal_candidates(p, t, c, even).items():
             series.setdefault("colours " + key, []).append(np.abs((t - removal)[colourful]).mean(axis=0))
         series.setdefault("colours model alone", []).append(np.abs(t[colourful]).mean(axis=0))
-        rows.append((name, share, current, b, a, cond, int(odd.sum()), scores))
+        rows.append((name, share, mean, b, d2, int(odd.sum()), scores))
         for key, value in signed.items():
             series.setdefault("greys " + key, []).append(value)
-    print("%-10s %6s | %15s | %15s | %11s %5s" % ("picture", "greys", "current R B", "fit b R B", "fit A diag", "cond"))
-    for name, share, current, b, a, cond, _, _ in rows:
-        print("%-10s %5.1f%% | %+7.4f %+7.4f | %+7.4f %+7.4f | %+5.2f %+5.2f %5.0f" % (
-            name, 100 * share, current[0], current[1], b[0], b[1], a[0, 0], a[1, 1], cond))
-    keys = list(rows[0][7])
+    print("%-10s %6s | %15s | %15s | %6s" % ("picture", "greys", "mean R B", "fit R B", "d^2"))
+    for name, share, mean, b, d2, _, _ in rows:
+        print("%-10s %5.1f%% | %+7.4f %+7.4f | %+7.4f %+7.4f | %6.2f" % (
+            name, 100 * share, mean[0], mean[1], b[0], b[1], d2))
+    keys = list(rows[0][6])
     print("\nmean |tint| left on near-grey pixels (R, B in EV)")
     print("%-10s %6s " % ("picture", "pixels") + " ".join("%17s" % k for k in keys))
-    for name, _, _, _, _, _, n, scores in rows:
+    for name, _, _, _, _, n, scores in rows:
         print("%-10s %6d " % (name, n) + " ".join("%8.4f %8.4f" % tuple(scores[k]) for k in keys))
-    total = {k: np.mean([r[7][k] for r in rows], axis=0) for k in keys}
+    total = {k: np.mean([r[6][k] for r in rows], axis=0) for k in keys}
     print("%-10s %6s " % ("mean", "") + " ".join("%8.4f %8.4f" % tuple(total[k]) for k in keys))
     if len(rows) > 2:
         print("\nhow far each estimate, and the mean tint left on the near-greys, moves from one picture to the next (R, B"

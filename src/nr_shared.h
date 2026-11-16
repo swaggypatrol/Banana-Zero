@@ -20,6 +20,7 @@
 //   stats input       read       -             -          read          -           -              stats       -
 //   stats gain        -          read          read       -             -           -              stats       -
 //   cast              -          read          read       -             -           -              cast        -
+//   spread            -          read          read       -             -           -              stats/cast  -
 //   dilate            depth      motion        -          -             -           dilated motion -           -
 //   sky               depth      -             -          -             -           control mask   -           -
 //
@@ -62,6 +63,7 @@
 #define NR_STATS_METER 3   // the scene meter: histogram of the frame's luminance in its own units
 #define NR_STATS_RESOLVE 4 // the scene white point from that histogram, eased towards over time; empties the histogram
 #define NR_STATS_CAST 5    // the gain pass's frame-wide sums alone (NR_S_GLOBAL), for the composite of the same frame
+#define NR_STATS_SPREAD 6  // after the gain or cast pass: the greyish pixels' chroma and tint around their means
 
 // NrConstants.flags
 #define NR_FLAG_LINEAR_HDR 0x01     // the frame is linear HDR: white point, shoulder, sRGB. Else it is display-encoded
@@ -198,11 +200,13 @@ static_assert(sizeof(NrConstants) == 160, "NrConstants is passed as root constan
 #define NR_G_IN_G 6
 #define NR_G_IN_B 7
 // For the white balance as the intercept of a fit of the tint to the greyish pixel's own chroma (nr.hlsl's CastTint):
-// the greyness weights times its log2 red over green and blue over green in the proxy (its chroma), their squares and
-// product, and the chroma times the tint.
+// the greyness weights times its log2 red over green and blue over green in the proxy (its chroma), from the gain or
+// cast pass; then, from the spread pass after it (NR_STATS_SPREAD), the weights times the products of the chroma and
+// the tint each less its mean (the sums before over the greyness), so that a picture of one colour sums to nothing
+// rather than to a large square less another (in fixed point, the difference of the two was all rounding).
 #define NR_G_CHROMA_R 8
 #define NR_G_CHROMA_B 9
-#define NR_G_RR 10      // chroma R squared
+#define NR_G_RR 10      // chroma R squared, around their means
 #define NR_G_RB 11      // chroma R times chroma B
 #define NR_G_BB 12      // chroma B squared
 #define NR_G_R_TINT_R 13 // chroma R times tint R
@@ -217,6 +221,10 @@ static_assert(sizeof(NrConstants) == 160, "NrConstants is passed as root constan
 // The fit's ridge (nr.hlsl's CastTint), as a spread of chroma in EV: greyish pixels whose chroma spreads much less
 // than this give no slope to fit, and the white balance is then their mean tint.
 #define NR_GREY_SPREAD 0.1
+// How far the fit is trusted to reach grey (nr.hlsl's CastTint): grey's distance from the greyish pixels' mean chroma,
+// squared, in units of their spread (d^2), at which the fit's slope counts half towards the white balance. Quake II RTX
+// frames lie at 2 to 20; a frame of one saturated colour at about 1700.
+#define NR_GREY_REACH 128.0
 #define NR_S_TAG_LAST (NR_S_GLOBAL + NR_GLOBALS)       // frame + 1 again
 #define NR_S_WORDS (NR_S_TAG_LAST + 1)
 

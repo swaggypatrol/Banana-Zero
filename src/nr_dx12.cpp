@@ -2672,6 +2672,11 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
             c.width = modelWidth;
             c.height = modelHeight;
             Dispatch(list, g_nr.statsPipeline, gainTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
+            // The fit's spread around the means the gain pass just summed, for the log's white balance.
+            UavBarrier(&barriers[0], g_nr.stats.resource);
+            list->ResourceBarrier(1, barriers);
+            c.mode = NR_STATS_SPREAD;
+            Dispatch(list, g_nr.statsPipeline, gainTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
         }
         if (dump)
             DumpPasses(list, dumpTable, constants, NR_MODE_DUMP_BEFORE, layout);
@@ -2684,7 +2689,8 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         list->ResourceBarrier(count, barriers);
         if (cast)
         {
-            // This frame's sums, emptied first, then read by the composite (u1 of its table).
+            // This frame's sums, emptied first, then the spread around their means, then read by the composite (u1
+            // of its table).
             NrConstants c = constants;
             c.mode = NR_STATS_CLEAR;
             Dispatch(list, g_nr.statsPipeline, compositeTable, c, 1, 1);
@@ -2693,6 +2699,9 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
             c.mode = NR_STATS_CAST;
             c.width = modelWidth;
             c.height = modelHeight;
+            Dispatch(list, g_nr.statsPipeline, compositeTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
+            list->ResourceBarrier(1, barriers);
+            c.mode = NR_STATS_SPREAD;
             Dispatch(list, g_nr.statsPipeline, compositeTable, c, Groups(modelWidth, 32), Groups(modelHeight, 32));
             list->ResourceBarrier(1, barriers);
         }
@@ -2960,20 +2969,24 @@ void LogSample(const Sample& sample)
             const double grey = global[NR_G_GREY];
             const double meanR = grey > 0.0 ? global[NR_G_TINT_R] / grey : 0.0;
             const double meanB = grey > 0.0 ? global[NR_G_TINT_B] / grey : 0.0;
-            // CastTint's intercept in means and covariances, before its shrink.
-            double tr = meanR, tb = meanB;
+            // CastTint's white balance, before its shrink: the intercept, its slope's share weighed by how far the fit
+            // reaches to grey (d^2). The spread pass summed the second moments around the means.
+            double tr = meanR, tb = meanB, reach = 0.0;
             if (grey > 0.0)
             {
                 const double cr = global[NR_G_CHROMA_R] / grey, cb = global[NR_G_CHROMA_B] / grey;
-                const double ridge = NR_GREY_SPREAD * NR_GREY_SPREAD;
-                const double rr = global[NR_G_RR] / grey - cr * cr + ridge, rb = global[NR_G_RB] / grey - cr * cb;
-                const double bb = global[NR_G_BB] / grey - cb * cb + ridge;
+                const double groups = double((info.modelWidth + 31) / 32) * double((info.modelHeight + 31) / 32);
+                const double ridge = NR_GREY_SPREAD * NR_GREY_SPREAD + 0.5 * groups / (grey * NR_G_SCALE);
+                const double rr = global[NR_G_RR] / grey + ridge, rb = global[NR_G_RB] / grey;
+                const double bb = global[NR_G_BB] / grey + ridge;
                 const double det = rr * bb - rb * rb;
                 if (det > 0.0)
                 {
                     const double mr = (bb * cr - rb * cb) / det, mb = (rr * cb - rb * cr) / det;
-                    tr -= mr * (global[NR_G_R_TINT_R] / grey - cr * meanR) + mb * (global[NR_G_B_TINT_R] / grey - cb * meanR);
-                    tb -= mr * (global[NR_G_R_TINT_B] / grey - cr * meanB) + mb * (global[NR_G_B_TINT_B] / grey - cb * meanB);
+                    reach = std::max(mr * cr + mb * cb, 0.0);
+                    const double trust = NR_GREY_REACH / (NR_GREY_REACH + reach);
+                    tr -= trust * (mr * global[NR_G_R_TINT_R] / grey + mb * global[NR_G_B_TINT_R] / grey);
+                    tb -= trust * (mr * global[NR_G_R_TINT_B] / grey + mb * global[NR_G_B_TINT_B] / grey);
                 }
             }
             // What TakeCastOff divides out: 1 - GlobalColour of it, less where little grey was found (NR_GREY_PRIOR).
@@ -2992,11 +3005,11 @@ void LogSample(const Sample& sample)
             shown(1.0 - taken, tr, tb, &keptRg, &keptBg);
             const double brightness = double(info.detail) * global[NR_G_GAIN] / weight;
             add("; frame: input R/G %.4f B/G %.4f; the model's cast at DetailStrength x ColourStrength %.2f: grey R/G "
-                "x%.4f B/G x%.4f (white balance R/G x%.4f B/G x%.4f, fitted on %.1f%% of its picture in greys, whose "
-                "mean tint is R/G x%.4f B/G x%.4f); its mean brightness change %+.3f EV; predicted after the composite "
+                "x%.4f B/G x%.4f (white balance R/G x%.4f B/G x%.4f, fitted on %.1f%% of its picture in greys, d^2 %.1f, "
+                "whose mean tint is R/G x%.4f B/G x%.4f); its mean brightness change %+.3f EV; predicted after the composite "
                 "(GlobalColour %.2f, %.0f%% of the white balance taken off): grey R/G x%.4f B/G x%.4f",
                 global[NR_G_IN_R] / global[NR_G_IN_G], global[NR_G_IN_B] / global[NR_G_IN_G], k, rg, bg, std::exp2(tr),
-                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), std::exp2(meanR), std::exp2(meanB),
+                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), reach, std::exp2(meanR), std::exp2(meanB),
                 brightness, double(info.globalColour), 100.0 * taken, keptRg, keptBg);
         }
     }
