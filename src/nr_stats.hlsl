@@ -24,22 +24,45 @@ groupshared uint sMeter[NR_METER_BINS];
 // up and rounds once into the buffer's fixed point (AddToGroup). 64 waves at most: 256 threads in waves of 4.
 static const uint kMaxWaves = 64;
 groupshared float sWave[NR_GLOBALS * kMaxWaves];
+groupshared uint sWaveKey[kMaxWaves]; // each slot's wave by its first thread's index in the group
 groupshared uint sWaves;
 
 // Into the group's frame-wide sums: across the wave in floats, into the wave's own slot. The merge after the group's
 // barrier adds the slots up, still in floats, and rounds once per group: rounding per wave, in v0.3.1, made the fit's
-// sums of a frame of little grey mostly rounding.
-void AddToGroup(float global[NR_GLOBALS])
+// sums of a frame of little grey mostly rounding. Every thread of the group calls it.
+void AddToGroup(float global[NR_GLOBALS], uint gi)
 {
     uint slot = 0;
     if (WaveIsFirstLane())
         InterlockedAdd(sWaves, 1u, slot);
     slot = WaveReadLaneFirst(slot);
+    const uint key = WaveReadLaneFirst(gi);
+    if (WaveIsFirstLane())
+        sWaveKey[slot] = key;
     [unroll] for (uint k = 0; k < NR_GLOBALS; ++k)
     {
         const float sum = WaveActiveSum(global[k]);
         if (WaveIsFirstLane())
             sWave[k * kMaxWaves + slot] = sum;
+    }
+}
+
+// A pixel's share of the white balance's first sums (nr.hlsl's CastTint): its greyness, and that times its tint and its
+// own chroma. The chroma of a pixel greyness weighs is within its own +-log2 of (smallest / largest), so weight times
+// chroma stays under 1 (the spread pass sums its squares and products). The cast pass sums these alone, the gain
+// pass beside its own, in the same order, so the two give the same words.
+void AddGrey(inout float global[NR_GLOBALS], float3 p, float3 o)
+{
+    const float grey = Greyness(p, o);
+    if (grey > 0.0)
+    {
+        const float2 tint = Tint(p, o);
+        const float2 c = GreyChroma(p);
+        global[NR_G_GREY] += grey;
+        global[NR_G_TINT_R] += grey * tint.x;
+        global[NR_G_TINT_B] += grey * tint.y;
+        global[NR_G_CHROMA_R] += grey * c.x;
+        global[NR_G_CHROMA_B] += grey * c.y;
     }
 }
 
@@ -250,10 +273,25 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 ++count[NR_C_DARK];
         }
     }
-    else if (g.mode == NR_STATS_GAIN || g.mode == NR_STATS_CAST)
+    else if (g.mode == NR_STATS_CAST)
     {
-        // The cast pass is this one with its sums alone: no histogram, no counts.
-        const bool histogram = g.mode == NR_STATS_GAIN;
+        // The white balance's first sums alone (AddGrey), for the composite of a frame without statistics; a frame
+        // with them reads the gain pass's, which are the same.
+        float global[NR_GLOBALS];
+        [unroll] for (uint z = 0; z < NR_GLOBALS; ++z)
+            global[z] = 0.0;
+        [unroll] for (uint n = 0; n < 4; ++n)
+        {
+            const uint2 q = id.xy * 2 + uint2(n & 1, n >> 1);
+            if (q.x >= g.width || q.y >= g.height)
+                continue;
+            const float3 pe = gProxy.Load(int3(q, 0)).rgb;
+            AddGrey(global, ProxyLinear(pe), ModelLinear(gModel.Load(int3(q, 0)).rgb, pe));
+        }
+        AddToGroup(global, gi);
+    }
+    else if (g.mode == NR_STATS_GAIN)
+    {
         float global[NR_GLOBALS];
         [unroll] for (uint z = 0; z < NR_GLOBALS; ++z)
             global[z] = 0.0;
@@ -272,12 +310,9 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 ++count[NR_C_GAIN_LOW];
             else if (gain > g.maxGain)
                 ++count[NR_C_GAIN_HIGH];
-            if (histogram)
-            {
-                const float at = clamp(floor((gain - float(NR_GAIN_EV_MIN)) * float(NR_GAIN_PER_EV)), 0.0,
-                                       float(NR_GAIN_BINS - 1));
-                InterlockedAdd(sHist[uint(at)], 1u);
-            }
+            const float at = clamp(floor((gain - float(NR_GAIN_EV_MIN)) * float(NR_GAIN_PER_EV)), 0.0,
+                                   float(NR_GAIN_BINS - 1));
+            InterlockedAdd(sHist[uint(at)], 1u);
             const float3 chroma = ModelChroma(p, o);
             if (abs(chroma.r) + abs(chroma.g) + abs(chroma.b) > 0.05)
                 ++count[NR_C_COLOUR];
@@ -286,24 +321,12 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             const float weight = dot(p, kLuma);
             global[NR_G_WEIGHT] += weight;
             global[NR_G_GAIN] += weight * clamp(change, -2.0, 2.0);
-            // The chroma of a pixel greyness weighs is within its own +-log2 of (smallest / largest), so weight times
-            // chroma stays under 1 (the spread pass sums its squares and products).
-            const float grey = Greyness(p, o);
-            if (grey > 0.0)
-            {
-                const float2 tint = Tint(p, o);
-                const float2 c = GreyChroma(p);
-                global[NR_G_GREY] += grey;
-                global[NR_G_TINT_R] += grey * tint.x;
-                global[NR_G_TINT_B] += grey * tint.y;
-                global[NR_G_CHROMA_R] += grey * c.x;
-                global[NR_G_CHROMA_B] += grey * c.y;
-            }
+            AddGrey(global, p, o);
             global[NR_G_IN_R] += p.r;
             global[NR_G_IN_G] += p.g;
             global[NR_G_IN_B] += p.b;
         }
-        AddToGroup(global);
+        AddToGroup(global, gi);
     }
     else if (g.mode == NR_STATS_SPREAD)
     {
@@ -347,7 +370,7 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
                 }
             }
         }
-        AddToGroup(global);
+        AddToGroup(global, gi);
     }
 
     [unroll] for (uint w = 0; w < NR_COUNTS; ++w)
@@ -376,9 +399,26 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
     }
     if (g.mode != NR_STATS_INPUT && gi < NR_GLOBALS)
     {
+        // The slots in the order of their waves' first threads, not of the waves' arrival, so that the float sum, and
+        // its rounding, is the same every run (in arrival order a frame's white balance changed by a step of the
+        // fixed point now and then, and the picture by an fp16 step).
         float sum = 0.0;
-        for (uint w = 0; w < sWaves; ++w)
-            sum += sWave[gi * kMaxWaves + w];
+        int previous = -1;
+        for (uint r = 0; r < sWaves; ++r)
+        {
+            uint next = 0;
+            uint smallest = 0xFFFFFFFF;
+            for (uint w = 0; w < sWaves; ++w)
+            {
+                if (int(sWaveKey[w]) > previous && sWaveKey[w] < smallest)
+                {
+                    smallest = sWaveKey[w];
+                    next = w;
+                }
+            }
+            sum += sWave[gi * kMaxWaves + next];
+            previous = int(smallest);
+        }
         const int fixed = int(round(sum * NR_G_SCALE));
         if (fixed != 0)
             gStats.InterlockedAdd((NR_S_GLOBAL + gi) * 4, uint(fixed));

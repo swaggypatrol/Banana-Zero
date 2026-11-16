@@ -2463,7 +2463,10 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const View modelV = { g_nr.modelOutput.resource, g_nr.modelOutput.format };
     const View depthV = { f.depth, depthView };
     const Buffer* const statsBuffer = stats ? &g_nr.stats : nullptr;
-    const Buffer* const castBuffer = cast ? &g_nr.cast : nullptr;
+    // The composite's white balance sums: on a statistics frame the gain and spread passes' (the same words), else the
+    // cast pass's own buffer.
+    const bool castPass = cast && !stats;
+    const Buffer* const castBuffer = !cast ? nullptr : stats ? &g_nr.stats : &g_nr.cast;
     WriteTable(encodeTable, { frameView, none, none, exposureV, none, none, none }, proxyV, statsBuffer);
     if (stats)
         WriteTable(gainTable, { none, modelV, proxyV, none, none, none, none }, none, statsBuffer);
@@ -2683,11 +2686,13 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         count = 0;
         Transition(&barriers[count++], f.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (cast)
+        if (castPass)
             Transition(&barriers[count++], g_nr.cast.resource, D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (stats && cast)
+            UavBarrier(&barriers[count++], g_nr.stats.resource);
         list->ResourceBarrier(count, barriers);
-        if (cast)
+        if (castPass)
         {
             // This frame's sums, emptied first, then the spread around their means, then read by the composite (u1
             // of its table).
@@ -2715,7 +2720,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         constants.badgeSize = LogClock() < g_nr.badgeUntil ? g_nr.badgeSize : 0;
         Dispatch(list, g_nr.pipeline, compositeTable, constants, groupsX, groupsY);
         constants.badgeSize = 0;
-        if (cast)
+        if (castPass)
         {
             Transition(&barriers[0], g_nr.cast.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                        D3D12_RESOURCE_STATE_COMMON);

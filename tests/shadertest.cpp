@@ -1695,36 +1695,51 @@ void CheckCast(Scene& s, const Setup& base)
     });
     const std::vector<uint8_t> modelBytes = Encode(model);
 
+    // The composite after the cast pass (NR_STATS_CAST), or, on a frame with statistics, after the gain pass, whose
+    // buffer it reads instead: the same white balance sums, so the same picture.
     const UINT64 bytes = NR_S_WORDS * 4;
-    ID3D12Resource* cast = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
-    Reset(s, u);
-    RecordEncode(s, u);
-    Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(cast, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT }, { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT },
-                                 ExposureView(s, u), OutputView(s), cast, bytes);
-    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CLEAR), 1, 1);
-    UavBarrier(cast);
-    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CAST), Groups(s.width, 32), Groups(s.height, 32));
-    UavBarrier(cast);
-    Dispatch(g.stats, table, Constants(s, u, NR_STATS_SPREAD), Groups(s.width, 32), Groups(s.height, 32));
-    UavBarrier(cast);
-    Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
-    Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const std::vector<uint32_t> w = ReadBuffer(cast, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    cast->Release();
+    auto composite = [&](unsigned firstPass, std::vector<uint32_t>* words) {
+        ID3D12Resource* sums = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+        Reset(s, u);
+        RecordEncode(s, u);
+        Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(sums, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                     { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT }, ExposureView(s, u), OutputView(s), sums,
+                                     bytes);
+        Dispatch(g.stats, table, Constants(s, u, NR_STATS_CLEAR), 1, 1);
+        UavBarrier(sums);
+        Dispatch(g.stats, table, Constants(s, u, firstPass), Groups(s.width, 32), Groups(s.height, 32));
+        UavBarrier(sums);
+        Dispatch(g.stats, table, Constants(s, u, NR_STATS_SPREAD), Groups(s.width, 32), Groups(s.height, 32));
+        UavBarrier(sums);
+        Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
+        Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        *words = ReadBuffer(sums, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        sums->Release();
+        return output;
+    };
+    std::vector<uint32_t> w, statsWords;
+    const std::vector<uint8_t> output = composite(NR_STATS_CAST, &w);
+    const std::vector<uint8_t> statsOutput = composite(NR_STATS_GAIN, &statsWords);
 
     // The pass's sums are the statistics' (checked against the CPU there), with no histogram or count beside them, and
     // the white balance they give is the model's.
     const CpuStats e = ExpectedStats(s, u, proxy, model);
     int32_t sum[NR_GLOBALS];
     bool sumsRight = true;
+    bool sameAsStats = output == statsOutput;
     for (unsigned i = 0; i < NR_GLOBALS; ++i)
     {
         sum[i] = int32_t(w[NR_S_GLOBAL + i]);
-        sumsRight = sumsRight && std::fabs(double(sum[i]) / NR_G_SCALE - e.global[i]) <= 0.5 + 1.0e-4 * std::fabs(e.global[i]);
+        // The cast pass sums only what the white balance takes; the rest of its words stay 0.
+        const bool wanted = i == NR_G_GREY || i == NR_G_TINT_R || i == NR_G_TINT_B || i == NR_G_CHROMA_R ||
+                            i == NR_G_CHROMA_B || i >= NR_G_RR;
+        const double want = wanted ? e.global[i] : 0.0;
+        sumsRight = sumsRight && std::fabs(double(sum[i]) / NR_G_SCALE - want) <= 0.5 + 1.0e-4 * std::fabs(want);
+        sameAsStats = sameAsStats && (!wanted || w[NR_S_GLOBAL + i] == statsWords[NR_S_GLOBAL + i]);
     }
     bool nothingElse = true;
     for (unsigned i = NR_S_TAG_FIRST + 1; i < NR_S_GLOBAL; ++i)
@@ -1741,12 +1756,13 @@ void CheckCast(Scene& s, const Setup& base)
     double fitR = 0.0, fitB = 0.0;
     const double groups = double(Groups(s.width, 32)) * double(Groups(s.height, 32));
     ref::CastTint(sums, prior, 0.5 * groups / sums[NR_G_GREY], &fitR, &fitB);
-    const double gain = double(sum[NR_G_GAIN]) / double(sum[NR_G_WEIGHT]);
     Check(sumsRight && nothingElse && std::fabs(tintR - std::log2(1.08 / 1.02)) < 0.003 &&
               std::fabs(tintB - std::log2(0.88 / 1.02)) < 0.003,
           "cast, %s: the cast pass's sums as the CPU's, and nothing else written; the model's white balance R/G x%.4f "
-          "B/G x%.4f (made x%.4f, x%.4f), brightness %+.4f EV",
-          s.format->name, std::exp2(tintR), std::exp2(tintB), 1.08 / 1.02, 0.88 / 1.02, gain);
+          "B/G x%.4f (made x%.4f, x%.4f)",
+          s.format->name, std::exp2(tintR), std::exp2(tintB), 1.08 / 1.02, 0.88 / 1.02);
+    Check(sameAsStats, "cast, %s: a frame with statistics, its composite reading the gain pass's sums, has the same "
+          "white balance words and the same picture", s.format->name);
 
     // Each changed pixel: that much of the white balance divided out of its colour, then the composite as ever.
     const float white = WhiteOf(u);
