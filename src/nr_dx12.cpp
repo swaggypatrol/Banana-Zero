@@ -2945,9 +2945,11 @@ void LogSample(const Sample& sample)
         add("; ModelScale: model input %ux%u", info.modelWidth, info.modelHeight);
     if (info.modelRan)
     {
-        // The frame as a whole (NR_S_GLOBAL): the model's white balance, measured on the greyish parts of its picture,
-        // and what it turns a grey into at DetailStrength x ColourStrength; its brightness change, weighted by
-        // luminance; then what of them is kept.
+        // The frame as a whole (NR_S_GLOBAL): the model's white balance, fitted on the greyish parts of its picture as
+        // nr.hlsl's CastTint does (with the greyish pixels' mean tint beside it, which their changes of saturation pull
+        // away from it), and what it turns a grey into at DetailStrength x ColourStrength; its brightness change,
+        // weighted by luminance; then a prediction of a grey below the shoulder after the composite, from those
+        // numbers alone: no pixel of the result is looked at (tools/nrloop.py measures the result itself).
         double global[NR_GLOBALS];
         for (unsigned i = 0; i < NR_GLOBALS; ++i)
             global[i] = double(int32_t(w[NR_S_GLOBAL + i])) / NR_G_SCALE;
@@ -2956,8 +2958,24 @@ void LogSample(const Sample& sample)
         {
             const double k = double(info.detail) * double(info.colour);
             const double grey = global[NR_G_GREY];
-            const double tr = grey > 0.0 ? global[NR_G_TINT_R] / grey : 0.0;
-            const double tb = grey > 0.0 ? global[NR_G_TINT_B] / grey : 0.0;
+            const double meanR = grey > 0.0 ? global[NR_G_TINT_R] / grey : 0.0;
+            const double meanB = grey > 0.0 ? global[NR_G_TINT_B] / grey : 0.0;
+            // CastTint's intercept in means and covariances, before its shrink.
+            double tr = meanR, tb = meanB;
+            if (grey > 0.0)
+            {
+                const double cr = global[NR_G_CHROMA_R] / grey, cb = global[NR_G_CHROMA_B] / grey;
+                const double ridge = NR_GREY_SPREAD * NR_GREY_SPREAD;
+                const double rr = global[NR_G_RR] / grey - cr * cr + ridge, rb = global[NR_G_RB] / grey - cr * cb;
+                const double bb = global[NR_G_BB] / grey - cb * cb + ridge;
+                const double det = rr * bb - rb * rb;
+                if (det > 0.0)
+                {
+                    const double mr = (bb * cr - rb * cb) / det, mb = (rr * cb - rb * cr) / det;
+                    tr -= mr * (global[NR_G_R_TINT_R] / grey - cr * meanR) + mb * (global[NR_G_B_TINT_R] / grey - cb * meanR);
+                    tb -= mr * (global[NR_G_R_TINT_B] / grey - cr * meanB) + mb * (global[NR_G_B_TINT_B] / grey - cb * meanB);
+                }
+            }
             // What TakeCastOff divides out: 1 - GlobalColour of it, less where little grey was found (NR_GREY_PRIOR).
             const double found = grey > 0.0 ? grey / (grey + NR_GREY_PRIOR * double(c[NR_C_GAIN_PIXELS])) : 0.0;
             const double taken = (1.0 - double(info.globalColour)) * found;
@@ -2974,12 +2992,12 @@ void LogSample(const Sample& sample)
             shown(1.0 - taken, tr, tb, &keptRg, &keptBg);
             const double brightness = double(info.detail) * global[NR_G_GAIN] / weight;
             add("; frame: input R/G %.4f B/G %.4f; the model's cast at DetailStrength x ColourStrength %.2f: grey R/G "
-                "x%.4f B/G x%.4f (white balance R/G x%.4f B/G x%.4f, measured on %.1f%% of its picture in greys); its "
-                "mean brightness change %+.3f EV; kept (GlobalColour %.2f, %.0f%% of the white balance taken off): grey "
-                "R/G x%.4f B/G x%.4f",
+                "x%.4f B/G x%.4f (white balance R/G x%.4f B/G x%.4f, fitted on %.1f%% of its picture in greys, whose "
+                "mean tint is R/G x%.4f B/G x%.4f); its mean brightness change %+.3f EV; predicted after the composite "
+                "(GlobalColour %.2f, %.0f%% of the white balance taken off): grey R/G x%.4f B/G x%.4f",
                 global[NR_G_IN_R] / global[NR_G_IN_G], global[NR_G_IN_B] / global[NR_G_IN_G], k, rg, bg, std::exp2(tr),
-                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), brightness, double(info.globalColour),
-                100.0 * taken, keptRg, keptBg);
+                std::exp2(tb), Share(uint32_t(grey), c[NR_C_GAIN_PIXELS]), std::exp2(meanR), std::exp2(meanB),
+                brightness, double(info.globalColour), 100.0 * taken, keptRg, keptBg);
         }
     }
     Log("%s", line);

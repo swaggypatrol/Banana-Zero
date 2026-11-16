@@ -119,7 +119,7 @@ float3 ChromaFromRedBlue(float r, float b) { return float3(r, -(kLuma.r * r + kL
 // picture. How much a pixel counts: (its smallest channel over its largest)^2 in the proxy, below the shoulder, with
 // every channel of both pictures above 1/1024 (the near black's colour is noise, a compressed highlight's is the
 // encode's); 0 elsewhere. Its tint there: the model's gain on red and on blue over its gain on green, in EV, held to
-// +-2.
+// +-2. The white balance is then fitted from these (nr.hlsl's CastTint).
 static const float kTintFloor = 1.0 / 1024.0;
 float Greyness(float3 p, float3 o)
 {
@@ -134,6 +134,10 @@ float2 Tint(float3 p, float3 o)
 {
     return clamp(float2(log2((o.r * p.g) / (p.r * o.g)), log2((o.b * p.g) / (p.b * o.g))), -2.0, 2.0);
 }
+// A greyish pixel's own chroma in the proxy, log2 of red over green and of blue over green: what the fit of the tint
+// (nr.hlsl's CastTint) tells a change of saturation from white balance by. Only where Greyness counts it, so every
+// channel is above kTintFloor.
+float2 GreyChroma(float3 p) { return float2(log2(p.r / p.g), log2(p.b / p.g)); }
 
 // ModelScale (NR_FLAG_SCALED): the model works on a smaller copy of the frame, and the fit and the composite bring its
 // change back to the frame's size along a guide: the log2 luminance of the model's input in linear light, with the
