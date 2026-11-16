@@ -82,6 +82,10 @@ constexpr double kPreviewHold = 0.5;          // seconds the preview is kept aft
 // statistics come when they are due, apart from these.
 constexpr double kPreviewSeconds = 1.0 / 30.0;
 constexpr double kPanelStatsSeconds = 0.1;
+
+// Whether `seconds` have passed since `last`, a quarter of them early: frames do not come exactly on time, and at 60 fps
+// a 1/30 s interval due on the dot would fall to every third frame whenever one came a little early.
+bool Due(double now, double last, double seconds) { return now - last >= 0.75 * seconds; }
 constexpr unsigned kTimestamps = 4;           // per frame: the pass begins, the model begins, the model ends, the
                                               // pass ends
 constexpr unsigned kTimingSamples = 16;       // the menu and the log get the median of the last this many
@@ -2506,7 +2510,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     // the preview picture when it is due (kPreviewSeconds, kPanelStatsSeconds).
     const double now = LogClock();
     const bool logStats = g_nr.statsWanted.load(std::memory_order_relaxed);
-    const bool panelStats = previewing && now - g_nr.panelStatsAt >= kPanelStatsSeconds;
+    const bool panelStats = previewing && Due(now, g_nr.panelStatsAt, kPanelStatsSeconds);
     const bool stats = !g_nr.statsPending && (logStats || panelStats) && EnsureStats();
     if (stats && logStats)
         g_nr.statsWanted.store(false, std::memory_order_relaxed);
@@ -2516,7 +2520,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     const bool dumpDue = g_nr.dumpState.load(std::memory_order_acquire) == kDumpIdle &&
                          g_nr.dumpWanted.load(std::memory_order_relaxed) && EnsureDump(f);
     const DumpLayout layout = dumpDue ? Layout(f.width, f.height) : DumpLayout {};
-    const bool preview = previewing && (now - g_nr.previewAt >= kPreviewSeconds || previewKind != g_nr.previewKind) &&
+    const bool preview = previewing && (Due(now, g_nr.previewAt, kPreviewSeconds) || previewKind != g_nr.previewKind) &&
                          EnsurePreview(f);
 
     // What the game's depth adds: the motion vectors dilated by it (DilateMotion), the control mask that sets the sky
