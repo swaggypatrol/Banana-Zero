@@ -150,16 +150,41 @@ float3 ApplyChange(float3 frame, float change, float3 chroma, float white, bool 
 }
 
 // GlobalColour (NR_FLAG_CAST): the model's white balance, measured on this frame by the cast pass (nr_stats.hlsl) as a
-// gain per channel on the greyish parts of its picture (Greyness, Tint), castColour of it divided out of the model's
-// colour at this pixel, whose light in the model's input is `light`. So greys stay grey, a white-balance cast comes
-// off every pixel exactly, a saturated colour loses only its own share of it (a red light has no blue to lose), and
-// what the model changes here against there stays. In Forza Horizon 6 the model's white balance moves a grey's B/G by
-// several per cent within seconds as the scene changes. The model can white-balance only what its output has room
+// gain per channel on the greyish parts of its picture (Greyness, Tint, CastTint), castColour of it divided out of the
+// model's colour at this pixel, whose light in the model's input is `light`. So greys stay grey, a white-balance cast
+// comes off every pixel exactly, a saturated colour loses only its own share of it (a red light has no blue to lose),
+// and what the model changes here against there stays. In Forza Horizon 6 the model's white balance moves a grey's B/G
+// by several per cent within seconds as the scene changes. The model can white-balance only what its output has room
 // for, so the share divided out fades from all of it below the shoulder to none where the model's input is at its top
-// (a white highlight it left white keeps its colour). And a white balance measured on little grey is mostly left
-// alone: NR_GREY_PRIOR of the picture counts as grey that is untinted, so a loading screen with 0.1% of grey loses a
-// fifth of it, a road with 18% nearly all.
+// (a white highlight it left white keeps its colour).
 float CastSum(uint i) { return float(asint(gDump.Load((NR_S_GLOBAL + i) * 4))); }
+
+// The white balance from the cast pass's sums, R and B over G in EV: the intercept b of the tint as a linear function
+// of the greyish pixel's own chroma c (GreyChroma), tint = b + A c, by least squares weighted by greyness. The model
+// changes saturation too, and a near-grey colour shows that as a tint of its own (a warm-lit near-grey loses some of
+// its warmth, which reads as blue): the mean tint over the greyish pixels mixes the two, and swung the greys' colour
+// from frame to frame more than no correction at all (Quake II RTX through tools/nrloop.py); the intercept is the tint
+// of a grey. A ridge of NR_GREY_SPREAD^2 on A: greyish pixels with little spread of chroma give no slope, and b is
+// then their mean tint. In means: b = mean t - (Cov(c) + spread^2)^-1 Cov(c, t) . mean c. Then shrunk as a white
+// balance measured on little grey should be: NR_GREY_PRIOR of the picture counts as grey that is untinted, so a
+// loading screen with 0.1% of grey loses a fifth of it, a road with 18% nearly all. `grey` is the weights' sum, above
+// 0; `prior` the prior's, in the same units.
+float2 CastTint(float grey, float prior)
+{
+    const float2 c = float2(CastSum(NR_G_CHROMA_R), CastSum(NR_G_CHROMA_B)) / grey;
+    const float2 t = float2(CastSum(NR_G_TINT_R), CastSum(NR_G_TINT_B)) / grey;
+    const float ridge = NR_GREY_SPREAD * NR_GREY_SPREAD;
+    const float rr = CastSum(NR_G_RR) / grey - c.x * c.x + ridge;
+    const float rb = CastSum(NR_G_RB) / grey - c.x * c.y;
+    const float bb = CastSum(NR_G_BB) / grey - c.y * c.y + ridge;
+    // Cov(c, t), one column per tint: R, then B.
+    const float2 ctR = float2(CastSum(NR_G_R_TINT_R), CastSum(NR_G_B_TINT_R)) / grey - c * t.x;
+    const float2 ctB = float2(CastSum(NR_G_R_TINT_B), CastSum(NR_G_B_TINT_B)) / grey - c * t.y;
+    // (Cov + ridge)^-1 mean c: symmetric, so its product with Cov(c, t) gives the slope's share of b.
+    const float det = rr * bb - rb * rb;
+    const float2 m = det > 0.0 ? float2(bb * c.x - rb * c.y, rr * c.y - rb * c.x) / det : float2(0.0, 0.0);
+    return (t - float2(dot(m, ctR), dot(m, ctB))) * (grey / (grey + prior));
+}
 
 void TakeCastOff(inout float3 chroma, float3 light)
 {
@@ -171,7 +196,7 @@ void TakeCastOff(inout float3 chroma, float3 light)
         return;
     const float prior = float(NR_GREY_PRIOR * NR_G_SCALE) * float(g.modelWidth) * float(g.modelHeight);
     const float room = saturate((1.0 - Max3(light)) / (1.0 - g.shoulder));
-    const float2 tint = g.castColour * room * float2(CastSum(NR_G_TINT_R), CastSum(NR_G_TINT_B)) / (grey + prior);
+    const float2 tint = g.castColour * room * CastTint(grey, prior);
     const float3 own = light / luminance;
     const float3 c = (own + chroma) * float3(exp2(-tint.x), 1.0, exp2(-tint.y));
     const float y = dot(c, kLuma);

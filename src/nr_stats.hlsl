@@ -233,7 +233,9 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
     {
         // The cast pass is this one with its sums alone: no histogram, no counts.
         const bool histogram = g.mode == NR_STATS_GAIN;
-        float global[NR_GLOBALS] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+        float global[NR_GLOBALS];
+        [unroll] for (uint z = 0; z < NR_GLOBALS; ++z)
+            global[z] = 0.0;
         [unroll] for (uint n = 0; n < 4; ++n)
         {
             const uint2 q = id.xy * 2 + uint2(n & 1, n >> 1);
@@ -263,13 +265,25 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             const float weight = dot(p, kLuma);
             global[NR_G_WEIGHT] += weight;
             global[NR_G_GAIN] += weight * clamp(change, -2.0, 2.0);
+            // The fit's sums (nr.hlsl's CastTint): the chroma of a pixel greyness weighs is within its own +-log2 of
+            // (smallest / largest), so that weight times chroma, its square, or its product with the tint stays under 1.
             const float grey = Greyness(p, o);
             if (grey > 0.0)
             {
                 const float2 tint = Tint(p, o);
+                const float2 c = GreyChroma(p);
                 global[NR_G_GREY] += grey;
                 global[NR_G_TINT_R] += grey * tint.x;
                 global[NR_G_TINT_B] += grey * tint.y;
+                global[NR_G_CHROMA_R] += grey * c.x;
+                global[NR_G_CHROMA_B] += grey * c.y;
+                global[NR_G_RR] += grey * c.x * c.x;
+                global[NR_G_RB] += grey * c.x * c.y;
+                global[NR_G_BB] += grey * c.y * c.y;
+                global[NR_G_R_TINT_R] += grey * c.x * tint.x;
+                global[NR_G_B_TINT_R] += grey * c.y * tint.x;
+                global[NR_G_R_TINT_B] += grey * c.x * tint.y;
+                global[NR_G_B_TINT_B] += grey * c.y * tint.y;
             }
             global[NR_G_IN_R] += p.r;
             global[NR_G_IN_G] += p.g;

@@ -197,11 +197,26 @@ static_assert(sizeof(NrConstants) == 160, "NrConstants is passed as root constan
 #define NR_G_IN_R 5     // the proxy's linear red, green and blue, unweighted: the colour of the model's input
 #define NR_G_IN_G 6
 #define NR_G_IN_B 7
-#define NR_GLOBALS 8
+// For the white balance as the intercept of a fit of the tint to the greyish pixel's own chroma (nr.hlsl's CastTint):
+// the greyness weights times its log2 red over green and blue over green in the proxy (its chroma), their squares and
+// product, and the chroma times the tint.
+#define NR_G_CHROMA_R 8
+#define NR_G_CHROMA_B 9
+#define NR_G_RR 10      // chroma R squared
+#define NR_G_RB 11      // chroma R times chroma B
+#define NR_G_BB 12      // chroma B squared
+#define NR_G_R_TINT_R 13 // chroma R times tint R
+#define NR_G_B_TINT_R 14 // chroma B times tint R
+#define NR_G_R_TINT_B 15 // chroma R times tint B
+#define NR_G_B_TINT_B 16 // chroma B times tint B
+#define NR_GLOBALS 17
 #define NR_G_SCALE 64.0
 // The grey taken for granted as untinted when the white balance is divided out (nr.hlsl's TakeCastOff), as a share of
 // the model's picture.
 #define NR_GREY_PRIOR (1.0 / 256.0)
+// The fit's ridge (nr.hlsl's CastTint), as a spread of chroma in EV: greyish pixels whose chroma spreads much less
+// than this give no slope to fit, and the white balance is then their mean tint.
+#define NR_GREY_SPREAD 0.1
 #define NR_S_TAG_LAST (NR_S_GLOBAL + NR_GLOBALS)       // frame + 1 again
 #define NR_S_WORDS (NR_S_TAG_LAST + 1)
 
