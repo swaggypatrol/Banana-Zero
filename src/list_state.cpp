@@ -233,28 +233,34 @@ void SetArg(ID3D12GraphicsCommandList* list, UINT parameter, ArgKind kind, uint6
     s->args[parameter] = { kind, value };
 }
 
-void SetConstant(ListState* s, UINT parameter, UINT offset, uint32_t value)
+// Root constants `offset` to `offset + count` of `parameter` set to `values`. The noted constants are kept in order of
+// parameter, then offset, so a range is merged in one pass and the restore sets each run of them in one call.
+void SetConstants(ListState* s, UINT parameter, UINT offset, UINT count, const uint32_t* values)
 {
-    if (parameter >= kListStateArgs || offset >= kListStateConstants)
+    if (parameter >= kListStateArgs || offset >= kListStateConstants || count > kListStateConstants - offset)
     {
         Unknown(s, &g_saidOverflow, "a root constant beyond 64 was set");
         return;
     }
-    for (unsigned i = 0; i < s->constantCount; ++i)
-    {
-        ListStateConstant& c = s->constants[i];
-        if (c.parameter == parameter && c.offset == offset)
-        {
-            c.value = value;
-            return;
-        }
-    }
-    if (s->constantCount == kListStateConstants)
+    auto key = [](unsigned p, unsigned o) { return p * kListStateConstants + o; };
+    const unsigned first = key(parameter, offset), end = first + count;
+    ListStateConstant merged[kListStateConstants];
+    unsigned m = 0, i = 0;
+    while (i < s->constantCount && key(s->constants[i].parameter, s->constants[i].offset) < first)
+        merged[m++] = s->constants[i++];
+    while (i < s->constantCount && key(s->constants[i].parameter, s->constants[i].offset) < end)
+        ++i; // replaced
+    if (m + count + (s->constantCount - i) > kListStateConstants)
     {
         Unknown(s, &g_saidOverflow, "more than 64 root constants were set");
         return;
     }
-    s->constants[s->constantCount++] = { uint8_t(parameter), uint8_t(offset), value };
+    for (UINT k = 0; k < count; ++k)
+        merged[m++] = { uint8_t(parameter), uint8_t(offset + k), values[k] };
+    while (i < s->constantCount)
+        merged[m++] = s->constants[i++];
+    memcpy(s->constants, merged, m * sizeof merged[0]);
+    s->constantCount = m;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -386,7 +392,7 @@ void STDMETHODCALLTYPE HookSetComputeRoot32BitConstant(ID3D12GraphicsCommandList
 {
     typedef void(STDMETHODCALLTYPE * Fn)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
     if (ListState* s = StateOf(list, true))
-        SetConstant(s, parameter, offset, value);
+        SetConstants(s, parameter, offset, 1, &value);
     Original<Fn, kSetComputeRoot32BitConstant>(list)(list, parameter, value, offset);
 }
 
@@ -400,11 +406,9 @@ void STDMETHODCALLTYPE HookSetComputeRoot32BitConstants(ID3D12GraphicsCommandLis
         {
             Unknown(s, &g_saidBadConstants, "SetComputeRoot32BitConstants was given no values");
         }
-        else
+        else if (count != 0)
         {
-            const uint32_t* dwords = static_cast<const uint32_t*>(values);
-            for (UINT i = 0; i < count && s->known; ++i)
-                SetConstant(s, parameter, offset + i, dwords[i]);
+            SetConstants(s, parameter, offset, count, static_cast<const uint32_t*>(values));
         }
     }
     Original<Fn, kSetComputeRoot32BitConstants>(list)(list, parameter, count, values, offset);
@@ -794,10 +798,20 @@ void ListStateRestore(ID3D12GraphicsCommandList* list, const ListState& state)
             default: break;
             }
         }
-        for (unsigned i = 0; i < state.constantCount; ++i)
+        // Each run of constants at consecutive offsets of one parameter in one call (they are noted in that order).
+        uint32_t values[kListStateConstants];
+        for (unsigned i = 0; i < state.constantCount;)
         {
             const ListStateConstant& c = state.constants[i];
-            list->SetComputeRoot32BitConstant(c.parameter, c.value, c.offset);
+            unsigned n = 0;
+            while (i + n < state.constantCount && state.constants[i + n].parameter == c.parameter &&
+                   state.constants[i + n].offset == c.offset + n)
+            {
+                values[n] = state.constants[i + n].value;
+                ++n;
+            }
+            list->SetComputeRoot32BitConstants(c.parameter, n, values, c.offset);
+            i += n;
         }
     }
     if (state.pipeline != nullptr)

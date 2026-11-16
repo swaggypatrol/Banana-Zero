@@ -2096,13 +2096,31 @@ void WriteTable(unsigned table, const View (&srvs)[kSrvs], View target, const Bu
     WriteTextureUav(table + kUav2, nullptr, DXGI_FORMAT_UNKNOWN);
 }
 
+// What our passes have bound on the list Run records into: a run of them sets the descriptor heap and the root
+// signature once, and the pipeline only when it changes. Run forgets it at its start and after the model's
+// evaluation, which binds its own; nothing else binds on the list in between.
+struct Bound
+{
+    ID3D12GraphicsCommandList* list;
+    ID3D12PipelineState* pipeline;
+};
+Bound g_bound;
+
 void Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline, unsigned table,
               const NrConstants& constants, unsigned groupsX, unsigned groupsY)
 {
-    ID3D12DescriptorHeap* heaps[] = { g_nr.heap };
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRootSignature(g_nr.rootSignature);
-    list->SetPipelineState(pipeline);
+    if (g_bound.list != list)
+    {
+        ID3D12DescriptorHeap* heaps[] = { g_nr.heap };
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootSignature(g_nr.rootSignature);
+        g_bound = { list, nullptr };
+    }
+    if (g_bound.pipeline != pipeline)
+    {
+        list->SetPipelineState(pipeline);
+        g_bound.pipeline = pipeline;
+    }
     list->SetComputeRoot32BitConstants(0, NR_CONSTANTS_DWORDS, &constants, 0);
     list->SetComputeRootDescriptorTable(1, GpuHandle(table));
     list->Dispatch(groupsX, groupsY, 1);
@@ -2357,6 +2375,7 @@ __declspec(noinline) void LogModelRecovered(uint64_t failures)
 void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, unsigned feature, bool previewing)
 {
     const uint64_t frameIndex = g_nr.frame++;
+    g_bound = {};
     g_nr.ringRecording[frameIndex % kRing] = g_nr.recordings;
     const unsigned base = unsigned(frameIndex % kRing) * kDescriptorsPerFrame;
     const unsigned encodeTable = base;
@@ -2638,6 +2657,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     if (timing)
         list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 1);
     const int result = g_nr.bridge.evaluate(list, g_nr.handle, g_nr.evalParams, nullptr);
+    g_bound = {}; // the model bound its own
     if (timing)
         list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 2);
     const bool delivered = result == NVSDK_NGX_Result_Success;

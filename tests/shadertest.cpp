@@ -3446,6 +3446,74 @@ void STDMETHODCALLTYPE SpyTable(ID3D12GraphicsCommandList* list, UINT parameter,
         g_spyTable)(list, parameter, table);
 }
 
+// Spies for the restore's root constants: what it sets, in which calls. They do not pass the calls on.
+struct SpyConstantsCall
+{
+    UINT parameter;
+    UINT offset;
+    UINT count; // 0: SetComputeRoot32BitConstant, one value
+    uint32_t values[4];
+};
+std::vector<SpyConstantsCall> g_spyConstants;
+
+void STDMETHODCALLTYPE SpyConstant(ID3D12GraphicsCommandList*, UINT parameter, UINT value, UINT offset)
+{
+    g_spyConstants.push_back({ parameter, offset, 0, { value } });
+}
+
+void STDMETHODCALLTYPE SpyConstants(ID3D12GraphicsCommandList*, UINT parameter, UINT count, const void* values, UINT offset)
+{
+    SpyConstantsCall c = { parameter, offset, count, {} };
+    memcpy(c.values, values, std::min(count, 4u) * 4);
+    g_spyConstants.push_back(c);
+}
+
+// Root constants (src/list_state.cpp's SetConstants): a range over constants set before replaces them, a constant
+// inside a range replaces it alone, all kept in order; and the restore sets each run at consecutive offsets of one
+// parameter in one call. `list` is followed, known and empty.
+void CheckConstants(ID3D12GraphicsCommandList* list, ID3D12RootSignature* gameRoot)
+{
+    list->SetComputeRootSignature(gameRoot);
+    const uint32_t four[] = { 1, 2, 3, 4 };
+    const uint32_t two[] = { 30, 40 };
+    list->SetComputeRoot32BitConstants(0, 4, four, 0);
+    list->SetComputeRoot32BitConstants(0, 2, two, 2);
+    list->SetComputeRoot32BitConstant(0, 20, 1);
+    ListState s = {};
+    const uint32_t want[] = { 1, 20, 30, 40 };
+    bool right = ListStateCapture(list, &s) && s.constantCount == 4;
+    for (unsigned i = 0; right && i < 4; ++i)
+        right = s.constants[i].parameter == 0 && s.constants[i].offset == i && s.constants[i].value == want[i];
+    Check(right, "list state: constants over constants set before replace them, one inside a range replaces it alone");
+
+    ListState runs = {};
+    runs.known = true;
+    runs.computeRoot = gameRoot;
+    const ListStateConstant noted[] = { { 0, 0, 5 }, { 0, 1, 6 }, { 0, 3, 7 }, { 2, 0, 8 }, { 2, 1, 9 } };
+    memcpy(runs.constants, noted, sizeof noted);
+    runs.constantCount = 5;
+    constexpr unsigned kConstant = 33, kConstants = 35; // ID3D12GraphicsCommandList's table
+    void** const table0 = *reinterpret_cast<void***>(list);
+    void** const spied = CopyTable(table0);
+    spied[kConstant] = reinterpret_cast<void*>(&SpyConstant);
+    spied[kConstants] = reinterpret_cast<void*>(&SpyConstants);
+    g_spyConstants.clear();
+    *reinterpret_cast<void***>(list) = spied;
+    ListStateRestore(list, runs);
+    *reinterpret_cast<void***>(list) = table0;
+    const SpyConstantsCall expected[] = { { 0, 0, 2, { 5, 6 } }, { 0, 3, 1, { 7 } }, { 2, 0, 2, { 8, 9 } } };
+    bool calls = g_spyConstants.size() == 3;
+    for (size_t i = 0; calls && i < 3; ++i)
+    {
+        const SpyConstantsCall& a = g_spyConstants[i];
+        const SpyConstantsCall& b = expected[i];
+        calls = a.parameter == b.parameter && a.offset == b.offset && a.count == b.count &&
+                memcmp(a.values, b.values, b.count * 4) == 0;
+    }
+    Check(calls, "list state: the restore sets constants 0:0-1, 0:3 and 2:0-1 in three calls (%zu made)",
+          g_spyConstants.size());
+}
+
 // The game's graphics descriptor tables across the NR pass: the pass changes the descriptor heaps, which leaves every
 // table undefined, so the restore must set them again, after the heaps. `list` is followed and known (reset since).
 void CheckGraphicsTables(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* const* gameHeaps,
@@ -3590,6 +3658,8 @@ void TestListState()
     Check(ListStateCapture(g.list, &s) && Empty(s, g.nr), "list state: nothing but ClearState's pipeline after it");
     Submit();
     Check(ListStateCapture(g.list, &s) && Empty(s, nullptr), "list state: nothing bound after the next Reset");
+    CheckConstants(g.list, gameRoot);
+    Submit();
 
     ID3D12CommandAllocator* otherAllocator = nullptr;
     Must(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&otherAllocator)),
