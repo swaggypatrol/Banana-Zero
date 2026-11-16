@@ -3230,7 +3230,7 @@ DWORD WINAPI Worker(void*)
     {
         Sleep(250);
         SettingsReloadIfChanged();
-        const Settings* s = SettingsCurrent();
+        const Settings s = SettingsCurrent();
         const double now = LogClock();
 
         if (g_sampleState.load(std::memory_order_acquire) == 1)
@@ -3238,12 +3238,12 @@ DWORD WINAPI Worker(void*)
             LogSample(g_sample);
             g_sampleState.store(0, std::memory_order_release);
         }
-        if (s->statsSeconds > 0.0f)
+        if (s.statsSeconds > 0.0f)
         {
             if (now >= nextStats)
             {
                 g_nr.statsWanted.store(true, std::memory_order_relaxed);
-                nextStats = now + double(s->statsSeconds);
+                nextStats = now + double(s.statsSeconds);
             }
         }
         else
@@ -3258,15 +3258,15 @@ DWORD WINAPI Worker(void*)
             WriteDump(++dumps);
             g_nr.dumpState.store(kDumpIdle, std::memory_order_release);
         }
-        if (s->dumpSeconds > 0.0f && dumps < kMaxDumps)
+        if (s.dumpSeconds > 0.0f && dumps < kMaxDumps)
         {
             // The first a little after dumps are switched on (or NR starts), then every DumpEvery seconds.
             if (nextDump == 0.0)
-                nextDump = now + (s->dumpSeconds < 20.0f ? double(s->dumpSeconds) : 20.0);
+                nextDump = now + (s.dumpSeconds < 20.0f ? double(s.dumpSeconds) : 20.0);
             if (now >= nextDump)
             {
                 g_nr.dumpWanted.store(true, std::memory_order_relaxed);
-                nextDump = now + double(s->dumpSeconds);
+                nextDump = now + double(s.dumpSeconds);
             }
         }
         else
@@ -3360,10 +3360,10 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
             SettingsLoad(ini);
         StartWorker(); // after the first load: from here on only that thread reads the file
     }
-    const Settings* s = SettingsCurrent(); // one snapshot for the whole frame
-    g_nr.requestedPreset = ModelRequestedPreset(s->model);
+    const Settings s = SettingsCurrent(); // one snapshot for the whole frame
+    g_nr.requestedPreset = ModelRequestedPreset(s.model);
     // The preview lives only while the menu asks for it: closing the menu frees the picture.
-    const bool previewing = PreviewWanted(*s);
+    const bool previewing = PreviewWanted(s);
     if (g_nr.preview.resource != nullptr && !previewing)
         DropPreview();
     if (params == nullptr)
@@ -3386,7 +3386,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     NoteFrame(frame, source.feature);
     // NR off with nothing frozen and nothing retired waiting for a recording to land: nothing to record, so the
     // game's list is left alone (no capture, no restore, no marker).
-    if (!s->enabled && !FreezeWanted() && !FreezeActive() && g_nr.parked.empty())
+    if (!s.enabled && !FreezeWanted() && !FreezeActive() && g_nr.parked.empty())
     {
         g_nr.wasDisabled = true; // the model's history is stale by the time NR is back
         return kSkipDisabled;
@@ -3404,7 +3404,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     // The frozen frame (M3, freeze.h) goes first, NR on or off: with NR off the frozen picture still replaces the
     // game's Output, so that A/B and the split screen compare the same picture.
     FreezeApply(list, &frame);
-    if (!s->enabled)
+    if (!s.enabled)
     {
         g_nr.wasDisabled = true; // the model's history is stale by the time NR is back
         return kSkipDisabled;
@@ -3445,7 +3445,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     CollectDump();
     const ModelCreationKey active { g_nr.createdWidth, g_nr.createdHeight,
                                     ModelPresetKey(g_nr.model, g_nr.createdPreset) };
-    const ModelCreationKey requested = ModelCreateKey(g_nr.model, frame.width, frame.height, s->model);
+    const ModelCreationKey requested = ModelCreateKey(g_nr.model, frame.width, frame.height, s.model);
     if (g_nr.handle != nullptr)
     {
         const ModelRebuild plan = ModelPlanRebuild(active, requested, g_nr.evaluatesSeen - g_nr.createdAt,
@@ -3468,7 +3468,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
             DescribeFrame(frame);
         }
         *bound = true;
-        if (!CreateFeature(list, frame, s->model))
+        if (!CreateFeature(list, frame, s.model))
             return kSkipOff;
         return kSkipCreated;
     }
@@ -3483,7 +3483,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     if (g_nr.frame >= kRing && !Landed(g_nr.ringRecording[g_nr.frame % kRing]))
         return kSkipInFlight;
     *bound = true;
-    Run(list, frame, *s, source.feature, previewing);
+    Run(list, frame, s, source.feature, previewing);
     return kSkipNone;
 }
 } // namespace

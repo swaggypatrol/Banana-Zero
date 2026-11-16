@@ -6,7 +6,6 @@
 
 #include <windows.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -21,8 +20,25 @@
 
 namespace
 {
-const Settings g_defaults;
-std::atomic<const Settings*> g_current { &g_defaults };
+// The snapshot in use: copied in and out under its own lock, which guards nothing else, so a reader waits at most for
+// one copy.
+Settings g_current;
+SRWLOCK g_currentLock = SRWLOCK_INIT;
+
+Settings Current()
+{
+    AcquireSRWLockShared(&g_currentLock);
+    const Settings s = g_current;
+    ReleaseSRWLockShared(&g_currentLock);
+    return s;
+}
+
+void SetCurrent(const Settings& s)
+{
+    AcquireSRWLockExclusive(&g_currentLock);
+    g_current = s;
+    ReleaseSRWLockExclusive(&g_currentLock);
+}
 
 // The file last read and its stamp, for SettingsReloadIfChanged: the path is set by SettingsLoad, the stamp by every
 // load and by SettingsNoteWritten (the menu's thread, after its own write).
@@ -30,41 +46,9 @@ wchar_t g_path[MAX_PATH] = {};
 FILETIME g_stamp = {};
 ULONGLONG g_size = ~0ull;
 unsigned g_generation = 0;
-// Guards the path and its stamp, the generation counter and the retire list: loads run on the background thread,
-// SettingsPublish (the menu, M3) on the present thread and the render thread.
+// Guards the path and its stamp and the generation counter, and keeps a generation and its snapshot together: loads run
+// on the background thread, SettingsPublish (the menu, M3) on the present thread and the render thread.
 SRWLOCK g_publishLock = SRWLOCK_INIT;
-
-// Snapshots replaced by a reload or by the menu. An evaluation reads the pointer once and is done with it within a
-// frame, so a replaced snapshot is freed once it has been out of use for kRetireSeconds. A dragged slider publishes
-// a snapshot at every step, up to one a frame, hence the room for a few seconds of them.
-constexpr double kRetireSeconds = 5.0;
-struct Retired
-{
-    const Settings* settings = nullptr;
-    double at = 0.0;
-};
-Retired g_retired[256];
-
-void Retire(const Settings* old)
-{
-    if (old == &g_defaults || old == nullptr)
-        return;
-    const double now = LogClock();
-    Retired* slot = nullptr;
-    for (Retired& r : g_retired)
-    {
-        if (r.settings != nullptr && now - r.at > kRetireSeconds)
-        {
-            delete r.settings;
-            r = {};
-        }
-        if (r.settings == nullptr && slot == nullptr)
-            slot = &r;
-    }
-    if (slot != nullptr)
-        *slot = { old, now };
-    // All of them replaced within the last few seconds: keep the old one for ever rather than free it too soon.
-}
 
 // Reads a whole file, NUL-terminated; nullptr if it does not exist or cannot be read. Freed with delete[].
 char* ReadFileText(const wchar_t* path, size_t* size)
@@ -462,13 +446,10 @@ void SettingsDescribeModel(const ModelSettings& m, char* out, size_t size)
         Append(out, size, &length, " the model's defaults");
 }
 
-// The settings the file at `path` holds, the defaults for whatever it lacks; nullptr only without memory. Each line it
-// cannot use is logged. `found`: the file exists; `applied`, `problems`: the lines used and the lines ignored.
-Settings* ParseIni(const wchar_t* path, bool* foundOut, unsigned* appliedOut, unsigned* problemsOut)
+// The settings the file at `path` holds into `*settings` (the defaults), for whatever it has. Each line it cannot use is
+// logged. `found`: the file exists; `applied`, `problems`: the lines used and the lines ignored.
+void ParseIni(const wchar_t* path, Settings* settings, bool* foundOut, unsigned* appliedOut, unsigned* problemsOut)
 {
-    Settings* settings = new (std::nothrow) Settings;
-    if (settings == nullptr)
-        return nullptr;
 
     size_t size = 0;
     char* text = ReadFileText(path, &size);
@@ -519,22 +500,20 @@ Settings* ParseIni(const wchar_t* path, bool* foundOut, unsigned* appliedOut, un
     *foundOut = found;
     *appliedOut = applied;
     *problemsOut = problems;
-    return settings;
 }
 
 // Reads the file at `path`, whose stamp and size were `stamp` and `size` just before, and publishes what it holds as the
 // next generation, logged. With `ifChanged`, only when its values differ from those in use: a file saved again as it
 // was (or only its comments changed) leaves the generation, and so the menu's unsaved edits, alone. Either way the
-// stamp is noted. The settings published, or nullptr when none were.
-const Settings* Publish(const wchar_t* path, FILETIME stamp, ULONGLONG size, bool ifChanged)
+// stamp is noted. True, with the settings published in `*out`, when some were.
+bool Publish(const wchar_t* path, FILETIME stamp, ULONGLONG size, bool ifChanged, Settings* out)
 {
     bool found = false;
     unsigned applied = 0, problems = 0;
-    Settings* settings = ParseIni(path, &found, &applied, &problems);
-    if (settings == nullptr)
-        return nullptr;
+    Settings settings;
+    ParseIni(path, &settings, &found, &applied, &problems);
     char described[1024];
-    SettingsDescribe(*settings, described, sizeof described);
+    SettingsDescribe(settings, described, sizeof described);
 
     AcquireSRWLockExclusive(&g_publishLock);
     g_stamp = stamp;
@@ -542,28 +521,25 @@ const Settings* Publish(const wchar_t* path, FILETIME stamp, ULONGLONG size, boo
     bool publish = true;
     if (ifChanged)
     {
-        Settings same = *g_current.load(std::memory_order_acquire);
-        same.generation = settings->generation;
-        publish = !(same == *settings);
+        Settings same = Current();
+        same.generation = settings.generation;
+        publish = !(same == settings);
     }
-    unsigned generation = 0;
     if (publish)
     {
-        generation = settings->generation = ++g_generation;
-        Retire(g_current.exchange(settings, std::memory_order_acq_rel));
+        settings.generation = ++g_generation;
+        SetCurrent(settings);
     }
     ReleaseSRWLockExclusive(&g_publishLock);
     if (!publish)
-    {
-        delete settings;
-        return nullptr;
-    }
-    Log("settings%s: %s%ls (%u keys%s): %s", generation > 1 ? " reloaded" : "", found ? "" : "no file at ", path,
+        return false;
+    Log("settings%s: %s%ls (%u keys%s): %s", settings.generation > 1 ? " reloaded" : "", found ? "" : "no file at ", path,
         applied, problems != 0 ? ", some ignored, see above" : "", described);
-    return settings;
+    *out = settings;
+    return true;
 }
 
-const Settings* SettingsLoad(const wchar_t* iniPath)
+Settings SettingsLoad(const wchar_t* iniPath)
 {
     wchar_t path[MAX_PATH];
     AcquireSRWLockExclusive(&g_publishLock);
@@ -574,8 +550,8 @@ const Settings* SettingsLoad(const wchar_t* iniPath)
     FILETIME stamp = {};
     ULONGLONG size = ~0ull;
     Stat(path, &stamp, &size);
-    const Settings* settings = Publish(path, stamp, size, false);
-    return settings != nullptr ? settings : SettingsCurrent();
+    Settings settings;
+    return Publish(path, stamp, size, false, &settings) ? settings : Current();
 }
 
 bool SettingsReloadIfChanged()
@@ -602,19 +578,18 @@ bool SettingsReloadIfChanged()
     AcquireSRWLockShared(&g_publishLock);
     const bool ours = CompareFileTime(&stamp, &g_stamp) == 0 && size == g_size;
     ReleaseSRWLockShared(&g_publishLock);
-    return !ours && Publish(path, stamp, size, true) != nullptr;
+    Settings published;
+    return !ours && Publish(path, stamp, size, true, &published);
 }
 
-const Settings* SettingsCurrent() { return g_current.load(std::memory_order_acquire); }
+Settings SettingsCurrent() { return Current(); }
 
-const Settings* SettingsPublish(const Settings& settings)
+Settings SettingsPublish(const Settings& settings)
 {
-    Settings* copy = new (std::nothrow) Settings(settings);
-    if (copy == nullptr)
-        return SettingsCurrent();
+    Settings copy = settings;
     AcquireSRWLockExclusive(&g_publishLock);
-    copy->generation = ++g_generation;
-    Retire(g_current.exchange(copy, std::memory_order_acq_rel));
+    copy.generation = ++g_generation;
+    SetCurrent(copy);
     ReleaseSRWLockExclusive(&g_publishLock);
     return copy;
 }

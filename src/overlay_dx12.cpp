@@ -748,7 +748,7 @@ bool MakeObjects()
 // The style for the frame's height and the theme the settings name (menu_style.cpp), redone when either changes.
 void ScaleStyle(float scale)
 {
-    const MenuTheme theme = SettingsCurrent()->menuTheme;
+    const MenuTheme theme = SettingsCurrent().menuTheme;
     if (scale == g.styleScale && theme == g.styleTheme)
         return;
     g.styleScale = scale;
@@ -965,7 +965,7 @@ void DrawLocked(IDXGISwapChain* chain)
             return;
         }
     }
-    const Settings& s = *SettingsCurrent();
+    const Settings s = SettingsCurrent();
     ChooseMode(g.native, s);
 
     // This frame's allocator, if the queue is done with the frame that used it kFrames draws ago. Never waited for:

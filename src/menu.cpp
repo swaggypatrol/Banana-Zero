@@ -107,9 +107,9 @@ void RequestWrite(const Settings& s)
 void CommitLocked(const char* why)
 {
     const Settings before = g_model.published;
-    const Settings* after = MenuModelCommit(&g_model, LogClock(), &SettingsPublish);
+    const Settings after = MenuModelCommit(&g_model, LogClock(), &SettingsPublish);
     char diff[512];
-    SettingsDiff(before, *after, diff, sizeof diff);
+    SettingsDiff(before, after, diff, sizeof diff);
     Log("menu%s%s: %s", why != nullptr ? " " : "", why != nullptr ? why : "", diff[0] != '\0' ? diff : "no change");
 }
 
@@ -172,17 +172,17 @@ bool KeyDown(unsigned vk) { return vk != 0 && vk < 256 && (GetAsyncKeyState(int(
 
 void MenuOnEvaluate(ID3D12GraphicsCommandList* list)
 {
-    const Settings* current = SettingsCurrent();
-    if (current->generation == 0)
+    const Settings current = SettingsCurrent();
+    if (current.generation == 0)
         return; // the file has not been read yet (the NR pass reads it on this same evaluation)
     const double now = LogClock();
     AcquireSRWLockExclusive(&g_lock);
     if (!g_inited)
     {
-        MenuModelInit(&g_model, *current);
+        MenuModelInit(&g_model, current);
         g_inited = true;
     }
-    else if (MenuModelSync(&g_model, *current))
+    else if (MenuModelSync(&g_model, current))
         Log("menu: the file was read again, the menu follows it");
 
     const bool front = InFront();

@@ -41,12 +41,12 @@ Settings MenuModelEffective(const MenuModel& m)
     return s;
 }
 
-const Settings* MenuModelCommit(MenuModel* m, double now, MenuPublishFn publish)
+Settings MenuModelCommit(MenuModel* m, double now, MenuPublishFn publish)
 {
-    const Settings* s = publish(MenuModelEffective(*m));
-    m->generation = s->generation;
-    m->draft.generation = s->generation;
-    m->published = *s;
+    const Settings s = publish(MenuModelEffective(*m));
+    m->generation = s.generation;
+    m->draft.generation = s.generation;
+    m->published = s;
     m->dirty = Differs(m->written, m->draft);
     m->lastCommitAt = now;
     return s;
