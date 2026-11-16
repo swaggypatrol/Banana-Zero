@@ -162,7 +162,8 @@ def nr_frames(log):
     marker = "; NR "
     for line in reversed(log.splitlines()):
         if "process ending; totals" in line and marker in line:
-            return int(line.split(marker, 1)[1].split()[0])
+            count = line.split(marker, 1)[1].split()[0]
+            return 0 if count == "disabled" else int(count)  # "NR disabled (Enabled=0), ...": never ran
     return 0
 
 

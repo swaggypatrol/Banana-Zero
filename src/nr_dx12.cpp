@@ -3328,9 +3328,10 @@ void PublishStatus()
 
 // Under the lock: everything after the cheap checks.
 // `game` is filled with what the game has bound on `list` before anything is recorded into it, and `*captured` set;
-// the caller binds it again afterwards.
+// the caller then ends the recording with a marker, and binds the game's state again if `*bound` (we or the model
+// bound our own).
 Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, const NrSource& source, ListState* game,
-              bool* captured, const char** detail)
+              bool* captured, bool* bound, const char** detail)
 {
     if (g_nr.off.load(std::memory_order_relaxed))
         return kSkipOff; // turned off between the caller's check and its lock (the game shutting the core down)
@@ -3366,6 +3367,13 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
         return kSkipGeometry;
     }
     NoteFrame(frame, source.feature);
+    // NR off with nothing frozen and nothing retired waiting for a recording to land: nothing to record, so the
+    // game's list is left alone (no capture, no restore, no marker).
+    if (!s->enabled && !FreezeWanted() && !FreezeActive() && g_nr.parked.empty())
+    {
+        g_nr.wasDisabled = true; // the model's history is stale by the time NR is back
+        return kSkipDisabled;
+    }
     // Everything below may record into the game's list and bind state of its own (ours, the model's).
     if (!ListStateCapture(list, game, detail))
         return kSkipState;
@@ -3394,6 +3402,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     ++g_nr.evaluatesSeen;
     if (!g_nr.ready)
     {
+        *bound = true; // the calls below bind our own state, or the model's, on the list
         if (!Initialise(list))
         {
             Off("initialisation failed, see above");
@@ -3441,6 +3450,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
             g_nr.describedFrame = true;
             DescribeFrame(frame);
         }
+        *bound = true;
         if (!CreateFeature(list, frame, s->model))
             return kSkipOff;
         return kSkipCreated;
@@ -3455,6 +3465,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     // with them.
     if (g_nr.frame >= kRing && !Landed(g_nr.ringRecording[g_nr.frame % kRing]))
         return kSkipInFlight;
+    *bound = true;
     Run(list, frame, *s, source.feature, previewing);
     return kSkipNone;
 }
@@ -3473,12 +3484,13 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
         return;
     }
     static ListState game; // under g_lock
-    bool captured = false;
+    bool captured = false, bound = false;
     const char* detail = nullptr; // why the list's state is not known, when that is the reason
-    const Skip skip = Evaluate(list, params, source, &game, &captured, &detail);
+    const Skip skip = Evaluate(list, params, source, &game, &captured, &bound, &detail);
     if (captured)
     {
-        ListStateRestore(list, game);
+        if (bound)
+            ListStateRestore(list, game);
         if (g_nr.markers.resource != nullptr && !MarkRecording(list) && !g_nr.off.load(std::memory_order_relaxed))
             Off("the game's command list cannot write a completion marker (no ID3D12GraphicsCommandList2)");
     }
