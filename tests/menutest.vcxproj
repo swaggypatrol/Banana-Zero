@@ -37,7 +37,7 @@
       <ConformanceMode>true</ConformanceMode>
       <WarningLevel>Level4</WarningLevel>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;IMGUI_DISABLE_DEMO_WINDOWS;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;IMGUI_IMPL_WIN32_DISABLE_GAMEPAD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>BZ_MENU_TEST;WIN32_LEAN_AND_MEAN;NOMINMAX;IMGUI_DISABLE_DEMO_WINDOWS;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;IMGUI_IMPL_WIN32_DISABLE_GAMEPAD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- The menu's own sources from src, and Dear ImGui with its Win32 backend only (the input): no GPU. -->
       <AdditionalIncludeDirectories>$(RepoRoot)src;$(RepoRoot)third_party\imgui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>

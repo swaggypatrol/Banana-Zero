@@ -45,9 +45,11 @@ void MenuDragEndedLocked();
 // True while the panel waits for a key to bind: the hotkeys do nothing then.
 bool MenuPanelListening();
 
+#ifdef BZ_MENU_TEST
 // Where the panel last drew the control for an ini key ("Intensity"), in ImGui's coordinates; false when it did
-// not draw it. For menutest, which drives the panel with the mouse.
+// not draw it. Only in menutest's build (BZ_MENU_TEST), which drives the panel with the mouse.
 bool MenuItemRect(const char* key, float* x0, float* y0, float* x1, float* y1);
+#endif
 
 // The game is shutting the NGX core down: the menu closes, the overlay goes, the file is written now if it is due.
 void MenuBeforeCoreShutdown();

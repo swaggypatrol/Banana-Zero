@@ -24,7 +24,8 @@ namespace
 {
 const Settings g_defaults;
 
-// Where each control was drawn, for menutest.
+#ifdef BZ_MENU_TEST
+// Where each control was drawn, for menutest, which builds this file with BZ_MENU_TEST; the DLL records nothing.
 struct ItemRect
 {
     char key[64]; // own generated combo-option keys as well as literal control keys
@@ -59,6 +60,10 @@ void RecordRect(const char* key, ImVec2 min, ImVec2 max)
 }
 
 void Record(const char* key) { RecordRect(key, ImGui::GetItemRectMin(), ImGui::GetItemRectMax()); }
+#else
+void RecordRect(const char*, ImVec2, ImVec2) {}
+void Record(const char*) {}
+#endif
 
 constexpr float kPi = 3.14159265f;
 
@@ -150,9 +155,11 @@ bool ComboBox(const char* key, const char* label, int* v, const char* const* nam
                 *v = i;
                 changed = true;
             }
+#ifdef BZ_MENU_TEST
             char optionKey[64];
             snprintf(optionKey, sizeof optionKey, "%s/option/%d", key, i);
             Record(optionKey); // lets headless tests click the real dropdown choices
+#endif
             if (i == *v)
                 ImGui::SetItemDefaultFocus();
         }
@@ -699,6 +706,7 @@ void PreviewWindow(MenuModel& m)
 
 bool MenuPanelListening() { return g_listening >= 0; }
 
+#ifdef BZ_MENU_TEST
 bool MenuItemRect(const char* key, float* x0, float* y0, float* x1, float* y1)
 {
     for (unsigned i = 0; i < g_itemCount; ++i)
@@ -713,10 +721,13 @@ bool MenuItemRect(const char* key, float* x0, float* y0, float* x1, float* y1)
     }
     return false;
 }
+#endif
 
 void MenuDraw()
 {
+#ifdef BZ_MENU_TEST
     ++g_frame;
+#endif
     MenuModel& m = MenuModelLocked();
     Settings& d = m.draft;
     const Settings& def = g_defaults;
