@@ -421,6 +421,7 @@ Run these from the repository root after a build. Exit code 0 means pass; a nonz
 | `build\Release\nrprobe.exe --model <path> --preset N --mask-tests` | the same; a DLL with MaskBlendMode | Runs all 16 combinations of blend mode, AutoMask and external mask (finite output each), then checks the modes' behaviour: 1 to 3 equal 0 without Auto mask or without an external mask, differ from 0 with both, and min differs from max |
 | `build\Release\nrprobe.exe --model <path> --preset N --preset-tests` | the same; a DLL with two weight sets | Creates a feature per preset request 0, 1 and 2 and checks that requests selecting the same weights give the same picture and the others do not, so the creation key demonstrably reaches the model |
 | `build\Release\nrprobe.exe --tuning` | the same | Also measures what the model does with its knobs: that each one acts when written every frame, the model's own defaults and clamps, which motion-vector scale it wants, whether motion vectors dilated by depth help it along moving edges and thin bars, whether a control mask sets it per pixel, and, given Witcher 3 frame dumps (`DumpEvery`), how each setting moves the colours |
+| `python tools\nrloop.py identity` (also `bright`, `night`, `frames`) | RTX 50, the model and a DLSS DLL (`python tools\nrloop.py prepare --model <path> --dlss <path>` copies them into `build\Release`), Python with numpy | Runs `build\Release\nrhost.exe`, a game with no window: DLSS Super Resolution at DLAA through the driver's NGX runtime, `dxgi.dll`'s NR pass after it with the real model, and a second DLSS feature on the same input that NR does not follow, so every frame comes out with NR and without. `identity`: NR off and DetailStrength 0 leave DLSS's picture bit for bit. The others measure from the pictures themselves what NR does to greys and colours, on synthetic scenes or on frames from `tools\q2capture.py` (Quake II RTX's demo, path traced, in HDR; it needs the display in Windows' HDR mode). One run at a time: each writes `dlssnr.ini` beside `nrhost.exe` |
 | `build\Release\nrprobe.exe --subrects` | the same | Runs the model on smaller pictures inside a feature made for the full one, as Model input size does: that the result matches a feature made at the smaller size, that nothing outside the smaller picture is written, how long each size takes, and which motion-vector scale it wants then |
 
 ### Regenerating the export stubs
@@ -461,7 +462,7 @@ Every build compares the new `dxgi.dll` with the local `System32\dxgi.dll` and w
 | `src/dxgi.def`, `src/dxgi_stubs.asm`, `src/dxgi_exports.h` | Generated export forwarding |
 | `bridge/` | `banana.nvngx.dll` |
 | `tests/` | The test programs above, plus a fake NGX runtime and a fake model |
-| `tools/` | Build helpers, packaging, and `bzstats.py` / `bzdump.py` for the measurement output |
+| `tools/` | Build helpers, packaging, `bzstats.py` / `bzdump.py` for the measurement output, and `nrloop.py` / `q2capture.py` for the closed loop |
 | `third_party/imgui/` | Dear ImGui v1.92.9b, unmodified |
 | `sdk/` | NVIDIA NGX SDK headers |
 
