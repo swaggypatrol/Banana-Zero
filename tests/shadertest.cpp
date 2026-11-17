@@ -1695,36 +1695,51 @@ void CheckCast(Scene& s, const Setup& base)
     });
     const std::vector<uint8_t> modelBytes = Encode(model);
 
+    // The composite after the cast pass (NR_STATS_CAST), or, on a frame with statistics, after the gain pass, whose
+    // buffer it reads instead: the same white balance sums, so the same picture.
     const UINT64 bytes = NR_S_WORDS * 4;
-    ID3D12Resource* cast = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
-    Reset(s, u);
-    RecordEncode(s, u);
-    Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(cast, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT }, { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT },
-                                 ExposureView(s, u), OutputView(s), cast, bytes);
-    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CLEAR), 1, 1);
-    UavBarrier(cast);
-    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CAST), Groups(s.width, 32), Groups(s.height, 32));
-    UavBarrier(cast);
-    Dispatch(g.stats, table, Constants(s, u, NR_STATS_SPREAD), Groups(s.width, 32), Groups(s.height, 32));
-    UavBarrier(cast);
-    Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
-    Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const std::vector<uint32_t> w = ReadBuffer(cast, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    cast->Release();
+    auto composite = [&](unsigned firstPass, std::vector<uint32_t>* words) {
+        ID3D12Resource* sums = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+        Reset(s, u);
+        RecordEncode(s, u);
+        Upload(s.model, modelBytes, 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(sums, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const unsigned table = Table({}, { s.model, DXGI_FORMAT_R16G16B16A16_FLOAT },
+                                     { s.proxy, DXGI_FORMAT_R16G16B16A16_FLOAT }, ExposureView(s, u), OutputView(s), sums,
+                                     bytes);
+        Dispatch(g.stats, table, Constants(s, u, NR_STATS_CLEAR), 1, 1);
+        UavBarrier(sums);
+        Dispatch(g.stats, table, Constants(s, u, firstPass), Groups(s.width, 32), Groups(s.height, 32));
+        UavBarrier(sums);
+        Dispatch(g.stats, table, Constants(s, u, NR_STATS_SPREAD), Groups(s.width, 32), Groups(s.height, 32));
+        UavBarrier(sums);
+        Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), Groups(s.width, 8), Groups(s.height, 8));
+        Barrier(s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        std::vector<uint8_t> output = Read(s.output, s.format->bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        *words = ReadBuffer(sums, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        sums->Release();
+        return output;
+    };
+    std::vector<uint32_t> w, statsWords;
+    const std::vector<uint8_t> output = composite(NR_STATS_CAST, &w);
+    const std::vector<uint8_t> statsOutput = composite(NR_STATS_GAIN, &statsWords);
 
     // The pass's sums are the statistics' (checked against the CPU there), with no histogram or count beside them, and
     // the white balance they give is the model's.
     const CpuStats e = ExpectedStats(s, u, proxy, model);
     int32_t sum[NR_GLOBALS];
     bool sumsRight = true;
+    bool sameAsStats = output == statsOutput;
     for (unsigned i = 0; i < NR_GLOBALS; ++i)
     {
         sum[i] = int32_t(w[NR_S_GLOBAL + i]);
-        sumsRight = sumsRight && std::fabs(double(sum[i]) / NR_G_SCALE - e.global[i]) <= 0.5 + 1.0e-4 * std::fabs(e.global[i]);
+        // The cast pass sums only what the white balance takes; the rest of its words stay 0.
+        const bool wanted = i == NR_G_GREY || i == NR_G_TINT_R || i == NR_G_TINT_B || i == NR_G_CHROMA_R ||
+                            i == NR_G_CHROMA_B || i >= NR_G_RR;
+        const double want = wanted ? e.global[i] : 0.0;
+        sumsRight = sumsRight && std::fabs(double(sum[i]) / NR_G_SCALE - want) <= 0.5 + 1.0e-4 * std::fabs(want);
+        sameAsStats = sameAsStats && (!wanted || w[NR_S_GLOBAL + i] == statsWords[NR_S_GLOBAL + i]);
     }
     bool nothingElse = true;
     for (unsigned i = NR_S_TAG_FIRST + 1; i < NR_S_GLOBAL; ++i)
@@ -1741,12 +1756,13 @@ void CheckCast(Scene& s, const Setup& base)
     double fitR = 0.0, fitB = 0.0;
     const double groups = double(Groups(s.width, 32)) * double(Groups(s.height, 32));
     ref::CastTint(sums, prior, 0.5 * groups / sums[NR_G_GREY], &fitR, &fitB);
-    const double gain = double(sum[NR_G_GAIN]) / double(sum[NR_G_WEIGHT]);
     Check(sumsRight && nothingElse && std::fabs(tintR - std::log2(1.08 / 1.02)) < 0.003 &&
               std::fabs(tintB - std::log2(0.88 / 1.02)) < 0.003,
           "cast, %s: the cast pass's sums as the CPU's, and nothing else written; the model's white balance R/G x%.4f "
-          "B/G x%.4f (made x%.4f, x%.4f), brightness %+.4f EV",
-          s.format->name, std::exp2(tintR), std::exp2(tintB), 1.08 / 1.02, 0.88 / 1.02, gain);
+          "B/G x%.4f (made x%.4f, x%.4f)",
+          s.format->name, std::exp2(tintR), std::exp2(tintB), 1.08 / 1.02, 0.88 / 1.02);
+    Check(sameAsStats, "cast, %s: a frame with statistics, its composite reading the gain pass's sums, has the same "
+          "white balance words and the same picture", s.format->name);
 
     // Each changed pixel: that much of the white balance divided out of its colour, then the composite as ever.
     const float white = WhiteOf(u);
@@ -3430,6 +3446,74 @@ void STDMETHODCALLTYPE SpyTable(ID3D12GraphicsCommandList* list, UINT parameter,
         g_spyTable)(list, parameter, table);
 }
 
+// Spies for the restore's root constants: what it sets, in which calls. They do not pass the calls on.
+struct SpyConstantsCall
+{
+    UINT parameter;
+    UINT offset;
+    UINT count; // 0: SetComputeRoot32BitConstant, one value
+    uint32_t values[4];
+};
+std::vector<SpyConstantsCall> g_spyConstants;
+
+void STDMETHODCALLTYPE SpyConstant(ID3D12GraphicsCommandList*, UINT parameter, UINT value, UINT offset)
+{
+    g_spyConstants.push_back({ parameter, offset, 0, { value } });
+}
+
+void STDMETHODCALLTYPE SpyConstants(ID3D12GraphicsCommandList*, UINT parameter, UINT count, const void* values, UINT offset)
+{
+    SpyConstantsCall c = { parameter, offset, count, {} };
+    memcpy(c.values, values, std::min(count, 4u) * 4);
+    g_spyConstants.push_back(c);
+}
+
+// Root constants (src/list_state.cpp's SetConstants): a range over constants set before replaces them, a constant
+// inside a range replaces it alone, all kept in order; and the restore sets each run at consecutive offsets of one
+// parameter in one call. `list` is followed, known and empty.
+void CheckConstants(ID3D12GraphicsCommandList* list, ID3D12RootSignature* gameRoot)
+{
+    list->SetComputeRootSignature(gameRoot);
+    const uint32_t four[] = { 1, 2, 3, 4 };
+    const uint32_t two[] = { 30, 40 };
+    list->SetComputeRoot32BitConstants(0, 4, four, 0);
+    list->SetComputeRoot32BitConstants(0, 2, two, 2);
+    list->SetComputeRoot32BitConstant(0, 20, 1);
+    ListState s = {};
+    const uint32_t want[] = { 1, 20, 30, 40 };
+    bool right = ListStateCapture(list, &s) && s.constantCount == 4;
+    for (unsigned i = 0; right && i < 4; ++i)
+        right = s.constants[i].parameter == 0 && s.constants[i].offset == i && s.constants[i].value == want[i];
+    Check(right, "list state: constants over constants set before replace them, one inside a range replaces it alone");
+
+    ListState runs = {};
+    runs.known = true;
+    runs.computeRoot = gameRoot;
+    const ListStateConstant noted[] = { { 0, 0, 5 }, { 0, 1, 6 }, { 0, 3, 7 }, { 2, 0, 8 }, { 2, 1, 9 } };
+    memcpy(runs.constants, noted, sizeof noted);
+    runs.constantCount = 5;
+    constexpr unsigned kConstant = 33, kConstants = 35; // ID3D12GraphicsCommandList's table
+    void** const table0 = *reinterpret_cast<void***>(list);
+    void** const spied = CopyTable(table0);
+    spied[kConstant] = reinterpret_cast<void*>(&SpyConstant);
+    spied[kConstants] = reinterpret_cast<void*>(&SpyConstants);
+    g_spyConstants.clear();
+    *reinterpret_cast<void***>(list) = spied;
+    ListStateRestore(list, runs);
+    *reinterpret_cast<void***>(list) = table0;
+    const SpyConstantsCall expected[] = { { 0, 0, 2, { 5, 6 } }, { 0, 3, 1, { 7 } }, { 2, 0, 2, { 8, 9 } } };
+    bool calls = g_spyConstants.size() == 3;
+    for (size_t i = 0; calls && i < 3; ++i)
+    {
+        const SpyConstantsCall& a = g_spyConstants[i];
+        const SpyConstantsCall& b = expected[i];
+        calls = a.parameter == b.parameter && a.offset == b.offset && a.count == b.count &&
+                memcmp(a.values, b.values, b.count * 4) == 0;
+    }
+    Check(calls, "list state: the restore sets constants 0:0-1, 0:3 and 2:0-1 in three calls (%zu made)",
+          g_spyConstants.size());
+}
+
 // The game's graphics descriptor tables across the NR pass: the pass changes the descriptor heaps, which leaves every
 // table undefined, so the restore must set them again, after the heaps. `list` is followed and known (reset since).
 void CheckGraphicsTables(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* const* gameHeaps,
@@ -3574,6 +3658,8 @@ void TestListState()
     Check(ListStateCapture(g.list, &s) && Empty(s, g.nr), "list state: nothing but ClearState's pipeline after it");
     Submit();
     Check(ListStateCapture(g.list, &s) && Empty(s, nullptr), "list state: nothing bound after the next Reset");
+    CheckConstants(g.list, gameRoot);
+    Submit();
 
     ID3D12CommandAllocator* otherAllocator = nullptr;
     Must(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&otherAllocator)),

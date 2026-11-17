@@ -16,8 +16,8 @@
 //   - the panel: a slider dragged with the mouse publishes every step at once and logs the drag once, when the mouse
 //     lets go; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
 //     box unfreezes it, unticking the card undoes the freeze it made; skin structure takes no input until the auto
-//     mask is on; "all defaults"; the depth page: a sky slider away from 1 greys out the auto mask until it is back,
-//     the stripes and the dilation commit at once; the speed page: the model's input size publishes at once, a
+//     mask is on; "all defaults"; the Model page's depth and sky part: a sky slider away from 1 greys out the auto mask until it is back,
+//     the stripes and the dilation commit at once; the Picture page: the model's input size publishes at once, a
 //     right-click puts 100% back, a drag across and back moves in its steps, holds at its stops and finds every
 //     step one way or the other, the pass's model size and GPU time are drawn; closing the menu writes the file,
 //     and so does a second after a commit while it is open
@@ -41,6 +41,9 @@
 
 #include <windows.h>
 
+#include <psapi.h>
+
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -49,6 +52,8 @@
 #include <initializer_list>
 
 #include <atomic>
+#include <thread>
+#include <vector>
 
 #include "backends/imgui_impl_win32.h"
 #include "freeze.h"
@@ -59,6 +64,7 @@
 #include "menu.h"
 #include "menu_input.h"
 #include "menu_model.h"
+#include "menu_style.h"
 #include "nr_dx12.h"
 #include "overlay_dx12.h"
 #include "settings.h"
@@ -251,17 +257,17 @@ void TestWrite()
     Check(WriteAll(g_ini, merged), "write: the merged text goes to the test's ini");
     delete[] merged;
 
-    const Settings* loaded = SettingsLoad(g_ini);
-    Check(loaded->generation == 1, "write: the file read (generation %u)", loaded->generation);
-    Check(!loaded->enabled, "write: Enabled 0 read back");
-    Check(!loaded->model.preset.set, "write: Preset not set");
-    Check(loaded->model.intensity.set && Near(loaded->model.intensity.value, 0.8f, 1e-6f),
+    Settings loaded = SettingsLoad(g_ini);
+    Check(loaded.generation == 1, "write: the file read (generation %u)", loaded.generation);
+    Check(!loaded.enabled, "write: Enabled 0 read back");
+    Check(!loaded.model.preset.set, "write: Preset not set");
+    Check(loaded.model.intensity.set && Near(loaded.model.intensity.value, 0.8f, 1e-6f),
           "write: Intensity read back");
-    Check(Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog 2 read back");
-    Check(Near(loaded->colourStrength, 1.25f, 1e-6f), "write: ColourStrength read back");
-    Check(Near(loaded->globalColour, 0.35f, 1e-6f) && Near(loaded->highlightColour, 1.5f, 1e-6f),
+    Check(Near(loaded.statsSeconds, 2.0f, 1e-6f), "write: StatsLog 2 read back");
+    Check(Near(loaded.colourStrength, 1.25f, 1e-6f), "write: ColourStrength read back");
+    Check(Near(loaded.globalColour, 0.35f, 1e-6f) && Near(loaded.highlightColour, 1.5f, 1e-6f),
           "write: GlobalColour and HighlightColour read back");
-    Check(loaded->menuKey == 0x7B, "write: MenuKey F12 read back");
+    Check(loaded.menuKey == 0x7B, "write: MenuKey F12 read back");
 
     // A new file: the header and only the keys away from their defaults.
     Settings fresh;
@@ -299,22 +305,22 @@ void TestWrite()
     unsigned long error = 0;
     Check(SettingsWriteIni(g_ini, full, &error), "write: SettingsWriteIni (error %lu)", error);
     loaded = SettingsLoad(g_ini);
-    Check(loaded->model == full.model, "write: the model parameters read back the same");
-    Check(loaded->inputType == full.inputType && loaded->whiteSource == full.whiteSource &&
-              Near(loaded->shoulder, full.shoulder, 1e-6f) && loaded->preview == full.preview &&
-              loaded->zebra == full.zebra && loaded->cardCorner == full.cardCorner,
+    Check(loaded.model == full.model, "write: the model parameters read back the same");
+    Check(loaded.inputType == full.inputType && loaded.whiteSource == full.whiteSource &&
+              Near(loaded.shoulder, full.shoulder, 1e-6f) && loaded.preview == full.preview &&
+              loaded.zebra == full.zebra && loaded.cardCorner == full.cardCorner,
           "write: the encode, composite and aid keys read back the same");
-    Check(loaded->compare == full.compare && Near(loaded->compareSplit, full.compareSplit, 1e-6f) &&
-              loaded->toggleKey == full.toggleKey && loaded->freezeKey == full.freezeKey &&
-              loaded->menuColour == full.menuColour && Near(loaded->menuNits, full.menuNits, 1e-6f),
+    Check(loaded.compare == full.compare && Near(loaded.compareSplit, full.compareSplit, 1e-6f) &&
+              loaded.toggleKey == full.toggleKey && loaded.freezeKey == full.freezeKey &&
+              loaded.menuColour == full.menuColour && Near(loaded.menuNits, full.menuNits, 1e-6f),
           "write: the menu's keys read back the same");
-    Check(loaded->dilateMotion == full.dilateMotion && Near(loaded->skyTone, full.skyTone, 1e-6f) &&
-              Near(loaded->skyStructure, full.skyStructure, 1e-6f),
+    Check(loaded.dilateMotion == full.dilateMotion && Near(loaded.skyTone, full.skyTone, 1e-6f) &&
+              Near(loaded.skyStructure, full.skyStructure, 1e-6f),
           "write: the depth page's keys read back the same");
-    Check(loaded->modelScale == full.modelScale, "write: the speed page's key reads back the same (%.4g%%)",
-          double(loaded->modelScale));
-    Check(!loaded->showSky && !FileHas("ShowSky", 0.0), "write: the sky's stripes are never written");
-    Check(loaded->enabled && Near(loaded->statsSeconds, 2.0f, 1e-6f), "write: StatsLog still 2, Enabled back to 1");
+    Check(loaded.modelScale == full.modelScale, "write: the speed page's key reads back the same (%.4g%%)",
+          double(loaded.modelScale));
+    Check(!loaded.showSky && !FileHas("ShowSky", 0.0), "write: the sky's stripes are never written");
+    Check(loaded.enabled && Near(loaded.statsSeconds, 2.0f, 1e-6f), "write: StatsLog still 2, Enabled back to 1");
 
     // The replace with the file held by someone else, as an editor, a virus scanner or our own reload thread does.
     wchar_t temporary[MAX_PATH];
@@ -357,9 +363,9 @@ void TestWrite()
     const int ignoredBefore = LogCount("ignored");
     Check(WriteAll(g_ini, "HighlightRestore = 0.5\r\nGlobalBrightness = 0.2\r\nHighlightColour = 0.5\r\n"),
           "retired: the test's ini written");
-    const Settings* retired = SettingsLoad(g_ini);
+    Settings retired = SettingsLoad(g_ini);
     const int ignoredAfter = LogCount("ignored");
-    Check(ignoredBefore >= 0 && ignoredAfter == ignoredBefore && Near(retired->highlightColour, 0.5f, 1e-6f),
+    Check(ignoredBefore >= 0 && ignoredAfter == ignoredBefore && Near(retired.highlightColour, 0.5f, 1e-6f),
           "retired: HighlightRestore and GlobalBrightness read without a word (%d lines ignored before, %d after), "
           "HighlightColour 0.5 read",
           ignoredBefore, ignoredAfter);
@@ -370,19 +376,19 @@ void TestWrite()
 void TestMaskSettings()
 {
     WriteAll(g_ini, "Style=1\r\nStyle=99\r\nMaskBlendMode=3\r\nMaskBlendMode=4\r\nStatsLog=0\r\n");
-    const Settings* loaded = SettingsLoad(g_ini);
-    Check(loaded->model.style.set && loaded->model.style.value == 1,
+    Settings loaded = SettingsLoad(g_ini);
+    Check(loaded.model.style.set && loaded.model.style.value == 1,
           "parse: invalid Style does not leak into the published snapshot");
-    Check(loaded->model.maskBlendMode.set && loaded->model.maskBlendMode.value == 3,
+    Check(loaded.model.maskBlendMode.set && loaded.model.maskBlendMode.value == 3,
           "parse: invalid MaskBlendMode preserves the previous valid value");
     WriteAll(g_ini, "MaskBlendMode=-1\r\n");
-    Check(!SettingsLoad(g_ini)->model.maskBlendMode.set, "parse: negative mask mode is rejected");
+    Check(!SettingsLoad(g_ini).model.maskBlendMode.set, "parse: negative mask mode is rejected");
     WriteAll(g_ini, "MaskBlendMode=0\r\n");
     loaded = SettingsLoad(g_ini);
-    Check(loaded->model.maskBlendMode.set && loaded->model.maskBlendMode.value == 0,
+    Check(loaded.model.maskBlendMode.set && loaded.model.maskBlendMode.value == 0,
           "parse: explicit legacy mode 0 is retained");
     WriteAll(g_ini, "MaskBlendMode=2\r\nMaskBlendMode=Auto\r\n");
-    Check(!SettingsLoad(g_ini)->model.maskBlendMode.set, "parse: MaskBlendMode = auto means not set (Auto)");
+    Check(!SettingsLoad(g_ini).model.maskBlendMode.set, "parse: MaskBlendMode = auto means not set (Auto)");
     Settings before, after;
     after.model.maskBlendMode = { true, 2 };
     char diff[512];
@@ -397,7 +403,7 @@ void TestMaskSettings()
         Settings s;
         s.model.skinStructure = { true, value };
         unsigned long error = 0;
-        Check(SettingsWriteIni(g_ini, s, &error) && SettingsLoad(g_ini)->model.skinStructure.value == value,
+        Check(SettingsWriteIni(g_ini, s, &error) && SettingsLoad(g_ini).model.skinStructure.value == value,
               "write: a slider value %.9g survives saving and reloading exactly", double(value));
     }
 }
@@ -437,14 +443,14 @@ void TestModelScaleSteps()
         Check(ModelScaleStep(stop) == stop, "steps: the stop %.4g%% is a step", double(stop));
 
     WriteAll(g_ini, "ModelScale = 42.4\r\n");
-    Check(SettingsLoad(g_ini)->modelScale == 42.0f, "steps: ModelScale = 42.4 in the file reads as 42");
+    Check(SettingsLoad(g_ini).modelScale == 42.0f, "steps: ModelScale = 42.4 in the file reads as 42");
     WriteAll(g_ini, "ModelScale = 67\r\n");
-    Check(SettingsLoad(g_ini)->modelScale == kModelScaleTwoThirds, "steps: 67 reads as two thirds");
+    Check(SettingsLoad(g_ini).modelScale == kModelScaleTwoThirds, "steps: 67 reads as two thirds");
     WriteAll(g_ini, "ModelScale = 33.3\r\n");
-    Check(SettingsLoad(g_ini)->modelScale == kModelScaleThird && LogCount("(ModelScale = 33.3)") == 0,
+    Check(SettingsLoad(g_ini).modelScale == kModelScaleThird && LogCount("(ModelScale = 33.3)") == 0,
           "steps: 33.3 reads as a third, and the log has nothing to say about it");
     WriteAll(g_ini, "ModelScale = 20\r\n");
-    Check(SettingsLoad(g_ini)->modelScale == kModelScaleThird &&
+    Check(SettingsLoad(g_ini).modelScale == kModelScaleThird &&
               LogCount("out of range, clamped (ModelScale = 20)") == 1,
           "steps: 20 reads as a third, and the log says it was out of range");
 }
@@ -452,12 +458,12 @@ void TestModelScaleSteps()
 // A stand-in for SettingsPublish that counts.
 unsigned g_published = 0;
 Settings g_lastPublished;
-const Settings* FakePublish(const Settings& s)
+Settings FakePublish(const Settings& s)
 {
     ++g_published;
     g_lastPublished = s;
     g_lastPublished.generation = 1000 + g_published;
-    return &g_lastPublished;
+    return g_lastPublished;
 }
 
 // Hot reload: a file saved again with the same values (only a comment new) leaves the generation alone, as does the
@@ -465,18 +471,63 @@ const Settings* FakePublish(const Settings& s)
 void TestReload()
 {
     WriteAll(g_ini, "Shoulder = 0.6\r\n");
-    const unsigned generation = SettingsLoad(g_ini)->generation;
+    const unsigned generation = SettingsLoad(g_ini).generation;
     WriteAll(g_ini, "; a note\r\nShoulder = 0.6\r\n");
-    Check(!SettingsReloadIfChanged() && SettingsCurrent()->generation == generation,
+    Check(!SettingsReloadIfChanged() && SettingsCurrent().generation == generation,
           "reload: the same values with a new comment are not a new generation");
     WriteAll(g_ini, "Shoulder = 0.65\r\n");
-    Check(SettingsReloadIfChanged() && SettingsCurrent()->generation == generation + 1 &&
-              Near(SettingsCurrent()->shoulder, 0.65f, 1e-6f),
+    Check(SettingsReloadIfChanged() && SettingsCurrent().generation == generation + 1 &&
+              Near(SettingsCurrent().shoulder, 0.65f, 1e-6f),
           "reload: a changed value is read, as the next generation");
     WriteAll(g_ini, "Shoulder = 0.9\r\n");
     SettingsNoteWritten();
-    Check(!SettingsReloadIfChanged() && Near(SettingsCurrent()->shoulder, 0.65f, 1e-6f),
+    Check(!SettingsReloadIfChanged() && Near(SettingsCurrent().shoulder, 0.65f, 1e-6f),
           "reload: the menu's own write, noted, is not read back");
+}
+
+// SettingsCurrent copies a snapshot whole: while one thread publishes as fast as it can, readers on two others never
+// see a mix of two (each publish sets three fields to one number), and publishing keeps nothing (the snapshots were
+// once allocated and retired five seconds later, and a table of 256 of them, when full, kept the rest for ever).
+void TestSnapshots()
+{
+    auto privateBytes = [] {
+        PROCESS_MEMORY_COUNTERS_EX counters = {};
+        counters.cb = sizeof counters;
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof counters);
+        return double(counters.PrivateUsage);
+    };
+    constexpr unsigned kPublishes = 200000;
+    std::atomic<bool> stop { false };
+    std::atomic<unsigned> torn { 0 }, reads { 0 };
+    auto reader = [&] {
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            const Settings s = SettingsCurrent();
+            if (s.whiteEV != s.compareSplit || s.whiteEV != s.menuNits)
+                torn.fetch_add(1, std::memory_order_relaxed);
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    std::thread a(reader), b(reader);
+    const double before = privateBytes();
+    Settings s = SettingsCurrent();
+    unsigned published = 0;
+    // At least kPublishes, and on until the readers have read a thousand times (a small machine may not run them
+    // before that many are done), at most 20 times as many.
+    while ((published < kPublishes || reads < 1000) && published < 20 * kPublishes)
+    {
+        ++published;
+        s.whiteEV = s.compareSplit = s.menuNits = float(published);
+        SettingsPublish(s);
+    }
+    const double grown = privateBytes() - before;
+    stop = true;
+    a.join();
+    b.join();
+    Check(torn == 0 && reads >= 1000 && SettingsCurrent().whiteEV == float(published),
+          "snapshots: %u reads during %u publishes, %u of them a mix of two", reads.load(), published, torn.load());
+    Check(grown < 1024.0 * 1024.0, "snapshots: %u publishes grew the process by %.0f KB", published, grown / 1024.0);
+    SettingsLoad(g_ini);
 }
 
 void TestModel()
@@ -491,9 +542,9 @@ void TestModel()
     Check(!MenuModelSync(&m, current), "model: the same generation is no reload");
 
     m.draft.whiteEV = 1.0f;
-    const Settings* p = MenuModelCommit(&m, 10.0, &FakePublish);
-    Check(g_published == 1 && Near(p->whiteEV, 1.0f, 1e-6f) && p->enabled, "model: a commit publishes the draft");
-    Check(m.dirty && m.generation == p->generation, "model: dirty, generation follows the publish");
+    Settings p = MenuModelCommit(&m, 10.0, &FakePublish);
+    Check(g_published == 1 && Near(p.whiteEV, 1.0f, 1e-6f) && p.enabled, "model: a commit publishes the draft");
+    Check(m.dirty && m.generation == p.generation, "model: dirty, generation follows the publish");
     m.open = true;
     Check(!MenuModelWriteDue(m, 10.5), "model: open, not due at 0.5 s");
     Check(MenuModelWriteDue(m, 11.0), "model: open, due at 1 s");
@@ -504,7 +555,7 @@ void TestModel()
 
     m.abOff = true;
     p = MenuModelCommit(&m, 12.0, &FakePublish);
-    Check(g_published == 2 && !p->enabled && m.draft.enabled, "model: A/B publishes Enabled 0, the draft keeps 1");
+    Check(g_published == 2 && !p.enabled && m.draft.enabled, "model: A/B publishes Enabled 0, the draft keeps 1");
     Check(!m.dirty, "model: A/B alone makes nothing due for the file");
 
     Settings reloaded = current;
@@ -569,6 +620,13 @@ bool Click(const char* key, float atX = 0.5f, int button = 0)
     return true;
 }
 
+// The Model page with its depth and sky part unfolded (the fold stays as it was left).
+bool DepthSky()
+{
+    float x, y;
+    return Click("TabModel") && (Centre("SkyTone", &x, &y) || (Click("DepthSky") && Centre("SkyTone", &x, &y)));
+}
+
 // Open a real combo popup and click the recorded selectable, rather than assigning the draft in the test.
 bool Choose(const char* key, unsigned index)
 {
@@ -579,14 +637,14 @@ bool Choose(const char* key, unsigned index)
     return Click(option);
 }
 
-unsigned Generation() { return SettingsCurrent()->generation; }
+unsigned Generation() { return SettingsCurrent().generation; }
 
 void TestPanel()
 {
     // The file the menu starts from.
     WriteAll(g_ini, "Enabled = 1\r\nIntensity = 0.7\r\nStatsLog = 0\r\nDumpEvery = 0\r\n");
-    const Settings* start = SettingsLoad(g_ini);
-    const unsigned g0 = start->generation;
+    Settings start = SettingsLoad(g_ini);
+    const unsigned g0 = start.generation;
 
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -627,24 +685,24 @@ void TestPanel()
     Button(0, true);
     Frame();
     {
-        const float shown = SettingsCurrent()->model.intensity.value;
-        Check(Generation() == g0 + 1 && SettingsCurrent()->model.intensity.set && shown < 0.4f,
+        const float shown = SettingsCurrent().model.intensity.value;
+        Check(Generation() == g0 + 1 && SettingsCurrent().model.intensity.set && shown < 0.4f,
               "panel: pressing publishes the value under the mouse at once (%.2f, generation %u)", shown,
               Generation());
     }
     Centre("Intensity", &x, &y, 0.6f);
     MoveTo(x, y);
     Frame();
-    Check(Generation() == g0 + 2 && Near(SettingsCurrent()->model.intensity.value, 0.6f, 0.1f),
-          "panel: dragging publishes the new value at once (%.2f)", double(SettingsCurrent()->model.intensity.value));
+    Check(Generation() == g0 + 2 && Near(SettingsCurrent().model.intensity.value, 0.6f, 0.1f),
+          "panel: dragging publishes the new value at once (%.2f)", double(SettingsCurrent().model.intensity.value));
     Check(LogCount("menu slider") == 0 && LogCount("menu panel") == 0, "panel: no log line while the slider is dragged");
     Button(0, false);
     Frame();
     Check(Generation() == g0 + 2, "panel: letting go publishes nothing more (generation %u)", Generation());
     Check(LogCount("menu slider: Intensity 0.7 -> ") == 1 && LogCount("menu slider") == 1,
           "panel: letting go logs the drag once, from where it started");
-    const float intensity = SettingsCurrent()->model.intensity.value;
-    Check(SettingsCurrent()->model.intensity.set && Near(intensity, 0.6f, 0.1f),
+    const float intensity = SettingsCurrent().model.intensity.value;
+    Check(SettingsCurrent().model.intensity.set && Near(intensity, 0.6f, 0.1f),
           "panel: the published Intensity is where the mouse let go (%.2f)", intensity);
     Check(!FileHas("Intensity = 1", 0.3), "panel: the file is not written within 0.3 s of a commit");
     Sleep(1000);
@@ -658,13 +716,13 @@ void TestPanel()
     Check(Click("Intensity", 0.5f, 1), "panel: right-click Intensity");
     Frame();
     const unsigned g1 = Generation();
-    Check(g1 == g0 + 3 && !SettingsCurrent()->model.intensity.set, "panel: right-click makes it the model's default");
+    Check(g1 == g0 + 3 && !SettingsCurrent().model.intensity.set, "panel: right-click makes it the model's default");
 
     // A box commits at once.
     Check(Click("Enabled"), "panel: click Enabled");
-    Check(Generation() == g1 + 1 && !SettingsCurrent()->enabled, "panel: Enabled off published at once");
+    Check(Generation() == g1 + 1 && !SettingsCurrent().enabled, "panel: Enabled off published at once");
     Check(Click("Enabled"), "panel: click Enabled again");
-    Check(Generation() == g1 + 2 && SettingsCurrent()->enabled, "panel: Enabled on again");
+    Check(Generation() == g1 + 2 && SettingsCurrent().enabled, "panel: Enabled on again");
 
     // A/B: the pass sees Enabled 0, the draft keeps 1.
     Check(Click("AB"), "panel: click A/B");
@@ -673,11 +731,11 @@ void TestPanel()
         const bool draftEnabled = MenuModelLocked().draft.enabled;
         const bool abOff = MenuModelLocked().abOff;
         MenuUnlock();
-        Check(Generation() == g1 + 3 && !SettingsCurrent()->enabled && draftEnabled && abOff,
+        Check(Generation() == g1 + 3 && !SettingsCurrent().enabled && draftEnabled && abOff,
               "panel: A/B publishes Enabled 0 and keeps the draft's 1");
     }
     Check(Click("AB"), "panel: click A/B again");
-    Check(Generation() == g1 + 4 && SettingsCurrent()->enabled, "panel: A/B back");
+    Check(Generation() == g1 + 4 && SettingsCurrent().enabled, "panel: A/B back");
 
     // The card freezes; the freeze box unfreezes and takes the card with it. The card is on the compare page.
     Check(!FreezeWanted(), "panel: not frozen to begin with");
@@ -685,20 +743,20 @@ void TestPanel()
     Check(Click("TabCompare"), "panel: open the compare page");
     Check(!Centre("Intensity", &x, &y), "panel: the Model page is hidden now");
     Check(Click("Card"), "panel: click the card");
-    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g1 + 5, "panel: the card freezes the frame");
+    Check(FreezeWanted() && SettingsCurrent().card && Generation() == g1 + 5, "panel: the card freezes the frame");
     Check(Click("Freeze"), "panel: click the freeze box");
     Check(!FreezeWanted(), "panel: unfrozen");
-    Check(Generation() == g1 + 6 && !SettingsCurrent()->card, "panel: the card went with the freeze");
+    Check(Generation() == g1 + 6 && !SettingsCurrent().card, "panel: the card went with the freeze");
     // Unticking the card undoes the freeze it made; a freeze made by hand stays.
     Check(Click("Card"), "panel: click the card again");
-    Check(FreezeWanted() && SettingsCurrent()->card && Generation() == g1 + 7, "panel: the card freezes again");
+    Check(FreezeWanted() && SettingsCurrent().card && Generation() == g1 + 7, "panel: the card freezes again");
     Check(Click("Card"), "panel: untick the card");
-    Check(!FreezeWanted() && !SettingsCurrent()->card && Generation() == g1 + 8,
+    Check(!FreezeWanted() && !SettingsCurrent().card && Generation() == g1 + 8,
           "panel: the card off undoes the freeze it made");
     Check(Click("Freeze") && FreezeWanted(), "panel: freeze by hand");
-    Check(Click("Card") && SettingsCurrent()->card && Generation() == g1 + 9,
+    Check(Click("Card") && SettingsCurrent().card && Generation() == g1 + 9,
           "panel: the card on a frame frozen by hand");
-    Check(Click("Card") && !SettingsCurrent()->card && Generation() == g1 + 10, "panel: the card off again");
+    Check(Click("Card") && !SettingsCurrent().card && Generation() == g1 + 10, "panel: the card off again");
     Check(FreezeWanted(), "panel: the freeze made by hand stays");
     Check(Click("Freeze") && !FreezeWanted(), "panel: unfrozen by hand");
     Check(Click("TabModel"), "panel: back to the Model page");
@@ -720,7 +778,7 @@ void TestPanel()
 
     // Skin structure reaches the model only with the auto mask on: greyed out, it takes no clicks until then.
     Check(Centre("SkinStructure", &x, &y), "panel: the skin structure slider was drawn");
-    Check(Click("SkinStructure", 0.8f) && Generation() == g2 && !SettingsCurrent()->model.skinStructure.set,
+    Check(Click("SkinStructure", 0.8f) && Generation() == g2 && !SettingsCurrent().model.skinStructure.set,
           "panel: skin structure takes no click while the auto mask is off");
     {
         MenuLock();
@@ -728,45 +786,67 @@ void TestPanel()
         MenuCommitLocked("test");
         MenuUnlock();
     }
-    Check(Generation() == g2 + 1 && SettingsCurrent()->model.autoMask.set, "panel: auto mask on published");
+    Check(Generation() == g2 + 1 && SettingsCurrent().model.autoMask.set, "panel: auto mask on published");
     Check(Click("SkinStructure", 0.8f), "panel: click skin structure with the auto mask on");
-    Check(Generation() == g2 + 2 && SettingsCurrent()->model.skinStructure.set &&
-              SettingsCurrent()->model.skinStructure.value > 0.9f,
+    Check(Generation() == g2 + 2 && SettingsCurrent().model.skinStructure.set &&
+              SettingsCurrent().model.skinStructure.value > 0.9f,
           "panel: with the auto mask on, a click on skin structure sets it (%.2f)",
-          double(SettingsCurrent()->model.skinStructure.value));
+          double(SettingsCurrent().model.skinStructure.value));
 
+    // The overlay composites only where the panel drew (MenuDrawnBounds): around the panel, not the whole frame; with
+    // the confirmation's modal up, whose dimming covers the frame, all of it.
+    {
+        Frame();
+        const ImVec2 size = ImGui::GetIO().DisplaySize;
+        const MenuRect drawn = MenuDrawnBounds(ImGui::GetDrawData(), unsigned(size.x), unsigned(size.y));
+        float cx0, cy0, cx1, cy1, tx0, ty0, tx1, ty1;
+        const bool shown = MenuItemRect("Close", &cx0, &cy0, &cx1, &cy1) && MenuItemRect("AB", &tx0, &ty0, &tx1, &ty1);
+        const double area = double(drawn.right - drawn.left) * double(drawn.bottom - drawn.top);
+        Check(shown && drawn.left <= long(std::min(cx0, tx0)) && drawn.top <= long(std::min(cy0, ty0)) &&
+                  drawn.right >= long(std::max(cx1, tx1)) && drawn.bottom >= long(std::max(cy1, ty1)) &&
+                  area < 0.5 * double(size.x) * double(size.y),
+              "panel: the drawn part is the panel's (%ld,%ld to %ld,%ld of %.0fx%.0f)", drawn.left, drawn.top,
+              drawn.right, drawn.bottom, double(size.x), double(size.y));
+    }
     // All defaults, through the confirmation.
     Check(Click("Defaults"), "panel: click all defaults");
     Frame();
+    {
+        const ImVec2 size = ImGui::GetIO().DisplaySize;
+        const MenuRect drawn = MenuDrawnBounds(ImGui::GetDrawData(), unsigned(size.x), unsigned(size.y));
+        Check(drawn.left == 0 && drawn.top == 0 && drawn.right == long(size.x) && drawn.bottom == long(size.y),
+              "panel: with the modal confirmation up the whole frame is drawn (%ld,%ld to %ld,%ld)", drawn.left,
+              drawn.top, drawn.right, drawn.bottom);
+    }
     Check(Click("DefaultsYes"), "panel: confirm");
-    Check(Generation() == g2 + 3 && !SettingsCurrent()->model.intensity.set &&
-              !SettingsCurrent()->model.autoMask.set && !SettingsCurrent()->model.skinStructure.set &&
-              Near(SettingsCurrent()->whiteEV, 0.0f, 1e-6f),
+    Check(Generation() == g2 + 3 && !SettingsCurrent().model.intensity.set &&
+              !SettingsCurrent().model.autoMask.set && !SettingsCurrent().model.skinStructure.set &&
+              Near(SettingsCurrent().whiteEV, 0.0f, 1e-6f),
           "panel: all defaults published");
 
-    // The depth page. A sky slider away from 1 gives the model a control mask, and with one the model keeps its own
+    // The Model page's depth and sky part. A sky slider away from 1 gives the model a control mask, and with one the model keeps its own
     // auto mask off: the auto mask takes no input until both sky sliders are back at 1.
     const unsigned g3 = Generation();
-    Check(!Centre("SkyStructure", &x, &y), "panel: the sky sliders wait on the depth page");
-    Check(Click("TabDepth"), "panel: open the depth page");
+    Check(!Centre("SkyStructure", &x, &y), "panel: the sky sliders wait in the Model page's depth and sky part");
+    Check(DepthSky(), "panel: open the depth and sky part of the Model page");
     Check(!Centre("DetailStrength", &x, &y), "panel: the tuning page is hidden now");
     Check(Click("SkyStructure", 0.1f), "panel: click sky local structure near its left end");
-    Check(Generation() == g3 + 1 && SettingsCurrent()->skyStructure < 0.3f,
+    Check(Generation() == g3 + 1 && SettingsCurrent().skyStructure < 0.3f,
           "panel: the click publishes the value under the mouse at once (%.2f, generation %u)",
-          double(SettingsCurrent()->skyStructure), Generation());
-    Check(Click("ShowSky") && SettingsCurrent()->showSky && Generation() == g3 + 2, "panel: the sky's stripes on");
+          double(SettingsCurrent().skyStructure), Generation());
+    Check(Click("ShowSky") && SettingsCurrent().showSky && Generation() == g3 + 2, "panel: the sky's stripes on");
     Check(Click("TabModel") && Centre("AutoMask", &x, &y), "panel: back on Model, the auto mask is drawn");
     Check(Click("AutoMask", 0.5f, 1) && Generation() == g3 + 2,
           "panel: the auto mask takes no right-click while a sky slider is away from 1");
-    Check(Click("TabDepth") && Click("SkyStructure", 0.5f, 1), "panel: right-click sky local structure");
-    Check(Generation() == g3 + 3 && SettingsCurrent()->skyStructure == 1.0f, "panel: sky local structure back to 1");
+    Check(DepthSky() && Click("SkyStructure", 0.5f, 1), "panel: right-click sky local structure");
+    Check(Generation() == g3 + 3 && SettingsCurrent().skyStructure == 1.0f, "panel: sky local structure back to 1");
     Check(Click("TabModel") && Click("AutoMask", 0.5f, 1) && Generation() == g3 + 4,
           "panel: with both sky sliders at 1 the auto mask takes a right-click again");
-    Check(Click("TabDepth") && Click("DilateMotion") && SettingsCurrent()->dilateMotion && Generation() == g3 + 5,
+    Check(DepthSky() && Click("DilateMotion") && SettingsCurrent().dilateMotion && Generation() == g3 + 5,
           "panel: dilate by depth on, published at once");
     Check(Click("TabModel"), "panel: back to the Model page");
 
-    // The speed page: the model's input size is a slider like the others, under it the size the pass gives the model
+    // The Picture page: the model's input size is a slider like the others, under it the size the pass gives the model
     // and its time on the GPU, as the pass reports them.
     const unsigned g4 = Generation();
     g_fakeStatus.modelWidth = 2560;
@@ -774,18 +854,17 @@ void TestPanel()
     g_fakeStatus.haveTiming = true;
     g_fakeStatus.gpuMs = 4.1f;
     g_fakeStatus.modelMs = 3.8f;
-    Check(!Centre("ModelScale", &x, &y), "panel: the model's input size waits on the speed page");
-    Check(Click("TabSpeed"), "panel: open the speed page");
-    Check(!Centre("DetailStrength", &x, &y), "panel: the tuning page is hidden now");
+    Check(!Centre("ModelScale", &x, &y), "panel: the model's input size waits on the Picture page");
+    Check(Click("TabPicture"), "panel: the model's input size on the Picture page");
     Check(Click("ModelScale", 0.1f), "panel: click the model's input size near its left end");
-    Check(Generation() == g4 + 1 && SettingsCurrent()->modelScale < 60.0f,
+    Check(Generation() == g4 + 1 && SettingsCurrent().modelScale < 60.0f,
           "panel: the click publishes the size under the mouse at once (%.0f%%, generation %u)",
-          double(SettingsCurrent()->modelScale), Generation());
-    Check(Click("ModelScale", 0.5f, 1) && Generation() == g4 + 2 && SettingsCurrent()->modelScale == 100.0f,
+          double(SettingsCurrent().modelScale), Generation());
+    Check(Click("ModelScale", 0.5f, 1) && Generation() == g4 + 2 && SettingsCurrent().modelScale == 100.0f,
           "panel: a right-click puts the model's input size back to 100%%");
     {
         const bool clicked = Click("ModelScale", 0.5f);
-        const float size = SettingsCurrent()->modelScale;
+        const float size = SettingsCurrent().modelScale;
         Check(clicked && Generation() == g4 + 3 && size == kModelScaleTwoThirds,
               "panel: a click halfway along is two thirds (%.4g%%)", double(size));
     }
@@ -806,7 +885,7 @@ void TestPanel()
         float last = 0.0f;
         auto note = [&](bool there)
         {
-            const float value = SettingsCurrent()->modelScale;
+            const float value = SettingsCurrent().modelScale;
             stepsOnly &= ModelScaleStep(value) == value;
             inOrder &= there ? value >= last : value <= last;
             last = value;
@@ -833,7 +912,7 @@ void TestPanel()
               "panel: the model's input size slider's ends");
         MoveTo(left, y);
         Button(0, true);
-        last = SettingsCurrent()->modelScale;
+        last = SettingsCurrent().modelScale;
         Check(last == kModelScaleThird, "panel: pressed at its left end, the size is a third (%.4g%%)", double(last));
         for (float at = left; at <= right; at += 0.25f)
         {
@@ -873,20 +952,21 @@ void TestPanel()
         }
         Check(shown(49.0f, true) > 0 && shown(49.0f, false) == 0 && shown(51.0f, true) == 0 && shown(51.0f, false) > 0,
               "panel: 49%% comes up on the way to the stop at 50%%, 51%% on the way back");
-        Check(SettingsCurrent()->modelScale == kModelScaleThird && LogCount("menu slider: ModelScale") == logged + 1,
+        Check(SettingsCurrent().modelScale == kModelScaleThird && LogCount("menu slider: ModelScale") == logged + 1,
               "panel: let go at the left end, a third, the drag logged once");
     }
     g_fakeStatus.haveTiming = false;
     Frame();
     Check(Click("TabModel"), "panel: back to the Model page");
 
-    // New model controls: weights on the Model page; the sky + auto mask combination on the Depth page under the
-    // sky sliders. Auto (the default) and modes 1..3 permit the automatic mask with sky; mode 0 by hand keeps the
+    // New model controls: weights on the Model page; the sky + auto mask combination in its depth and sky part under
+    // the sky sliders. Auto (the default) and modes 1..3 permit the automatic mask with sky; mode 0 by hand keeps the
     // legacy restriction.
     g_fakeStatus.model = { 310, 9, 16, 0 };
     Frame();
-    Check(Centre("Preset", &x, &y) && !Centre("MaskBlendMode", &x, &y),
-          "panel: the new profile shows model weights on the Model page, the mask combination elsewhere");
+    Check(Centre("Preset", &x, &y) && Centre("MaskBlendMode", &x, &y),
+          "panel: the new profile shows model weights on the Model page, and the mask combination in its depth and "
+          "sky part");
     {
         MenuLock();
         auto& settings = MenuModelLocked().draft;
@@ -901,29 +981,29 @@ void TestPanel()
     unsigned modesGeneration = Generation();
     Check(Click("SkinStructure", 0.8f) && Generation() == modesGeneration + 1,
           "panel: new nonzero blend mode permits skin structure with a sky mask");
-    Check(Click("Preset", 0.5f, 1) && !SettingsCurrent()->model.preset.set,
+    Check(Click("Preset", 0.5f, 1) && !SettingsCurrent().model.preset.set,
           "panel: preset right-click restores DLL default");
-    Check(Click("TabDepth") && Centre("MaskBlendMode", &x, &y) && Centre("AutoMask", &x, &y),
-          "panel: the Depth page has the mask combination and the auto mask under the sky sliders");
-    Check(Click("MaskBlendMode", 0.5f, 1) && !SettingsCurrent()->model.maskBlendMode.set,
+    Check(DepthSky() && Centre("MaskBlendMode", &x, &y) && Centre("AutoMask", &x, &y),
+          "panel: the Model page has the mask combination under the sky sliders and the auto mask");
+    Check(Click("MaskBlendMode", 0.5f, 1) && !SettingsCurrent().model.maskBlendMode.set,
           "panel: mask combination right-click restores Auto");
     modesGeneration = Generation();
-    Check(Click("AutoMask", 0.5f, 1) && Generation() == modesGeneration + 1 && !SettingsCurrent()->model.autoMask.set,
+    Check(Click("AutoMask", 0.5f, 1) && Generation() == modesGeneration + 1 && !SettingsCurrent().model.autoMask.set,
           "panel: with Auto the auto mask stays usable while a sky slider is away from 1");
-    Check(Choose("AutoMask", 1) && SettingsCurrent()->model.autoMask.value == 1, "panel: auto mask on from the Depth page");
+    Check(Choose("AutoMask", 1) && SettingsCurrent().model.autoMask.value == 1, "panel: auto mask on, the sky part open");
     modesGeneration = Generation();
     Check(Click("SkinStructure", 0.3f) && Generation() == modesGeneration + 1 &&
-              SettingsCurrent()->model.skinStructure.set,
-          "panel: the Depth page's skin structure slider applies next to the sky sliders");
-    Check(Choose("MaskBlendMode", 1) && SettingsCurrent()->model.maskBlendMode.set &&
-              SettingsCurrent()->model.maskBlendMode.value == 0,
+              SettingsCurrent().model.skinStructure.set,
+          "panel: the skin structure slider applies with the sky part open");
+    Check(Choose("MaskBlendMode", 1) && SettingsCurrent().model.maskBlendMode.set &&
+              SettingsCurrent().model.maskBlendMode.value == 0,
           "panel: \"Sky mask only\" chosen by hand is MaskBlendMode 0");
     modesGeneration = Generation();
     Check(Click("AutoMask", 0.5f, 1) && Generation() == modesGeneration,
           "panel: mode 0 by hand still disables automatic mask with a sky mask");
-    Check(Choose("MaskBlendMode", 0) && !SettingsCurrent()->model.maskBlendMode.set,
+    Check(Choose("MaskBlendMode", 0) && !SettingsCurrent().model.maskBlendMode.set,
           "panel: choosing Auto in the dropdown clears the setting");
-    Check(Click("TabModel"), "panel: back to the Model page after the Depth page");
+    Check(Click("TabModel"), "panel: back to the Model page after its depth and sky part");
     {
         MenuLock();
         auto& settings = MenuModelLocked().draft;
@@ -992,44 +1072,44 @@ void TestModelPageFirstRun()
     float x, y;
     Check(Centre("Preset", &x, &y) && Centre("ModelDefaults", &x, &y),
           "first run: weights and reset button are visible without Advanced");
-    Check(Choose("Preset", 1) && SettingsCurrent()->model.preset.set && SettingsCurrent()->model.preset.value == 1,
+    Check(Choose("Preset", 1) && SettingsCurrent().model.preset.set && SettingsCurrent().model.preset.value == 1,
           "first run: actual weights dropdown selects HT and publishes it");
-    Check(Choose("AutoMask", 1) && SettingsCurrent()->model.autoMask.value == 1,
+    Check(Choose("AutoMask", 1) && SettingsCurrent().model.autoMask.value == 1,
           "first run: actual automatic-mask dropdown enables it");
-    Check(Click("TabDepth") && Choose("MaskBlendMode", 3) && SettingsCurrent()->model.maskBlendMode.value == 2,
-          "first run: the Depth page's combination dropdown selects Keep the lower (mode 2) and publishes it");
+    Check(DepthSky() && Choose("MaskBlendMode", 3) && SettingsCurrent().model.maskBlendMode.value == 2,
+          "first run: the combination dropdown selects Keep the lower (mode 2) and publishes it");
     Check(Click("TabModel"), "first run: back to the Model page");
-    Check(Click("SkinStructure", 0.7f) && SettingsCurrent()->model.skinStructure.set,
+    Check(Click("SkinStructure", 0.7f) && SettingsCurrent().model.skinStructure.set,
           "first run: the skin slider applies with automatic mask enabled");
-    Check(Click("LocalTone", 0.25f) && SettingsCurrent()->model.localTone.set,
+    Check(Click("LocalTone", 0.25f) && SettingsCurrent().model.localTone.set,
           "first run: the model strength slider applies without an INI");
-    const ModelSettings saved = SettingsCurrent()->model;
+    const ModelSettings saved = SettingsCurrent().model;
     Sleep(1100);
     MenuOnEvaluate(nullptr);
     Check(FileHasAt(path, "Preset = 1", 5.0) && FileHasAt(path, "MaskBlendMode = 2", 0.0) &&
               FileHasAt(path, "AutoMask = 1", 0.0),
           "first run: idle auto-save creates the missing INI from menu choices");
     MenuSetOpen(false);
-    Check(SettingsLoad(path)->model == saved, "first run: reloading the generated INI restores all model choices");
+    Check(SettingsLoad(path).model == saved, "first run: reloading the generated INI restores all model choices");
     MenuOnEvaluate(nullptr);
     MenuSetOpen(true);
     Frame();
     Check(Click("TabModel"), "first run: reopen the Model page");
     for (unsigned preset : { 2u, 0u, 1u })
-        Check(Choose("Preset", preset) && SettingsCurrent()->model.preset.value == preset,
+        Check(Choose("Preset", preset) && SettingsCurrent().model.preset.value == preset,
               "first run: the weights dropdown selects request %u", preset);
-    Check(Click("TabDepth"), "first run: the Depth page");
-    Check(Choose("MaskBlendMode", 0) && !SettingsCurrent()->model.maskBlendMode.set,
+    Check(DepthSky(), "first run: the depth and sky part of the Model page");
+    Check(Choose("MaskBlendMode", 0) && !SettingsCurrent().model.maskBlendMode.set,
           "first run: the combination dropdown selects Auto");
     for (unsigned mode = 0; mode <= 3; ++mode)
-        Check(Choose("MaskBlendMode", mode + 1) && SettingsCurrent()->model.maskBlendMode.set &&
-                  SettingsCurrent()->model.maskBlendMode.value == mode,
+        Check(Choose("MaskBlendMode", mode + 1) && SettingsCurrent().model.maskBlendMode.set &&
+                  SettingsCurrent().model.maskBlendMode.value == mode,
               "first run: the combination dropdown selects mode %u by hand", mode);
     Check(Click("Close"), "first run: close the menu after changing mode");
     Check(FileHasAt(path, "MaskBlendMode = 3", 5.0), "first run: closing saves the last dropdown selection");
     MenuSetOpen(true);
     Frame();
-    Check(Click("TabModel") && Click("ModelDefaults") && SettingsCurrent()->model == ModelSettings {},
+    Check(Click("TabModel") && Click("ModelDefaults") && SettingsCurrent().model == ModelSettings {},
           "first run: one reset-model button restores all model defaults");
     MenuSetOpen(false);
     const ULONGLONG until = GetTickCount64() + 5000;
@@ -1619,12 +1699,192 @@ void TestCopy()
 }
 } // namespace
 
+// ---------------------------------------------------------------------------------------------------------------
+// menutest --shots dark|paper <folder>: the panel's pages as pictures, for looking at the layout without a game. ImGui's draw data
+// is filled on the CPU (nearest texel, blended as the overlay's 8-bit picture is), with the overlay's font (Segoe UI at
+// 20 px, 1080 lines) and the dark theme, over mid grey. Each page goes to <folder>\<name>.rgba: the width and height
+// (uint32 each), then RGBA8 rows from the top. Not a test: nothing is checked.
+
+namespace
+{
+void Raster(std::vector<uint8_t>& picture, int width, int height, const ImDrawData* data)
+{
+    for (ImTextureData* t : *data->Textures)
+    {
+        if (t->Status == ImTextureStatus_WantDestroy)
+        {
+            t->SetTexID(ImTextureID_Invalid);
+            t->SetStatus(ImTextureStatus_Destroyed);
+        }
+        else if (t->Status != ImTextureStatus_OK)
+        {
+            t->SetTexID(ImTextureID(intptr_t(t)));
+            t->SetStatus(ImTextureStatus_OK);
+        }
+    }
+    const ImVec2 at = data->DisplayPos;
+    for (const ImDrawList* list : data->CmdLists)
+    {
+        for (const ImDrawCmd& cmd : list->CmdBuffer)
+        {
+            if (cmd.UserCallback != nullptr || cmd.ElemCount == 0)
+                continue;
+            const ImTextureData* tex = cmd.TexRef._TexData;
+            const int cx0 = std::max(0, int(cmd.ClipRect.x - at.x)), cy0 = std::max(0, int(cmd.ClipRect.y - at.y));
+            const int cx1 = std::min(width, int(cmd.ClipRect.z - at.x)), cy1 = std::min(height, int(cmd.ClipRect.w - at.y));
+            for (unsigned i = 0; i + 2 < cmd.ElemCount; i += 3)
+            {
+                const ImDrawVert* v[3];
+                for (int k = 0; k < 3; ++k)
+                    v[k] = &list->VtxBuffer[int(cmd.VtxOffset + list->IdxBuffer[int(cmd.IdxOffset + i + k)])];
+                const float x0 = v[0]->pos.x - at.x, y0 = v[0]->pos.y - at.y, x1 = v[1]->pos.x - at.x,
+                            y1 = v[1]->pos.y - at.y, x2 = v[2]->pos.x - at.x, y2 = v[2]->pos.y - at.y;
+                const float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+                if (area == 0.0f)
+                    continue;
+                const int bx0 = std::max(cx0, int(std::floor(std::min({ x0, x1, x2 }))));
+                const int by0 = std::max(cy0, int(std::floor(std::min({ y0, y1, y2 }))));
+                const int bx1 = std::min(cx1, int(std::ceil(std::max({ x0, x1, x2 }))));
+                const int by1 = std::min(cy1, int(std::ceil(std::max({ y0, y1, y2 }))));
+                for (int y = by0; y < by1; ++y)
+                {
+                    for (int x = bx0; x < bx1; ++x)
+                    {
+                        const float px = x + 0.5f, py = y + 0.5f;
+                        const float w0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) / area;
+                        const float w1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) / area;
+                        const float w2 = 1.0f - w0 - w1;
+                        if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f)
+                            continue;
+                        float c[4];
+                        for (int k = 0; k < 4; ++k)
+                            c[k] = (w0 * float((v[0]->col >> (8 * k)) & 0xFF) + w1 * float((v[1]->col >> (8 * k)) & 0xFF) +
+                                    w2 * float((v[2]->col >> (8 * k)) & 0xFF)) / 255.0f;
+                        if (tex != nullptr && tex->Pixels != nullptr)
+                        {
+                            const float u = w0 * v[0]->uv.x + w1 * v[1]->uv.x + w2 * v[2]->uv.x;
+                            const float t = w0 * v[0]->uv.y + w1 * v[1]->uv.y + w2 * v[2]->uv.y;
+                            const int tx = std::clamp(int(u * tex->Width), 0, tex->Width - 1);
+                            const int ty = std::clamp(int(t * tex->Height), 0, tex->Height - 1);
+                            const unsigned char* texel = static_cast<const unsigned char*>(const_cast<ImTextureData*>(tex)->GetPixelsAt(tx, ty));
+                            if (tex->Format == ImTextureFormat_Alpha8)
+                                c[3] *= texel[0] / 255.0f;
+                            else
+                                for (int k = 0; k < 4; ++k)
+                                    c[k] *= texel[k] / 255.0f;
+                        }
+                        uint8_t* d = &picture[(size_t(y) * width + x) * 4];
+                        for (int k = 0; k < 3; ++k)
+                            d[k] = uint8_t(std::lround(c[k] * c[3] * 255.0f + d[k] * (1.0f - c[3])));
+                    }
+                }
+            }
+        }
+    }
+}
+
+int Shots(const wchar_t* folder, MenuTheme theme)
+{
+    WriteAll(g_ini, theme == MenuTheme::Dark ? "StatsLog = 0\r\nMenuTheme = dark\r\n" : "StatsLog = 0\r\nMenuTheme = paper\r\n");
+    SettingsLoad(g_ini);
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1920.0f, 1080.0f);
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    io.IniFilename = nullptr;
+    char font[MAX_PATH * 3] = {};
+    wchar_t fontPath[MAX_PATH];
+    GetWindowsDirectoryW(fontPath, MAX_PATH);
+    wcscat_s(fontPath, MAX_PATH, L"\\Fonts\\segoeui.ttf");
+    WideCharToMultiByte(CP_UTF8, 0, fontPath, -1, font, sizeof font, nullptr, nullptr);
+    if (io.Fonts->AddFontFromFileTTF(font, 20.0f) == nullptr)
+        io.Fonts->AddFontDefault();
+    MenuStyleApply(theme, 1.0f);
+    ImGui::GetStyle().AntiAliasedLinesUseTex = false; // lines drawn as triangles: the atlas's line texels need filtering
+
+    g_fakeStatus = {};
+    g_fakeStatus.attempted = true;
+    g_fakeStatus.haveFeature = true;
+    g_fakeStatus.ready = true;
+    g_fakeStatus.model = { 310, 9, 16, 0 };
+    g_fakeStatus.width = 3840;
+    g_fakeStatus.height = 2160;
+    g_fakeStatus.modelWidth = 3840;
+    g_fakeStatus.modelHeight = 2160;
+    g_fakeStatus.feature = 1;
+    g_fakeStatus.hdr = true;
+    g_fakeStatus.linear = true;
+    g_fakeStatus.havePreExposure = true;
+    g_fakeStatus.frames = 45158;
+    g_fakeStatus.haveTiming = true;
+    g_fakeStatus.gpuMs = 7.39f;
+    g_fakeStatus.modelMs = 7.17f;
+    MenuOnEvaluate(nullptr);
+    MenuSetOpen(true);
+    for (int i = 0; i < 3; ++i)
+        Frame();
+
+    unsigned written = 0;
+    auto shot = [&](const char* name) {
+        Frame();
+        Frame();
+        std::vector<uint8_t> picture(size_t(1920) * 1080 * 4, 0);
+        for (size_t i = 0; i < picture.size(); i += 4)
+        {
+            picture[i] = picture[i + 1] = picture[i + 2] = 96;
+            picture[i + 3] = 255;
+        }
+        Raster(picture, 1920, 1080, ImGui::GetDrawData());
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, MAX_PATH, L"%ls\\%hs.rgba", folder, name);
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"wb") != 0 || f == nullptr)
+            return;
+        const uint32_t size[2] = { 1920, 1080 };
+        fwrite(size, sizeof size, 1, f);
+        fwrite(picture.data(), 1, picture.size(), f);
+        fclose(f);
+        ++written;
+    };
+    // The pages, and each folded part of them unfolded.
+    const char* const pages[] = { "TabPicture", "TabModel", "TabCompare", "TabSettings" };
+    const char* const folds[] = { "Advanced", "DepthSky" };
+    for (const char* page : pages)
+    {
+        if (!Click(page))
+            continue;
+        shot(page);
+        for (const char* fold : folds)
+        {
+            if (!Click(fold))
+                continue;
+            char name[64];
+            snprintf(name, sizeof name, "%s-%s", page, fold);
+            shot(name);
+            Click(fold);
+        }
+    }
+    // The tallest: the Model page unfolded, A/B on and a sky slider away from 1 (the longer lines under Combine).
+    if (Click("AB") && Click("TabModel"))
+    {
+        float x, y;
+        if (!Centre("SkyTone", &x, &y))
+            Click("DepthSky");
+        Click("SkyStructure", 0.2f);
+        shot("Tallest");
+    }
+    std::printf("menutest: %u pictures in %ls\n", written, folder);
+    return written != 0 ? 0 : 1;
+}
+} // namespace
+
 int main(int argc, char** argv)
 {
     const bool noInput = argc == 2 && strcmp(argv[1], "--no-input") == 0;
-    if (argc != 1 && !noInput)
+    const bool shots = argc == 4 && strcmp(argv[1], "--shots") == 0;
+    if (argc != 1 && !noInput && !shots)
     {
-        std::puts("usage: menutest [--no-input]");
+        std::puts("usage: menutest [--no-input | --shots dark|paper <folder>]");
         return 1;
     }
     const DWORD length = GetTempPathW(MAX_PATH, g_directory);
@@ -1652,12 +1912,19 @@ int main(int argc, char** argv)
     wcscpy_s(local, MAX_PATH, g_directory);
     local[wcslen(local) - 1] = L'\0';
     SetEnvironmentVariableW(L"LOCALAPPDATA", local);
+    if (shots)
+    {
+        wchar_t folder[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, folder, MAX_PATH);
+        return Shots(folder, strcmp(argv[2], "paper") == 0 ? MenuTheme::Paper : MenuTheme::Dark);
+    }
 
     TestKeys();
     TestWrite();
     TestMaskSettings();
     TestModelScaleSteps();
     TestReload();
+    TestSnapshots();
     TestModel();
     TestPanel();
     TestModelPageFirstRun();

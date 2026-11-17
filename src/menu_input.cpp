@@ -367,7 +367,6 @@ void OnRawMouse(HWND window, const RAWMOUSE& m)
         return; // the user is elsewhere: not the menu's
 
     POINT pointer = LoadPointer();
-    bool moved = false;
     if ((m.usFlags & MOUSE_MOVE_ABSOLUTE) != 0)
     {
         // A tablet or a remote desktop: 0..65535 over the desktop.
@@ -378,16 +377,12 @@ void OnRawMouse(HWND window, const RAWMOUSE& m)
         const int height = GetSystemMetrics(whole ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
         POINT p = { left + MulDiv(m.lLastX, width, 65535), top + MulDiv(m.lLastY, height, 65535) };
         if (ScreenToClient(window, &p))
-        {
-            moved = p.x != pointer.x || p.y != pointer.y;
             pointer = p;
-        }
     }
     else if (m.lLastX != 0 || m.lLastY != 0)
     {
         pointer.x += m.lLastX;
         pointer.y += m.lLastY;
-        moved = true;
     }
     RECT client;
     if (GetClientRect(window, &client) && client.right > 0 && client.bottom > 0)
@@ -400,16 +395,20 @@ void OnRawMouse(HWND window, const RAWMOUSE& m)
     if (first)
         Log("menu: input: raw mouse data came, the pointer follows it");
 
-    if (!MenuTryLock(first || m.usButtonFlags != 0 ? 50 : 5))
-        return; // a long frame holds the lock: a movement lost is nothing, the next one tells the position
+    // A movement alone is only stored: the next frame tells ImGui the latest position (MenuInputNewFrame), so a mouse
+    // reporting thousands of times a second does not take the menu's lock as often. A button or the wheel goes in at
+    // once, after the position it came at.
+    if (m.usButtonFlags == 0 && !first)
+        return;
+    if (!MenuTryLock(50))
+        return; // a long frame holds the lock
     if (!g_capture.load(std::memory_order_acquire) || ImGui::GetCurrentContext() == nullptr)
     {
         MenuUnlock(); // closed while we waited
         return;
     }
     ImGuiIO& io = ImGui::GetIO();
-    if (moved || first)
-        TellPointer(io, window, pointer);
+    TellPointer(io, window, pointer); // nothing queued when ImGui has it there already
     if (m.usButtonFlags != 0)
         TellModifiers(io); // a Ctrl+click needs Ctrl as it is now, whoever saw the key
     struct Button

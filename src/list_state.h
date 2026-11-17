@@ -55,7 +55,7 @@ struct ListState
     ID3D12RootSignature* graphicsRoot;
     uint64_t graphicsTables[kListStateArgs]; // per graphics root parameter, the table's GPU handle; 0 not set
     ListStateArg args[kListStateArgs];
-    ListStateConstant constants[kListStateConstants];
+    ListStateConstant constants[kListStateConstants]; // in order of parameter, then offset
     unsigned constantCount;
     const void* table; // the list's function table at its last Reset
     const char* lost;  // why it is not known since that Reset (a call we cannot follow), for the log; else null
@@ -76,6 +76,7 @@ struct ListStateCounts
 void ListStateCount(ListStateCounts* out);
 
 // Binds `state` on `list` again, after the NR pass bound its own: heaps, then the graphics descriptor tables (the heap
-// change left them undefined), then the compute root signature, its arguments and the pipeline. The rest of the
+// change left them undefined), then the compute root signature, its arguments (each run of constants at consecutive offsets in one call) and the
+// pipeline. The rest of the
 // graphics state is left alone: the NR pass binds none of it.
 void ListStateRestore(ID3D12GraphicsCommandList* list, const ListState& state);

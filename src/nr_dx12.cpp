@@ -77,6 +77,15 @@ constexpr uint64_t kDumpGiveUp = 240;
 constexpr unsigned kMaxDumps = 16;            // per process: each is about 25 MB at 4K
 constexpr unsigned kPreviewWidth = 768;       // the preview picture's width to aim for: a fifth of a 4K frame
 constexpr double kPreviewHold = 0.5;          // seconds the preview is kept after the menu last asked for it
+// While the menu shows the preview: its picture at most this often, and the statistics behind its readouts (the
+// histogram, the counts) at most this often; each at once when the preview opens or shows something else. The log's
+// statistics come when they are due, apart from these.
+constexpr double kPreviewSeconds = 1.0 / 30.0;
+constexpr double kPanelStatsSeconds = 0.1;
+
+// Whether `seconds` have passed since `last`, a quarter of them early: frames do not come exactly on time, and at 60 fps
+// a 1/30 s interval due on the dot would fall to every third frame whenever one came a little early.
+bool Due(double now, double last, double seconds) { return now - last >= 0.75 * seconds; }
 constexpr unsigned kTimestamps = 4;           // per frame: the pass begins, the model begins, the model ends, the
                                               // pass ends
 constexpr unsigned kTimingSamples = 16;       // the menu and the log get the median of the last this many
@@ -655,6 +664,17 @@ struct Nr
     bool markersFailed = false;
     uint64_t recordings = 0;            // recordings into a game's list so far, each ended with a marker
     uint64_t ringRecording[kRing] = {}; // per descriptor slot, the recording of the frame that last used it
+    // What each descriptor last had written to it, so that the same view is not made again (Unchanged); valid while
+    // `generation` is as it was then. Every texture or buffer of ours made, and the heap, starts a new generation.
+    struct Written
+    {
+        ID3D12Resource* resource;
+        DXGI_FORMAT format;
+        uint8_t kind; // 0 nothing known, else a ViewKind
+        uint64_t generation;
+    };
+    Written written[kRing * kDescriptorsPerFrame] = {};
+    uint64_t generation = 1;
 
     // ModelScale: the model's picture as last evaluated (the frame's size, or smaller; 0 before the feature's first
     // evaluation), since which frame, and the size last logged. The fit's three textures (nr_fit.hlsl), at the
@@ -702,6 +722,9 @@ struct Nr
     Buffer statsReadback; // kStatsSlots slots of kStatsSlotBytes
     bool statsFailed = false;
     bool statsPending = false;
+    double panelStatsAt = 0.0; // when the menu's readouts last asked for statistics (kPanelStatsSeconds)
+    double previewAt = 0.0;    // when the preview picture was last rendered (kPreviewSeconds), and what it showed
+    unsigned previewKind = 0;
     bool statsForLog = false; // the copy in flight was asked for by the log; else by the preview alone
     FrameInfo statsInfo;
 
@@ -1160,6 +1183,7 @@ bool MakePipeline()
         return false;
     }
     g_nr.descriptorSize = g_nr.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ++g_nr.generation;
     return true;
 }
 
@@ -1245,6 +1269,7 @@ bool MakeTexture(Texture* texture, DXGI_FORMAT format, unsigned width, unsigned 
         return false;
     }
     *texture = { resource, format, width, height };
+    ++g_nr.generation;
     return true;
 }
 
@@ -1287,6 +1312,7 @@ bool MakeBuffer(Buffer* buffer, D3D12_HEAP_TYPE type, uint64_t size, const char*
         }
     }
     *buffer = { resource, static_cast<const uint8_t*>(mapped), size };
+    ++g_nr.generation;
     return true;
 }
 
@@ -1596,6 +1622,7 @@ void DropPreview()
     ID3D12Resource* const resources[1] = { g_nr.preview.resource };
     Park(nullptr, resources, 1);
     g_nr.preview = {};
+    g_nr.previewAt = g_nr.panelStatsAt = 0.0; // the next one at once
     AcquireSRWLockExclusive(&g_previewLock);
     g_preview = {};
     g_preview.generation = ++g_nr.previewGeneration;
@@ -2047,9 +2074,38 @@ D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle(unsigned slot)
     return handle;
 }
 
-// A texture SRV at `slot`; a null one (reads as zero) when `resource` is null.
-void WriteSrv(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format)
+enum ViewKind : uint8_t
 {
+    kSrvView = 1,
+    kTextureUavView,
+    kBufferUavView,
+};
+
+// True when `slot` already holds this view, of a texture or buffer of ours or of nothing, made since our last
+// texture, buffer or heap was made; else notes it as about to be written. A view of the game's (`game`) is written
+// every time: a texture of its made again can come back at the same address. Run writes only a frame's own slots,
+// once the GPU is done with them, so a view left alone is the one the frame needs.
+bool Unchanged(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, ViewKind kind, bool game)
+{
+    Nr::Written& w = g_nr.written[slot];
+    if (game)
+    {
+        w = {};
+        return false;
+    }
+    if (resource == nullptr)
+        format = DXGI_FORMAT_UNKNOWN;
+    if (w.kind == kind && w.resource == resource && w.format == format && w.generation == g_nr.generation)
+        return true;
+    w = { resource, format, uint8_t(kind), g_nr.generation };
+    return false;
+}
+
+// A texture SRV at `slot`; a null one (reads as zero) when `resource` is null.
+void WriteSrv(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, bool game = false)
+{
+    if (Unchanged(slot, resource, format, kSrvView, game))
+        return;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
     srv.Format = resource != nullptr ? format : DXGI_FORMAT_R16G16B16A16_FLOAT;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2058,8 +2114,10 @@ void WriteSrv(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format)
     g_nr.device->CreateShaderResourceView(resource, &srv, CpuHandle(slot));
 }
 
-void WriteTextureUav(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format)
+void WriteTextureUav(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, bool game = false)
 {
+    if (Unchanged(slot, resource, format, kTextureUavView, game))
+        return;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.Format = resource != nullptr ? format : DXGI_FORMAT_R16G16B16A16_FLOAT;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -2069,6 +2127,8 @@ void WriteTextureUav(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format
 // A raw (byte address) buffer UAV; a null one when the buffer has no resource.
 void WriteBufferUav(unsigned slot, const Buffer* buffer)
 {
+    if (Unchanged(slot, buffer != nullptr ? buffer->resource : nullptr, DXGI_FORMAT_R32_TYPELESS, kBufferUavView, false))
+        return;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.Format = DXGI_FORMAT_R32_TYPELESS;
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -2079,10 +2139,12 @@ void WriteBufferUav(unsigned slot, const Buffer* buffer)
 }
 
 // One slot of a descriptor table: a texture and the format to view it with; null where the pass reads nothing.
+// `game`: the game's texture, whose view is written every frame (Unchanged).
 struct View
 {
     ID3D12Resource* resource;
     DXGI_FORMAT format;
+    bool game = false;
 };
 
 // A table of nr.hlsl or nr_stats.hlsl (nr_shared.h): the seven SRVs, the texture in u0, the buffer in u1, nothing in
@@ -2090,19 +2152,37 @@ struct View
 void WriteTable(unsigned table, const View (&srvs)[kSrvs], View target, const Buffer* buffer)
 {
     for (unsigned i = 0; i < kSrvs; ++i)
-        WriteSrv(table + i, srvs[i].resource, srvs[i].format);
-    WriteTextureUav(table + kUav0, target.resource, target.format);
+        WriteSrv(table + i, srvs[i].resource, srvs[i].format, srvs[i].game);
+    WriteTextureUav(table + kUav0, target.resource, target.format, target.game);
     WriteBufferUav(table + kUav1, buffer);
     WriteTextureUav(table + kUav2, nullptr, DXGI_FORMAT_UNKNOWN);
 }
 
+// What our passes have bound on the list Run records into: a run of them sets the descriptor heap and the root
+// signature once, and the pipeline only when it changes. Run forgets it at its start and after the model's
+// evaluation, which binds its own; nothing else binds on the list in between.
+struct Bound
+{
+    ID3D12GraphicsCommandList* list;
+    ID3D12PipelineState* pipeline;
+};
+Bound g_bound;
+
 void Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline, unsigned table,
               const NrConstants& constants, unsigned groupsX, unsigned groupsY)
 {
-    ID3D12DescriptorHeap* heaps[] = { g_nr.heap };
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRootSignature(g_nr.rootSignature);
-    list->SetPipelineState(pipeline);
+    if (g_bound.list != list)
+    {
+        ID3D12DescriptorHeap* heaps[] = { g_nr.heap };
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootSignature(g_nr.rootSignature);
+        g_bound = { list, nullptr };
+    }
+    if (g_bound.pipeline != pipeline)
+    {
+        list->SetPipelineState(pipeline);
+        g_bound.pipeline = pipeline;
+    }
     list->SetComputeRoot32BitConstants(0, NR_CONSTANTS_DWORDS, &constants, 0);
     list->SetComputeRootDescriptorTable(1, GpuHandle(table));
     list->Dispatch(groupsX, groupsY, 1);
@@ -2357,6 +2437,7 @@ __declspec(noinline) void LogModelRecovered(uint64_t failures)
 void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, unsigned feature, bool previewing)
 {
     const uint64_t frameIndex = g_nr.frame++;
+    g_bound = {};
     g_nr.ringRecording[frameIndex % kRing] = g_nr.recordings;
     const unsigned base = unsigned(frameIndex % kRing) * kDescriptorsPerFrame;
     const unsigned encodeTable = base;
@@ -2424,17 +2505,23 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     g_nr.encodeKey = key;
     g_nr.haveEncodeKey = true;
 
-    // What this frame carries besides the pass itself: the statistics when the log asked for them or the menu shows
-    // the preview (whenever the last copy has landed), a dump (the request is only taken once the dump is recorded),
-    // the preview picture while the menu asks for it.
+    // What this frame carries besides the pass itself: the statistics when the log asked for them or the menu's
+    // readouts are due (once the last copy has landed), a dump (the request is only taken once the dump is recorded),
+    // the preview picture when it is due (kPreviewSeconds, kPanelStatsSeconds).
+    const double now = LogClock();
     const bool logStats = g_nr.statsWanted.load(std::memory_order_relaxed);
-    const bool stats = !g_nr.statsPending && (logStats || previewing) && EnsureStats();
+    const bool panelStats = previewing && Due(now, g_nr.panelStatsAt, kPanelStatsSeconds);
+    const bool stats = !g_nr.statsPending && (logStats || panelStats) && EnsureStats();
     if (stats && logStats)
         g_nr.statsWanted.store(false, std::memory_order_relaxed);
+    if (stats && previewing)
+        g_nr.panelStatsAt = now;
+    const unsigned previewKind = 1u + (s.preview == Preview::Output ? 1u : 0u) + (s.zebra ? 2u : 0u);
     const bool dumpDue = g_nr.dumpState.load(std::memory_order_acquire) == kDumpIdle &&
                          g_nr.dumpWanted.load(std::memory_order_relaxed) && EnsureDump(f);
     const DumpLayout layout = dumpDue ? Layout(f.width, f.height) : DumpLayout {};
-    const bool preview = previewing && EnsurePreview(f);
+    const bool preview = previewing && (Due(now, g_nr.previewAt, kPreviewSeconds) || previewKind != g_nr.previewKind) &&
+                         EnsurePreview(f);
 
     // What the game's depth adds: the motion vectors dilated by it (DilateMotion), the control mask that sets the sky
     // apart (the sky sliders), the stripes over the sky (ShowSky, in the constants already). Each needs the depth in
@@ -2457,13 +2544,16 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
 
     // The descriptor tables (nr_shared.h has which pass reads which slot).
     const View none = { nullptr, DXGI_FORMAT_UNKNOWN };
-    const View frameView = { f.output, outputView };
-    const View exposureV = { exposure, exposureView };
+    const View frameView = { f.output, outputView, true };
+    const View exposureV = { exposure, exposureView, !meter }; // the game's, or the scene meter's own
     const View proxyV = { g_nr.proxy.resource, g_nr.proxy.format };
     const View modelV = { g_nr.modelOutput.resource, g_nr.modelOutput.format };
-    const View depthV = { f.depth, depthView };
+    const View depthV = { f.depth, depthView, true };
     const Buffer* const statsBuffer = stats ? &g_nr.stats : nullptr;
-    const Buffer* const castBuffer = cast ? &g_nr.cast : nullptr;
+    // The composite's white balance sums: on a statistics frame the gain and spread passes' (the same words), else the
+    // cast pass's own buffer.
+    const bool castPass = cast && !stats;
+    const Buffer* const castBuffer = !cast ? nullptr : stats ? &g_nr.stats : &g_nr.cast;
     WriteTable(encodeTable, { frameView, none, none, exposureV, none, none, none }, proxyV, statsBuffer);
     if (stats)
         WriteTable(gainTable, { none, modelV, proxyV, none, none, none, none }, none, statsBuffer);
@@ -2496,7 +2586,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         WriteTable(meterTable, { frameView, none, none, none, none, none, none },
                    { g_nr.scene.resource, DXGI_FORMAT_R32_FLOAT }, &g_nr.meter);
     if (dilate)
-        WriteTable(dilateTable, { depthV, { f.motion, motionView }, none, none, none, none, none },
+        WriteTable(dilateTable, { depthV, { f.motion, motionView, true }, none, none, none, none, none },
                    { g_nr.dilated.resource, g_nr.dilated.format }, nullptr);
     if (sky)
         WriteTable(skyTable, { depthV, none, none, none, none, none, none }, { g_nr.mask.resource, g_nr.mask.format },
@@ -2635,6 +2725,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     if (timing)
         list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 1);
     const int result = g_nr.bridge.evaluate(list, g_nr.handle, g_nr.evalParams, nullptr);
+    g_bound = {}; // the model bound its own
     if (timing)
         list->EndQuery(g_nr.queries, D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimestamps + 2);
     const bool delivered = result == NVSDK_NGX_Result_Success;
@@ -2683,11 +2774,13 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         count = 0;
         Transition(&barriers[count++], f.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (cast)
+        if (castPass)
             Transition(&barriers[count++], g_nr.cast.resource, D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (stats && cast)
+            UavBarrier(&barriers[count++], g_nr.stats.resource);
         list->ResourceBarrier(count, barriers);
-        if (cast)
+        if (castPass)
         {
             // This frame's sums, emptied first, then the spread around their means, then read by the composite (u1
             // of its table).
@@ -2715,7 +2808,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
         constants.badgeSize = LogClock() < g_nr.badgeUntil ? g_nr.badgeSize : 0;
         Dispatch(list, g_nr.pipeline, compositeTable, constants, groupsX, groupsY);
         constants.badgeSize = 0;
-        if (cast)
+        if (castPass)
         {
             Transition(&barriers[0], g_nr.cast.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                        D3D12_RESOURCE_STATE_COMMON);
@@ -2771,6 +2864,8 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, barriers);
         PublishPicture(frameIndex);
+        g_nr.previewAt = now;
+        g_nr.previewKind = previewKind;
     }
 
     // The copies the CPU reads a few frames from now.
@@ -3139,7 +3234,7 @@ DWORD WINAPI Worker(void*)
     {
         Sleep(250);
         SettingsReloadIfChanged();
-        const Settings* s = SettingsCurrent();
+        const Settings s = SettingsCurrent();
         const double now = LogClock();
 
         if (g_sampleState.load(std::memory_order_acquire) == 1)
@@ -3147,12 +3242,12 @@ DWORD WINAPI Worker(void*)
             LogSample(g_sample);
             g_sampleState.store(0, std::memory_order_release);
         }
-        if (s->statsSeconds > 0.0f)
+        if (s.statsSeconds > 0.0f)
         {
             if (now >= nextStats)
             {
                 g_nr.statsWanted.store(true, std::memory_order_relaxed);
-                nextStats = now + double(s->statsSeconds);
+                nextStats = now + double(s.statsSeconds);
             }
         }
         else
@@ -3167,15 +3262,15 @@ DWORD WINAPI Worker(void*)
             WriteDump(++dumps);
             g_nr.dumpState.store(kDumpIdle, std::memory_order_release);
         }
-        if (s->dumpSeconds > 0.0f && dumps < kMaxDumps)
+        if (s.dumpSeconds > 0.0f && dumps < kMaxDumps)
         {
             // The first a little after dumps are switched on (or NR starts), then every DumpEvery seconds.
             if (nextDump == 0.0)
-                nextDump = now + (s->dumpSeconds < 20.0f ? double(s->dumpSeconds) : 20.0);
+                nextDump = now + (s.dumpSeconds < 20.0f ? double(s.dumpSeconds) : 20.0);
             if (now >= nextDump)
             {
                 g_nr.dumpWanted.store(true, std::memory_order_relaxed);
-                nextDump = now + double(s->dumpSeconds);
+                nextDump = now + double(s.dumpSeconds);
             }
         }
         else
@@ -3254,9 +3349,10 @@ void PublishStatus()
 
 // Under the lock: everything after the cheap checks.
 // `game` is filled with what the game has bound on `list` before anything is recorded into it, and `*captured` set;
-// the caller binds it again afterwards.
+// the caller then ends the recording with a marker, and binds the game's state again if `*bound` (we or the model
+// bound our own).
 Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, const NrSource& source, ListState* game,
-              bool* captured, const char** detail)
+              bool* captured, bool* bound, const char** detail)
 {
     if (g_nr.off.load(std::memory_order_relaxed))
         return kSkipOff; // turned off between the caller's check and its lock (the game shutting the core down)
@@ -3268,10 +3364,10 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
             SettingsLoad(ini);
         StartWorker(); // after the first load: from here on only that thread reads the file
     }
-    const Settings* s = SettingsCurrent(); // one snapshot for the whole frame
-    g_nr.requestedPreset = ModelRequestedPreset(s->model);
+    const Settings s = SettingsCurrent(); // one snapshot for the whole frame
+    g_nr.requestedPreset = ModelRequestedPreset(s.model);
     // The preview lives only while the menu asks for it: closing the menu frees the picture.
-    const bool previewing = PreviewWanted(*s);
+    const bool previewing = PreviewWanted(s);
     if (g_nr.preview.resource != nullptr && !previewing)
         DropPreview();
     if (params == nullptr)
@@ -3292,6 +3388,13 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
         return kSkipGeometry;
     }
     NoteFrame(frame, source.feature);
+    // NR off with nothing frozen and nothing retired waiting for a recording to land: nothing to record, so the
+    // game's list is left alone (no capture, no restore, no marker).
+    if (!s.enabled && !FreezeWanted() && !FreezeActive() && g_nr.parked.empty())
+    {
+        g_nr.wasDisabled = true; // the model's history is stale by the time NR is back
+        return kSkipDisabled;
+    }
     // Everything below may record into the game's list and bind state of its own (ours, the model's).
     if (!ListStateCapture(list, game, detail))
         return kSkipState;
@@ -3305,7 +3408,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     // The frozen frame (M3, freeze.h) goes first, NR on or off: with NR off the frozen picture still replaces the
     // game's Output, so that A/B and the split screen compare the same picture.
     FreezeApply(list, &frame);
-    if (!s->enabled)
+    if (!s.enabled)
     {
         g_nr.wasDisabled = true; // the model's history is stale by the time NR is back
         return kSkipDisabled;
@@ -3320,6 +3423,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     ++g_nr.evaluatesSeen;
     if (!g_nr.ready)
     {
+        *bound = true; // the calls below bind our own state, or the model's, on the list
         if (!Initialise(list))
         {
             Off("initialisation failed, see above");
@@ -3345,7 +3449,7 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     CollectDump();
     const ModelCreationKey active { g_nr.createdWidth, g_nr.createdHeight,
                                     ModelPresetKey(g_nr.model, g_nr.createdPreset) };
-    const ModelCreationKey requested = ModelCreateKey(g_nr.model, frame.width, frame.height, s->model);
+    const ModelCreationKey requested = ModelCreateKey(g_nr.model, frame.width, frame.height, s.model);
     if (g_nr.handle != nullptr)
     {
         const ModelRebuild plan = ModelPlanRebuild(active, requested, g_nr.evaluatesSeen - g_nr.createdAt,
@@ -3367,7 +3471,8 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
             g_nr.describedFrame = true;
             DescribeFrame(frame);
         }
-        if (!CreateFeature(list, frame, s->model))
+        *bound = true;
+        if (!CreateFeature(list, frame, s.model))
             return kSkipOff;
         return kSkipCreated;
     }
@@ -3381,7 +3486,8 @@ Skip Evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* params, cons
     // with them.
     if (g_nr.frame >= kRing && !Landed(g_nr.ringRecording[g_nr.frame % kRing]))
         return kSkipInFlight;
-    Run(list, frame, *s, source.feature, previewing);
+    *bound = true;
+    Run(list, frame, s, source.feature, previewing);
     return kSkipNone;
 }
 } // namespace
@@ -3399,12 +3505,13 @@ void NrAfterEvaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* param
         return;
     }
     static ListState game; // under g_lock
-    bool captured = false;
+    bool captured = false, bound = false;
     const char* detail = nullptr; // why the list's state is not known, when that is the reason
-    const Skip skip = Evaluate(list, params, source, &game, &captured, &detail);
+    const Skip skip = Evaluate(list, params, source, &game, &captured, &bound, &detail);
     if (captured)
     {
-        ListStateRestore(list, game);
+        if (bound)
+            ListStateRestore(list, game);
         if (g_nr.markers.resource != nullptr && !MarkRecording(list) && !g_nr.off.load(std::memory_order_relaxed))
             Off("the game's command list cannot write a completion marker (no ID3D12GraphicsCommandList2)");
     }

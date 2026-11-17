@@ -7,7 +7,7 @@
 #include "settings.h"
 
 // Publishes a snapshot and returns it: SettingsPublish in the game, the test's stand-in in menutest.
-typedef const Settings* (*MenuPublishFn)(const Settings&);
+typedef Settings (*MenuPublishFn)(const Settings&);
 
 struct MenuModel
 {
@@ -33,7 +33,7 @@ Settings MenuModelEffective(const MenuModel& m);
 
 // The panel changed the draft (a slider moved, a box ticked) or A/B flipped: publishes the effective snapshot and
 // remembers it. Returns the snapshot. `now` is LogClock().
-const Settings* MenuModelCommit(MenuModel* m, double now, MenuPublishFn publish);
+Settings MenuModelCommit(MenuModel* m, double now, MenuPublishFn publish);
 
 // The file is written a second after the last commit, or at once when the menu is closed.
 bool MenuModelWriteDue(const MenuModel& m, double now);

@@ -151,19 +151,18 @@ constexpr float kModelScaleStops[] = { kModelScaleThird, 50.0f, kModelScaleTwoTh
 float ModelScaleStep(float percent);
 
 // Reads the file (absent is fine: defaults), publishes the snapshot and logs what it read. Returns the snapshot.
-const Settings* SettingsLoad(const wchar_t* iniPath);
+Settings SettingsLoad(const wchar_t* iniPath);
 
 // Reads the file again if its time stamp or size changed since the last read; for a background thread. True when a
-// new snapshot was published. Snapshots it replaces are freed a few seconds later, when no evaluation can still be
-// looking at them.
+// new snapshot was published.
 bool SettingsReloadIfChanged();
 
-// The current snapshot; the defaults until SettingsLoad. Never null.
-const Settings* SettingsCurrent();
+// A copy of the current snapshot, taken whole under a short lock; the defaults until SettingsLoad. Any thread.
+Settings SettingsCurrent();
 
-// The menu committed (M3): publishes a copy of `settings` as the next generation and retires the one before, like a
-// reload does. Returns the published snapshot. Any thread; a few at once are fine.
-const Settings* SettingsPublish(const Settings& settings);
+// The menu committed (M3): publishes `settings` as the next generation, as a reload does. Returns what was published.
+// Any thread; a few at once are fine.
+Settings SettingsPublish(const Settings& settings);
 
 // The menu wrote the file: its new time stamp and size are noted so that SettingsReloadIfChanged does not read our
 // own write back (the snapshot already holds it).
