@@ -135,7 +135,7 @@ struct NrConstants
     // How much of the model's white balance the composite divides out of each pixel's colour (NR_FLAG_CAST):
     // 1 - GlobalColour.
     NR_FLOAT castColour;
-    NR_UINT unused0;
+    NR_FLOAT statsScale; // fixed-point units per sum: NrStatsScale(modelWidth, modelHeight)
     NR_UINT unused1;
     NR_UINT unused2;
 };
@@ -189,7 +189,7 @@ static_assert(sizeof(NrConstants) == 160, "NrConstants is passed as root constan
 // The gain pass's sums over the model's picture: what the model does to the frame as a whole, its brightness (each
 // pixel weighted by its luminance in the proxy, so that the near black counts for little) and its white balance (each
 // weighted by how grey it is, nr_common.hlsli's Greyness), and the colour of what it was given. Signed fixed point,
-// NR_G_SCALE to 1 (int32 bits).
+// statsScale to 1 (int32 bits), the same for every sum and both passes of a frame.
 #define NR_S_GLOBAL (NR_S_COUNTS + NR_COUNTS)
 #define NR_G_WEIGHT 0   // the luminances themselves
 #define NR_G_GAIN 1     // times the model's brightness change in EV (ModelGain, before DetailStrength), held to +-2
@@ -215,6 +215,20 @@ static_assert(sizeof(NrConstants) == 160, "NrConstants is passed as root constan
 #define NR_G_B_TINT_B 16 // chroma B times tint B
 #define NR_GLOBALS 17
 #define NR_G_SCALE 64.0
+#ifdef __cplusplus
+// Keep 4K's precision, reducing it only when the sums need the range. With N pixels and G groups, the spread pass's
+// guard bounds all 17 sums, including group rounding, by 4*N*scale + 128*G (nr_stats.hlsl). Leave room below INT32_MAX
+// for float arithmetic too. At Direct3D's largest 16384x16384 texture this still returns 1, never zero.
+inline float NrStatsScale(uint32_t width, uint32_t height)
+{
+    const double pixels = double(width) * double(height);
+    const double groups = double((width + 31) / 32) * double((height + 31) / 32);
+    float scale = float(NR_G_SCALE);
+    while (4.0 * pixels * scale + 128.0 * groups > 2140000000.0)
+        scale *= 0.5f;
+    return scale;
+}
+#endif
 // The grey taken for granted as untinted when the white balance is divided out (nr.hlsl's TakeCastOff), as a share of
 // the model's picture.
 #define NR_GREY_PRIOR (1.0 / 256.0)

@@ -166,7 +166,7 @@ float CastSum(uint i) { return float(asint(gDump.Load((NR_S_GLOBAL + i) * 4))); 
 // swung the greys' colour from frame to frame more than no correction at all (Quake II RTX through tools/nrloop.py);
 // the intercept is the tint of a grey. A ridge of NR_GREY_SPREAD^2 on A: greyish pixels with little spread of chroma
 // give no slope, and b is then their mean tint; nor do covariances the sums' rounding could make up: each of the
-// cast pass's groups rounds its sums once to 1/NR_G_SCALE, so the ridge grows by that much over the greyness at most.
+// cast pass's groups rounds its sums once to 1/statsScale, so the ridge grows by that much over the greyness at most.
 // In means: b = mean t - Cov(c, t)' (Cov(c) + ridge)^-1 mean c. The
 // slope's share counts only as far as the fit is trusted to reach grey from its pixels: times NR_GREY_REACH /
 // (NR_GREY_REACH + d^2), d^2 = mean c' (Cov(c) + spread^2)^-1 mean c, so that greyish pixels all far from grey, a frame
@@ -180,6 +180,8 @@ float2 CastTint(float grey, float prior)
     const float shrink = grey / (grey + prior);
     // Cov(c) + ridge, and Cov(c, t) one column per tint (R, then B): the spread pass summed them around the means.
     const float groups = float((g.modelWidth + 31) / 32) * float((g.modelHeight + 31) / 32);
+    if (grey <= 0.5 * groups)
+        return t * shrink; // the spread pass cannot locate a mean within the sums' rounding error
     const float ridge = NR_GREY_SPREAD * NR_GREY_SPREAD + 0.5 * groups / grey;
     const float rr = CastSum(NR_G_RR) / grey + ridge;
     const float rb = CastSum(NR_G_RB) / grey;
@@ -203,7 +205,7 @@ void TakeCastOff(inout float3 chroma, float3 light)
     const float luminance = dot(light, kLuma);
     if (!(grey > 0.0) || !(luminance > kChromaFloor))
         return;
-    const float prior = float(NR_GREY_PRIOR * NR_G_SCALE) * float(g.modelWidth) * float(g.modelHeight);
+    const float prior = NR_GREY_PRIOR * g.statsScale * float(g.modelWidth) * float(g.modelHeight);
     const float room = saturate((1.0 - Max3(light)) / (1.0 - g.shoulder));
     const float2 tint = g.castColour * room * CastTint(grey, prior);
     const float3 own = light / luminance;

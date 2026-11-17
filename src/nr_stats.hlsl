@@ -317,7 +317,7 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             if (abs(chroma.r) + abs(chroma.g) + abs(chroma.b) > 0.05)
                 ++count[NR_C_COLOUR];
             // The brightness by the proxy's luminance, the white balance by greyness; each weight at most 1 and each
-            // value held to +-2, so that no sum can leave an int32 at 4K (the spread pass's are bounded by these).
+            // value held to +-2. NrStatsScale gives every sum room in int32 at this model size.
             const float weight = dot(p, kLuma);
             global[NR_G_WEIGHT] += weight;
             global[NR_G_GAIN] += weight * clamp(change, -2.0, 2.0);
@@ -334,14 +334,17 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         // being the sums the gain or cast pass left in this buffer over their greyness, worked out as CastTint does.
         // Around 0 instead, as v0.3.1 summed them, a frame of one saturated colour gave chroma squares of about 10 whose
         // rounding at every wave added up beyond the ridge, and the fit took several EV of white balance off it.
-        // No sum of these, whole or in part, can leave an int32 at 4K: weight x (chroma - mean)^2 summed over any pixels is
-        // at most weight x chroma^2 summed over all (under 0.3 a pixel), weight x (tint - mean)^2 likewise under 4, and a
-        // product of the two under half their sum.
+        // A rounded weight no larger than its rounding error cannot locate a mean: skip the spread then, leaving
+        // the composite the mean tint and its prior. Otherwise, with N pixels, G groups and S=statsScale, the raw
+        // chroma second moments are bounded by 0.3*N*S + 121*G, tint's by 4*N*S + 9*G: |chroma|<10 and |tint|<=2,
+        // and each first sum's rounding error is at most G/2. A cross product's absolute sum is at most half their
+        // sum. Including this pass's G/2 rounding, 4*N*S + 128*G bounds all stored sums (NrStatsScale).
         float global[NR_GLOBALS];
         [unroll] for (uint z = 0; z < NR_GLOBALS; ++z)
             global[z] = 0.0;
         const float total = float(asint(gStats.Load((NR_S_GLOBAL + NR_G_GREY) * 4)));
-        if (total > 0.0)
+        const float groups = float((g.modelWidth + 31) / 32) * float((g.modelHeight + 31) / 32);
+        if (total > 0.5 * groups)
         {
             const float2 meanC = float2(float(asint(gStats.Load((NR_S_GLOBAL + NR_G_CHROMA_R) * 4))),
                                         float(asint(gStats.Load((NR_S_GLOBAL + NR_G_CHROMA_B) * 4)))) / total;
@@ -419,7 +422,7 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
             sum += sWave[gi * kMaxWaves + next];
             previous = int(smallest);
         }
-        const int fixed = int(round(sum * NR_G_SCALE));
+        const int fixed = int(round(sum * g.statsScale));
         if (fixed != 0)
             gStats.InterlockedAdd((NR_S_GLOBAL + gi) * 4, uint(fixed));
     }
