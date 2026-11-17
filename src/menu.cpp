@@ -15,6 +15,10 @@
 #include "settings.h"
 #include "settings_write.h"
 
+#ifdef BZ_MENU_TEST
+void MenuTestBeforeEvaluateLock();
+#endif
+
 namespace
 {
 SRWLOCK g_lock = SRWLOCK_INIT; // the model, the edges, the overlay, ImGui (menu.h: MenuLock)
@@ -172,11 +176,18 @@ bool KeyDown(unsigned vk) { return vk != 0 && vk < 256 && (GetAsyncKeyState(int(
 
 void MenuOnEvaluate(ID3D12GraphicsCommandList* list)
 {
+    const double now = LogClock();
+#ifdef BZ_MENU_TEST
+    MenuTestBeforeEvaluateLock();
+#endif
+    AcquireSRWLockExclusive(&g_lock);
+    // A present may publish while we wait for the menu: read its settings only after taking the same lock.
     const Settings current = SettingsCurrent();
     if (current.generation == 0)
+    {
+        ReleaseSRWLockExclusive(&g_lock);
         return; // the file has not been read yet (the NR pass reads it on this same evaluation)
-    const double now = LogClock();
-    AcquireSRWLockExclusive(&g_lock);
+    }
     if (!g_inited)
     {
         MenuModelInit(&g_model, current);

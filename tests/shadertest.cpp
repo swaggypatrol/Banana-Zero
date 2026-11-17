@@ -380,7 +380,7 @@ float TintOf(float oc, float pc, F3 p, F3 o)
     return std::clamp(std::log2((oc * p.g) / (pc * o.g)), -2.0f, 2.0f);
 }
 
-// CastTint's white balance from the frame-wide sums (in units of 1, or all in NR_G_SCALE's: the ratios are the same),
+// CastTint's white balance from the frame-wide sums (in units of 1, or all in statsScale's: the ratios are the same),
 // worked out the textbook way, in doubles: the weighted least squares of tint = b + A chroma with the ridge on A, as a
 // 3x3 system in the raw moments (put back together from the spread pass's centered ones) solved by Cramer's rule; the
 // slope's share of b weighed by NR_GREY_REACH / (NR_GREY_REACH + d^2), d^2 from a 2x2 solve of its own; then times
@@ -391,6 +391,12 @@ void CastTint(const double* sum, double prior, double rounding, double* tintR, d
     const double s = sum[NR_G_GREY];
     const double cr = s > 0.0 ? sum[NR_G_CHROMA_R] / s : 0.0, cb = s > 0.0 ? sum[NR_G_CHROMA_B] / s : 0.0;
     const double mr = s > 0.0 ? sum[NR_G_TINT_R] / s : 0.0, mb = s > 0.0 ? sum[NR_G_TINT_B] / s : 0.0;
+    if (rounding >= 1.0)
+    {
+        *tintR = mr * s / (s + prior);
+        *tintB = mb * s / (s + prior);
+        return;
+    }
     const double ridge = (NR_GREY_SPREAD * NR_GREY_SPREAD + rounding) * s;
     const double m[3][3] = { { s, sum[NR_G_CHROMA_R], sum[NR_G_CHROMA_B] },
                              { sum[NR_G_CHROMA_R], sum[NR_G_RR] + s * cr * cr + ridge, sum[NR_G_RB] + s * cr * cb },
@@ -892,7 +898,8 @@ unsigned FitTable(View model, View proxy, View slope, View value, View raw)
     return table;
 }
 
-void Dispatch(ID3D12PipelineState* pipeline, unsigned table, const NrConstants& c, UINT groupsX, UINT groupsY)
+void Dispatch(ID3D12PipelineState* pipeline, unsigned table, const NrConstants& c, UINT groupsX, UINT groupsY,
+              UINT groupsZ = 1)
 {
     ID3D12DescriptorHeap* heaps[] = { g.heap };
     g.list->SetDescriptorHeaps(1, heaps);
@@ -902,7 +909,7 @@ void Dispatch(ID3D12PipelineState* pipeline, unsigned table, const NrConstants& 
     D3D12_GPU_DESCRIPTOR_HANDLE handle = g.heap->GetGPUDescriptorHandleForHeapStart();
     handle.ptr += UINT64(table) * g.increment;
     g.list->SetComputeRootDescriptorTable(1, handle);
-    g.list->Dispatch(groupsX, groupsY, 1);
+    g.list->Dispatch(groupsX, groupsY, groupsZ);
 }
 
 UINT Groups(UINT size, UINT per) { return (size + per - 1) / per; }
@@ -1021,6 +1028,7 @@ struct Setup
 
 UINT ModelW(const Scene& s, const Setup& u) { return u.modelWidth != 0 ? u.modelWidth : s.width; }
 UINT ModelH(const Scene& s, const Setup& u) { return u.modelHeight != 0 ? u.modelHeight : s.height; }
+float StatsScale(const Scene& s, const Setup& u) { return NrStatsScale(ModelW(s, u), ModelH(s, u)); }
 
 NrConstants Constants(const Scene& s, const Setup& u, uint32_t mode)
 {
@@ -1051,6 +1059,7 @@ NrConstants Constants(const Scene& s, const Setup& u, uint32_t mode)
     }
     c.modelWidth = ModelW(s, u);
     c.modelHeight = ModelH(s, u);
+    c.statsScale = StatsScale(s, u);
     c.stepX = float(s.width) / float(c.modelWidth);
     c.stepY = float(s.height) / float(c.modelHeight);
     if (c.modelWidth != s.width || c.modelHeight != s.height)
@@ -1504,7 +1513,7 @@ CpuStats ExpectedStats(const Scene& s, const Setup& u, const std::vector<Pixel>&
     }
     // The spread pass: the same pixels' chroma and tint around the means of the sums above.
     const double grey = c.global[NR_G_GREY];
-    if (grey > 0.0)
+    if (grey * StatsScale(s, u) > 0.5 * Groups(ModelW(s, u), 32) * Groups(ModelH(s, u), 32))
     {
         const double mcr = c.global[NR_G_CHROMA_R] / grey, mcb = c.global[NR_G_CHROMA_B] / grey;
         const double mtr = c.global[NR_G_TINT_R] / grey, mtb = c.global[NR_G_TINT_B] / grey;
@@ -1616,7 +1625,7 @@ void CheckStats(Scene& s, const Setup& u, const std::vector<uint8_t>& modelBytes
     double worst = 0.0;
     for (unsigned i = 0; i < NR_GLOBALS; ++i)
     {
-        const double got = double(int32_t(w[NR_S_GLOBAL + i])) / NR_G_SCALE;
+        const double got = double(int32_t(w[NR_S_GLOBAL + i])) / StatsScale(s, u);
         const double error = std::fabs(got - e.global[i]);
         worst = std::max(worst, error);
         globalRight = globalRight && error <= 0.5 + 1.0e-4 * std::fabs(e.global[i]);
@@ -1738,7 +1747,7 @@ void CheckCast(Scene& s, const Setup& base)
         const bool wanted = i == NR_G_GREY || i == NR_G_TINT_R || i == NR_G_TINT_B || i == NR_G_CHROMA_R ||
                             i == NR_G_CHROMA_B || i >= NR_G_RR;
         const double want = wanted ? e.global[i] : 0.0;
-        sumsRight = sumsRight && std::fabs(double(sum[i]) / NR_G_SCALE - want) <= 0.5 + 1.0e-4 * std::fabs(want);
+        sumsRight = sumsRight && std::fabs(double(sum[i]) / StatsScale(s, u) - want) <= 0.5 + 1.0e-4 * std::fabs(want);
         sameAsStats = sameAsStats && (!wanted || w[NR_S_GLOBAL + i] == statsWords[NR_S_GLOBAL + i]);
     }
     bool nothingElse = true;
@@ -1748,7 +1757,7 @@ void CheckCast(Scene& s, const Setup& base)
     const double tintB = double(sum[NR_G_TINT_B]) / double(sum[NR_G_GREY]);
     // How much of it TakeCastOff divides out: the fit's intercept (the model's tint is the same on every greyish pixel,
     // so it is the mean), times the grey found against the grey taken for granted as untinted.
-    const double prior = NR_GREY_PRIOR * NR_G_SCALE * double(s.width) * double(s.height);
+    const double prior = NR_GREY_PRIOR * StatsScale(s, u) * double(ModelW(s, u)) * double(ModelH(s, u));
     const double found = double(sum[NR_G_GREY]) / (double(sum[NR_G_GREY]) + prior);
     double sums[NR_GLOBALS];
     for (unsigned i = 0; i < NR_GLOBALS; ++i)
@@ -1852,7 +1861,7 @@ void CheckGreyPrior(Scene& s, const Setup& base)
     for (const double share : { 0.001, 0.2 })
     {
         std::vector<uint32_t> words(NR_S_WORDS, 0u);
-        const double grey = share * pixels * NR_G_SCALE;
+        const double grey = share * pixels * StatsScale(s, u);
         words[NR_S_GLOBAL + NR_G_GREY] = uint32_t(int32_t(std::lround(grey)));
         words[NR_S_GLOBAL + NR_G_TINT_B] = uint32_t(int32_t(std::lround(-grey))); // -1 EV: B/G halved
         ID3D12Resource* cast = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
@@ -1996,7 +2005,7 @@ void CheckCastScenes(const Format& f)
         const CpuStats e = ExpectedStats(s, u, proxy, model);
         double want[2];
         const double rounding = 0.5 * double(Groups(s.width, 32)) * double(Groups(s.height, 32)) /
-                                (e.global[NR_G_GREY] * NR_G_SCALE);
+                                (e.global[NR_G_GREY] * StatsScale(s, u));
         ref::CastTint(e.global, NR_GREY_PRIOR * double(s.width) * double(s.height), rounding, &want[0], &want[1]);
         const double share = e.global[NR_G_GREY] / (double(s.width) * double(s.height));
         const double shrink = share / (share + NR_GREY_PRIOR);
@@ -2045,6 +2054,159 @@ void CheckCastScenes(const Format& f)
               pic.want == kNear ? alone[0] : made[0], pic.want == kNear ? alone[1] : made[1], mean[0], mean[1], counted);
         Drop(s);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// At 8K, a grey picture with +2 EV of model tint overflowed the int32 sum at scale 64. The statistics shader does
+// not use DispatchThreadID.z: repeat a 32x32 tile along z to run the actual 8K number of pixels through its wave
+// reduction, group rounding and global atomics, with only small textures. Composite one tile using those full-frame
+// sums and dimensions. The varied tile is near the maximum of w*chroma^2, with opposite, clipped tints.
+void TestLargeCast()
+{
+    Check(NrStatsScale(3840, 2160) == 64.0f && NrStatsScale(7680, 4320) == 16.0f &&
+              NrStatsScale(16384, 16384) == 1.0f,
+          "cast range: scale 64 at 4K, 16 at 8K, 1 at Direct3D's largest texture");
+    struct Case
+    {
+        const char* name;
+        UINT width, height, repeats;
+        bool varied;
+    };
+    const Case cases[] = { { "8K, +2 EV tint", 7680, 4320, 32400, false },
+                           { "8K output, 50% model", 3840, 2160, 8100, false },
+                           { "8K, large chroma and tint spread", 7680, 4320, 32400, true } };
+    for (const Case& test : cases)
+    {
+        std::vector<Pixel> proxy(32 * 32), model(32 * 32);
+        for (size_t i = 0; i < proxy.size(); ++i)
+        {
+            if (!test.varied)
+            {
+                proxy[i] = { 0.5f, 0.5f, 0.5f, 1.0f };
+                model[i] = { 1.0f, 0.5f, 1.0f, 1.0f };
+            }
+            else
+            {
+                const bool high = (i % 32) >= 16;
+                const ref::F3 light = high ? ref::F3 { 0.2f * std::exp(1.0f), 0.2f, 0.2f * std::exp(1.0f) }
+                                          : ref::F3 { 0.2f, 0.2f * std::exp(1.0f), 0.2f };
+                proxy[i] = Quantise(kHalf, WithAlpha(ref::SrgbEncode(light), 1.0f));
+                const ref::F3 p = ref::ProxyLinear(Rgb(proxy[i]));
+                const float gain = high ? 4.1f : 1.0f / 4.1f; // past +/-2, so Tint clamps exactly
+                model[i] = Quantise(kHalf, WithAlpha(ref::SrgbEncode({ p.r * gain, p.g, p.b * gain }), 1.0f));
+            }
+        }
+        Scene s = MakeSceneOf(kHalf, 32, 32, 0, [&](UINT x, UINT y) {
+            return WithAlpha(ref::ProxyLinear(Rgb(proxy[y * 32 + x])), 1.0f);
+        });
+        Setup u;
+        u.whiteScale = 1.0f;
+        u.castColour = 1.0f;
+        u.modelWidth = test.width;
+        u.modelHeight = test.height;
+        Reset(s, u);
+        Upload(s.proxy, Encode(proxy), 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Upload(s.model, Encode(model), 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const UINT64 bytes = NR_S_WORDS * 4;
+        ID3D12Resource* sums = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+        Barrier(sums, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const unsigned table = Table({}, { s.model, kHalf.dxgi }, { s.proxy, kHalf.dxgi }, {}, OutputView(s), sums, bytes);
+        NrConstants c = Constants(s, u, NR_STATS_CLEAR);
+        c.flags &= ~NR_FLAG_SCALED; // one representative tile, already at the model's scale
+        Dispatch(g.stats, table, c, 1, 1);
+        UavBarrier(sums);
+        c.mode = NR_STATS_CAST;
+        Dispatch(g.stats, table, c, 1, 1, test.repeats);
+        UavBarrier(sums);
+        c.mode = NR_STATS_SPREAD;
+        Dispatch(g.stats, table, c, 1, 1, test.repeats);
+        UavBarrier(sums);
+        c.mode = NR_MODE_COMPOSITE;
+        Dispatch(g.nr, table, c, 4, 4);
+        const std::vector<uint8_t> output = Read(s.output, kHalf.bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const std::vector<uint32_t> words = ReadBuffer(sums, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        Setup tile = u;
+        tile.modelWidth = tile.modelHeight = 0;
+        CpuStats expected = ExpectedStats(s, tile, proxy, model);
+        for (double& value : expected.global)
+            value *= test.repeats;
+        bool right = true;
+        for (unsigned i = NR_G_GREY; i < NR_GLOBALS; ++i)
+        {
+            if (i >= NR_G_IN_R && i <= NR_G_IN_B)
+                continue;
+            const double want = expected.global[i] * c.statsScale;
+            const double got = double(int32_t(words[NR_S_GLOBAL + i]));
+            right &= std::fabs(got - want) <= 0.6 * test.repeats + 1.0e-4 * std::fabs(want);
+        }
+        const double grey = expected.global[NR_G_GREY];
+        const double prior = NR_GREY_PRIOR * double(test.width) * test.height;
+        const double rounding = 0.5 * Groups(test.width, 32) * Groups(test.height, 32) / (grey * c.statsScale);
+        double tintR = 0.0, tintB = 0.0;
+        ref::CastTint(expected.global, prior, rounding, &tintR, &tintB);
+        bool picture = true;
+        for (size_t i = 0; i < proxy.size(); ++i)
+        {
+            const ref::F3 p = ref::ProxyLinear(Rgb(proxy[i])), o = ref::ModelLinear(Rgb(model[i]), Rgb(proxy[i]));
+            const ref::F3 chroma = ref::TakeTintOff(ref::ModelChroma(p, o), p, float(tintR), float(tintB), u.knobs.shoulder);
+            const ref::F3 want = ref::ApplyChange(Rgb(s.texture[i]), ref::ModelGain(p, o), chroma, 1.0f, true, u.knobs);
+            const Pixel got = Decode(kHalf, output.data() + i * kHalf.bytes);
+            const float band = 0.003f * std::max({ 0.01f, std::fabs(want.r), std::fabs(want.g), std::fabs(want.b) });
+            picture &= Finite(got) && std::fabs(got.r - want.r) < band && std::fabs(got.g - want.g) < band &&
+                       std::fabs(got.b - want.b) < band;
+        }
+        Check(right && picture, "cast range, %s: real reduction sums stay signed, composite agrees with CPU (scale %.0f)",
+              test.name, double(c.statsScale));
+        sums->Release();
+        Drop(s);
+    }
+}
+
+// First sums whose weight is below their group-rounding error cannot locate a center. Most groups here round their
+// weight to zero but their chroma to -2; one less-saturated pixel makes the weight positive. The old spread used that
+// displaced center and could overflow on a whole frame of this kind. The guarded pass must leave all seven moments 0.
+void TestUnresolvedGrey()
+{
+    std::vector<Pixel> proxy(128 * 64, Pixel { 0.014f, 0.8f, 0.014f, 1.0f });
+    proxy[0] = { 0.2f, 0.5f, 0.2f, 1.0f };
+    std::vector<Pixel> model = proxy;
+    for (Pixel& p : model)
+        p.r = p.b = 2.0f * p.r;
+    Scene s = MakeSceneOf(kHalf, 128, 64, 0, [&](UINT x, UINT y) {
+        return WithAlpha(ref::ProxyLinear(Rgb(proxy[y * 128 + x])), 1.0f);
+    });
+    Setup u;
+    u.whiteScale = 1.0f;
+    u.castColour = 1.0f;
+    Reset(s, u);
+    Upload(s.proxy, Encode(proxy), 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Upload(s.model, Encode(model), 8, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(s.proxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const UINT64 bytes = NR_S_WORDS * 4;
+    ID3D12Resource* sums = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT);
+    Barrier(sums, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const unsigned table = Table({}, { s.model, kHalf.dxgi }, { s.proxy, kHalf.dxgi }, {}, OutputView(s), sums, bytes);
+    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CLEAR), 1, 1);
+    UavBarrier(sums);
+    Dispatch(g.stats, table, Constants(s, u, NR_STATS_CAST), 4, 2);
+    UavBarrier(sums);
+    Dispatch(g.stats, table, Constants(s, u, NR_STATS_SPREAD), 4, 2);
+    UavBarrier(sums);
+    Dispatch(g.nr, table, Constants(s, u, NR_MODE_COMPOSITE), 16, 8);
+    const std::vector<uint8_t> output = Read(s.output, kHalf.bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const std::vector<uint32_t> words = ReadBuffer(sums, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const int32_t grey = int32_t(words[NR_S_GLOBAL + NR_G_GREY]);
+    bool zero = grey > 0 && grey <= 4;
+    for (unsigned i = NR_G_RR; i < NR_GLOBALS; ++i)
+        zero &= words[NR_S_GLOBAL + i] == 0;
+    bool finite = true;
+    for (const Pixel& p : DecodeAll(kHalf, output))
+        finite &= Finite(p);
+    Check(zero && finite, "cast range: greyness below the rounding error keeps the mean, no spread (raw grey %d)", grey);
+    sums->Release();
+    Drop(s);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -3810,6 +3972,8 @@ int main()
     TestLinear(kHalf, 4); // inside a larger texture, as a game with an output subrect
     TestLinear(kSmall, 0);
     TestDisplayEncoded(kUnorm);
+    TestLargeCast();
+    TestUnresolvedGrey();
     TestDepth(); // last: a view this GPU cannot read may take the device down with it
     Say("shadertest: %d checks, %d failed", g_checks, g_failed);
     if (g_failed == 0)

@@ -45,6 +45,7 @@
 #include "ngx_hook.h"
 #include "nr_fit_shader.h"
 #include "nr_frame.h"
+#include "nr_schedule.h"
 #include "nr_shader.h"
 #include "nr_shared.h"
 #include "nr_stats_shader.h"
@@ -77,15 +78,11 @@ constexpr uint64_t kDumpGiveUp = 240;
 constexpr unsigned kMaxDumps = 16;            // per process: each is about 25 MB at 4K
 constexpr unsigned kPreviewWidth = 768;       // the preview picture's width to aim for: a fifth of a 4K frame
 constexpr double kPreviewHold = 0.5;          // seconds the preview is kept after the menu last asked for it
-// While the menu shows the preview: its picture at most this often, and the statistics behind its readouts (the
-// histogram, the counts) at most this often; each at once when the preview opens or shows something else. The log's
-// statistics come when they are due, apart from these.
+// While the menu shows the preview: its picture and readouts follow separate periodic deadlines. A late frame skips
+// missed periods; it never starts an early, shorter interval. Opening or changing the preview starts immediately.
+// The log's statistics come when they are due, apart from these.
 constexpr double kPreviewSeconds = 1.0 / 30.0;
 constexpr double kPanelStatsSeconds = 0.1;
-
-// Whether `seconds` have passed since `last`, a quarter of them early: frames do not come exactly on time, and at 60 fps
-// a 1/30 s interval due on the dot would fall to every third frame whenever one came a little early.
-bool Due(double now, double last, double seconds) { return now - last >= 0.75 * seconds; }
 constexpr unsigned kTimestamps = 4;           // per frame: the pass begins, the model begins, the model ends, the
                                               // pass ends
 constexpr unsigned kTimingSamples = 16;       // the menu and the log get the median of the last this many
@@ -722,9 +719,9 @@ struct Nr
     Buffer statsReadback; // kStatsSlots slots of kStatsSlotBytes
     bool statsFailed = false;
     bool statsPending = false;
-    double panelStatsAt = 0.0; // when the menu's readouts last asked for statistics (kPanelStatsSeconds)
-    double previewAt = 0.0;    // when the preview picture was last rendered (kPreviewSeconds), and what it showed
-    unsigned previewKind = 0;
+    NrSchedule panelStatsSchedule; // the next readout and picture deadlines; only completed work advances them
+    NrSchedule previewSchedule;
+    unsigned previewKind = 0; // requested content; a change restarts both schedules
     bool statsForLog = false; // the copy in flight was asked for by the log; else by the preview alone
     FrameInfo statsInfo;
 
@@ -1622,7 +1619,7 @@ void DropPreview()
     ID3D12Resource* const resources[1] = { g_nr.preview.resource };
     Park(nullptr, resources, 1);
     g_nr.preview = {};
-    g_nr.previewAt = g_nr.panelStatsAt = 0.0; // the next one at once
+    g_nr.previewSchedule = g_nr.panelStatsSchedule = {}; // the next one at once
     AcquireSRWLockExclusive(&g_previewLock);
     g_preview = {};
     g_preview.generation = ++g_nr.previewGeneration;
@@ -2331,6 +2328,7 @@ NrConstants FrameConstants(const Frame& f, const Settings& s, WhiteSource source
     c.height = f.height;
     c.modelWidth = modelWidth;
     c.modelHeight = modelHeight;
+    c.statsScale = NrStatsScale(modelWidth, modelHeight);
     c.stepX = float(f.width) / float(modelWidth);
     c.stepY = float(f.height) / float(modelHeight);
     if (modelWidth != f.width || modelHeight != f.height)
@@ -2509,19 +2507,23 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
     // readouts are due (once the last copy has landed), a dump (the request is only taken once the dump is recorded),
     // the preview picture when it is due (kPreviewSeconds, kPanelStatsSeconds).
     const double now = LogClock();
+    const unsigned previewKind = 1u + (s.preview == Preview::Output ? 1u : 0u) + (s.zebra ? 2u : 0u);
+    if (previewing && previewKind != g_nr.previewKind)
+    {
+        g_nr.previewSchedule = g_nr.panelStatsSchedule = {};
+        g_nr.previewKind = previewKind;
+    }
+    const bool preview = previewing && g_nr.previewSchedule.Due(now) && EnsurePreview(f);
     const bool logStats = g_nr.statsWanted.load(std::memory_order_relaxed);
-    const bool panelStats = previewing && Due(now, g_nr.panelStatsAt, kPanelStatsSeconds);
+    const bool panelStats = previewing && g_nr.panelStatsSchedule.Due(now);
     const bool stats = !g_nr.statsPending && (logStats || panelStats) && EnsureStats();
     if (stats && logStats)
         g_nr.statsWanted.store(false, std::memory_order_relaxed);
-    if (stats && previewing)
-        g_nr.panelStatsAt = now;
-    const unsigned previewKind = 1u + (s.preview == Preview::Output ? 1u : 0u) + (s.zebra ? 2u : 0u);
+    if (stats && panelStats)
+        g_nr.panelStatsSchedule.Advance(now, kPanelStatsSeconds);
     const bool dumpDue = g_nr.dumpState.load(std::memory_order_acquire) == kDumpIdle &&
                          g_nr.dumpWanted.load(std::memory_order_relaxed) && EnsureDump(f);
     const DumpLayout layout = dumpDue ? Layout(f.width, f.height) : DumpLayout {};
-    const bool preview = previewing && (Due(now, g_nr.previewAt, kPreviewSeconds) || previewKind != g_nr.previewKind) &&
-                         EnsurePreview(f);
 
     // What the game's depth adds: the motion vectors dilated by it (DilateMotion), the control mask that sets the sky
     // apart (the sky sliders), the stripes over the sky (ShowSky, in the constants already). Each needs the depth in
@@ -2864,8 +2866,7 @@ void Run(ID3D12GraphicsCommandList* list, const Frame& f, const Settings& s, uns
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, barriers);
         PublishPicture(frameIndex);
-        g_nr.previewAt = now;
-        g_nr.previewKind = previewKind;
+        g_nr.previewSchedule.Advance(now, kPreviewSeconds);
     }
 
     // The copies the CPU reads a few frames from now.
@@ -3055,8 +3056,9 @@ void LogSample(const Sample& sample)
         // weighted by luminance; then a prediction of a grey below the shoulder after the composite, from those
         // numbers alone: no pixel of the result is looked at (tools/nrloop.py measures the result itself).
         double global[NR_GLOBALS];
+        const double statsScale = NrStatsScale(info.modelWidth, info.modelHeight);
         for (unsigned i = 0; i < NR_GLOBALS; ++i)
-            global[i] = double(int32_t(w[NR_S_GLOBAL + i])) / NR_G_SCALE;
+            global[i] = double(int32_t(w[NR_S_GLOBAL + i])) / statsScale;
         const double weight = global[NR_G_WEIGHT];
         if (weight > 0.0 && global[NR_G_IN_G] > 0.0)
         {
@@ -3065,13 +3067,13 @@ void LogSample(const Sample& sample)
             const double meanR = grey > 0.0 ? global[NR_G_TINT_R] / grey : 0.0;
             const double meanB = grey > 0.0 ? global[NR_G_TINT_B] / grey : 0.0;
             // CastTint's white balance, before its shrink: the intercept, its slope's share weighed by how far the fit
-            // reaches to grey (d^2). The spread pass summed the second moments around the means.
+            // reaches to grey (d^2). With less grey than the sums' rounding uncertainty, both use the mean alone.
             double tr = meanR, tb = meanB, reach = 0.0;
-            if (grey > 0.0)
+            const double groups = double((info.modelWidth + 31) / 32) * double((info.modelHeight + 31) / 32);
+            if (grey * statsScale > 0.5 * groups)
             {
                 const double cr = global[NR_G_CHROMA_R] / grey, cb = global[NR_G_CHROMA_B] / grey;
-                const double groups = double((info.modelWidth + 31) / 32) * double((info.modelHeight + 31) / 32);
-                const double ridge = NR_GREY_SPREAD * NR_GREY_SPREAD + 0.5 * groups / (grey * NR_G_SCALE);
+                const double ridge = NR_GREY_SPREAD * NR_GREY_SPREAD + 0.5 * groups / (grey * statsScale);
                 const double rr = global[NR_G_RR] / grey + ridge, rb = global[NR_G_RB] / grey;
                 const double bb = global[NR_G_BB] / grey + ridge;
                 const double det = rr * bb - rb * rb;

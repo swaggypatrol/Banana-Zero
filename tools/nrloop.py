@@ -448,15 +448,25 @@ REACH = 128.0  # NR_GREY_REACH: how far the fit is trusted to reach grey, d^2 at
 SPREAD = 0.1  # NR_GREY_SPREAD: the ridge on the slope, as a spread of chroma in EV
 
 
+def stats_scale(width, height):
+    """NrStatsScale: all sums of a frame share this fixed-point scale, including the spread and the prior."""
+    groups = ((width + 31) // 32) * ((height + 31) // 32)
+    scale = 64.0
+    while 4.0 * width * height * scale + 128.0 * groups > 2140000000.0:
+        scale *= 0.5
+    return scale
+
+
 def cast_tint(w, t, c, prior, reach=REACH, spread=SPREAD):
     """nr.hlsl's CastTint in doubles: the intercept of tint = b + A chroma over the greyish pixels by weighted least
     squares (centered moments, a ridge of spread^2 on A), its slope's share of it weighed by reach / (reach + d^2),
     where d^2 is how far grey lies from the greyish pixels' mean chroma in units of their spread (a fit that has to
     reach far from its pixels to find grey is not trusted to), then shrunk by grey / (grey + prior). The ridge also
-    takes in the rounding of the sums, half a 1/64 step per 32x32 group of the cast pass over the greyness (w is the
+    takes in the rounding of the sums, half a fixed-point step per 32x32 group of the cast pass over the greyness (w is the
     picture's own 2-D weights, for its size). reach None: the whole slope and no rounding (v0.3.1). Returns the white
     balance (R, B in EV) and d^2."""
     groups = np.ceil(w.shape[0] / 32.0) * np.ceil(w.shape[1] / 32.0)
+    scale = stats_scale(w.shape[1], w.shape[0])
     w = w.reshape(-1)
     t = t.reshape(-1, 2)
     c = c.reshape(-1, 2)
@@ -465,8 +475,11 @@ def cast_tint(w, t, c, prior, reach=REACH, spread=SPREAD):
         return np.zeros(2), 0.0
     mc = (w[:, None] * c).sum(axis=0) / s
     mt = (w[:, None] * t).sum(axis=0) / s
+    # Below the first sums' rounding error, no reliable center for a spread: keep the mean tint and its prior.
+    if reach is not None and s * scale <= 0.5 * groups:
+        return mt * s / (s + prior), 0.0
     dc, dt = c - mc, t - mt
-    rounding = 0.0 if reach is None else 0.5 * groups / (s * 64.0)
+    rounding = 0.0 if reach is None else 0.5 * groups / (s * scale)
     cov = (w[:, None, None] * dc[:, :, None] * dc[:, None, :]).sum(axis=0) / s + (spread * spread + rounding) * np.eye(2)
     cct = (w[:, None, None] * dc[:, :, None] * dt[:, None, :]).sum(axis=0) / s
     m = np.linalg.solve(cov, mc)

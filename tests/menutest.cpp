@@ -13,6 +13,7 @@
 //     a file written from another keeps the other's lines
 //   - settings.cpp: ModelScale's steps (a third, whole percent, two thirds), and the file's value read as the nearest
 //   - menu_model.cpp: the draft, A/B, when the file is due, a reload behind the menu
+//   - menu.cpp: an evaluation waiting for the menu follows a commit made by the present, keeping A/B and the save due
 //   - the panel: a slider dragged with the mouse publishes every step at once and logs the drag once, when the mouse
 //     lets go; a right-click puts the default back; a box commits at once; the card freezes the frame and the freeze
 //     box unfreezes it, unticking the card undoes the freeze it made; skin structure takes no input until the auto
@@ -66,6 +67,7 @@
 #include "menu_model.h"
 #include "menu_style.h"
 #include "nr_dx12.h"
+#include "nr_schedule_test.h"
 #include "overlay_dx12.h"
 #include "settings.h"
 #include "settings_write.h"
@@ -99,6 +101,14 @@ void NrRetire(ID3D12Resource* const* resources, unsigned count)
         if (resources[i] != nullptr)
             resources[i]->Release();
     }
+}
+
+// The evaluator signals just before it takes the menu lock, so the test can commit while it waits there.
+HANDLE g_menuEvaluateLockEvent = nullptr;
+void MenuTestBeforeEvaluateLock()
+{
+    if (g_menuEvaluateLockEvent != nullptr)
+        SetEvent(g_menuEvaluateLockEvent);
 }
 
 namespace
@@ -497,6 +507,9 @@ void TestSnapshots()
         return double(counters.PrivateUsage);
     };
     constexpr unsigned kPublishes = 200000;
+    Settings s = SettingsCurrent();
+    s.whiteEV = s.compareSplit = s.menuNits = 0.0f;
+    SettingsPublish(s); // readers may run before the publishing loop: their first snapshot must obey its invariant
     std::atomic<bool> stop { false };
     std::atomic<unsigned> torn { 0 }, reads { 0 };
     auto reader = [&] {
@@ -510,7 +523,6 @@ void TestSnapshots()
     };
     std::thread a(reader), b(reader);
     const double before = privateBytes();
-    Settings s = SettingsCurrent();
     unsigned published = 0;
     // At least kPublishes, and on until the readers have read a thousand times (a small machine may not run them
     // before that many are done), at most 20 times as many.
@@ -569,6 +581,49 @@ void TestModel()
     Check(!KeyEdgeUpdate(&edge, false) && KeyEdgeUpdate(&edge, true) && !KeyEdgeUpdate(&edge, true) &&
               !KeyEdgeUpdate(&edge, false) && KeyEdgeUpdate(&edge, true),
           "model: a key edge fires once per press");
+}
+
+// The present owns the menu while an evaluation arrives, then publishes before letting it in. Reading settings
+// before the lock would make that evaluation mistake its older snapshot for a file reload and forget the save.
+void TestEvaluateCommit()
+{
+    WriteAll(g_ini, "Enabled = 1\r\nWhiteEV = 0\r\nMenuKey = None\r\nToggleKey = None\r\nFreezeKey = None\r\n");
+    SettingsLoad(g_ini);
+    MenuOnEvaluate(nullptr);
+    MenuSetOpen(true);
+    g_menuEvaluateLockEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    Check(g_menuEvaluateLockEvent != nullptr, "evaluate: made the synchronization event");
+    if (g_menuEvaluateLockEvent == nullptr)
+    {
+        MenuSetOpen(false);
+        return;
+    }
+
+    MenuLock();
+    std::thread evaluate([] { MenuOnEvaluate(nullptr); });
+    const bool waiting = WaitForSingleObject(g_menuEvaluateLockEvent, 5000) == WAIT_OBJECT_0;
+    MenuModel& model = MenuModelLocked();
+    model.draft.whiteEV = 1.0f;
+    model.abOff = true;
+    MenuCommitLocked("test concurrent present");
+    const unsigned generation = model.generation;
+    MenuUnlock();
+    evaluate.join();
+    CloseHandle(g_menuEvaluateLockEvent);
+    g_menuEvaluateLockEvent = nullptr;
+    Check(waiting, "evaluate: reached the menu lock while the present held it");
+
+    MenuLock();
+    const MenuModel after = MenuModelLocked();
+    MenuUnlock();
+    Check(after.generation == generation && after.draft.whiteEV == 1.0f && after.written.whiteEV == 0.0f && after.dirty,
+          "evaluate: the present's new value and pending save survived the waiting evaluation");
+    Check(after.abOff && after.draft.enabled && !after.published.enabled,
+          "evaluate: A/B stayed temporary, without turning the saved setting off");
+    MenuSetOpen(false);
+    Check(FileHas("WhiteEV = 1", 5.0), "evaluate: closing still saves the present's change");
+    const Settings saved = SettingsLoad(g_ini);
+    Check(saved.enabled && saved.whiteEV == 1.0f, "evaluate: reloading restores the change with NR enabled");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1925,7 +1980,9 @@ int main(int argc, char** argv)
     TestModelScaleSteps();
     TestReload();
     TestSnapshots();
+    TestNrSchedule(Check);
     TestModel();
+    TestEvaluateCommit();
     TestPanel();
     TestModelPageFirstRun();
     if (!noInput)
